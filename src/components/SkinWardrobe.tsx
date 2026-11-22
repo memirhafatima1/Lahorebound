@@ -108,7 +108,7 @@ export const SkinWardrobe: React.FC<SkinWardrobeProps> = ({
               }`}
             >
               <Crown className="w-3.5 h-3.5" />
-              <span>Weekly Gear ({unlockedCosmeticIds.length}/{SKIN_COSMETICS.length})</span>
+              <span>Runner Gear ({unlockedCosmeticIds.length}/{SKIN_COSMETICS.length})</span>
             </button>
           </div>
 
@@ -347,7 +347,11 @@ export const SkinWardrobe: React.FC<SkinWardrobeProps> = ({
                   {activeCosmetic
                     ? cosmeticUnlocked
                       ? activeCosmetic.description
-                      : `${activeCosmetic.description} · Unlock via Weekly Challenges`
+                      : `${activeCosmetic.description} · Unlock via ${
+                          activeCosmetic.source === 'daily_run'
+                            ? 'Daily Run Objective'
+                            : 'Weekly Challenges'
+                        }`
                     : 'Run with your base runner skin silhouette'}
                 </p>
               </div>
@@ -369,13 +373,17 @@ export const SkinWardrobe: React.FC<SkinWardrobeProps> = ({
                 ) : (
                   <span className="inline-flex items-center gap-1.5 rounded-xl bg-white/8 border border-white/10 px-3 py-2 text-xs font-bold text-slate-400">
                     <Lock className="w-3.5 h-3.5" />
-                    <span>Weekly Challenge Reward</span>
+                    <span>
+                      {activeCosmetic?.source === 'daily_run'
+                        ? 'Daily Run Objective'
+                        : 'Weekly Challenge Reward'}
+                    </span>
                   </span>
                 )}
               </div>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+            <div className="grid grid-cols-3 sm:grid-cols-5 gap-2 max-h-[30vh] overflow-y-auto pr-0.5">
               <button
                 type="button"
                 onClick={() => {
@@ -436,7 +444,13 @@ export const SkinWardrobe: React.FC<SkinWardrobeProps> = ({
                       {cosmetic.name}
                     </div>
                     <div className="text-[10px] font-bold text-slate-400">
-                      {unlocked ? (equipped ? 'Active' : 'Owned') : 'Weekly Reward'}
+                      {unlocked
+                        ? equipped
+                          ? 'Active'
+                          : 'Owned'
+                        : cosmetic.source === 'daily_run'
+                          ? 'Daily Run'
+                          : 'Weekly Reward'}
                     </div>
                   </button>
                 );

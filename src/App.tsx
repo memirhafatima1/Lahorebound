@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Award,
   BookOpen,
   Camera,
@@ -40,6 +41,13 @@ import {
   getDailyLoginStatus,
   normalizeDailyLogin,
 } from './game/dailyLogin';
+import {
+  claimDailyRunObjectiveReward,
+  evaluateDailyRunObjectiveAttempt,
+  getDailyRunMetricUnit,
+  getDailyRunObjectiveTemplateById,
+  normalizeDailyRunObjectiveState,
+} from './game/dailyRunObjective';
 import { DIFFICULTY_CONFIGS, DIFFICULTY_MODES } from './game/difficulty';
 import { SkyboundEngine } from './game/engine';
 import { getStreetCarnivalStatus, type GlobalEventStatus } from './game/globalEvents';
@@ -110,6 +118,7 @@ const INITIAL_HUD: HudSnapshot = {
   weather: 'sunny_haze',
   weatherLabel: 'Sunny Haze',
   weatherAccentHex: '#fbbf24',
+  ambientOverlayLabel: 'Warm Sandstone Heat Shimmer · Courtyard Breeze',
   musicTrack: 'street_ambient',
   musicTrackLabel: 'Street Breeze',
   radioStation: 'auto',
@@ -230,9 +239,18 @@ export default function App() {
   );
   const [hud, setHud] = useState<HudSnapshot>(INITIAL_HUD);
   const [runSummary, setRunSummary] = useState<RunSummary | null>(null);
+  const [webglStatus, setWebglStatus] = useState<'ok' | 'lost' | 'unavailable'>('ok');
 
   // Tracks metrics already applied to dailyMissions during the current run so we never double-count
   const flushedMetricsRef = useRef<RunMetrics>({ ...ZERO_METRICS });
+  const dailyRunAttemptRef = useRef<{ progress: number; disqualified: boolean }>({
+    progress: 0,
+    disqualified: false,
+  });
+  const [dailyRunAttempt, setDailyRunAttempt] = useState<{
+    progress: number;
+    disqualified: boolean;
+  }>({ progress: 0, disqualified: false });
 
   // Swipe gesture state (zero-latency directional trigger on touch/pointer move)
   const swipeStateRef = useRef<{
@@ -263,30 +281,60 @@ export default function App() {
       springHits: Math.max(0, snapshot.springHits - flushed.springHits),
     };
 
+    const hasCumulativeDelta =
+      delta.distance > 0 ||
+      delta.gems > 0 ||
+      delta.jumps > 0 ||
+      delta.slides > 0 ||
+      delta.styleBonuses > 0 ||
+      delta.springHits > 0;
+
+    const currentSave = saveRef.current;
+    const dailyEval = evaluateDailyRunObjectiveAttempt(
+      currentSave.dailyRunObjective,
+      snapshot,
+      dailyRunAttemptRef.current.disqualified,
+    );
+
+    const prevAttempt = dailyRunAttemptRef.current;
     if (
-      delta.distance === 0 &&
-      delta.gems === 0 &&
-      delta.jumps === 0 &&
-      delta.slides === 0 &&
-      delta.styleBonuses === 0 &&
-      delta.springHits === 0
+      prevAttempt.progress !== dailyEval.currentRunProgress ||
+      prevAttempt.disqualified !== dailyEval.disqualifiedThisRun
     ) {
+      const nextAttempt = {
+        progress: dailyEval.currentRunProgress,
+        disqualified: dailyEval.disqualifiedThisRun,
+      };
+      dailyRunAttemptRef.current = nextAttempt;
+      setDailyRunAttempt(nextAttempt);
+    }
+
+    const dailyStateChanged =
+      dailyEval.nextState.dateKey !== currentSave.dailyRunObjective.dateKey ||
+      dailyEval.nextState.templateId !== currentSave.dailyRunObjective.templateId ||
+      dailyEval.nextState.bestProgress !== currentSave.dailyRunObjective.bestProgress ||
+      dailyEval.nextState.completed !== currentSave.dailyRunObjective.completed;
+
+    if (!hasCumulativeDelta && !dailyStateChanged) {
       return;
     }
 
-    flushedMetricsRef.current = {
-      distance: Math.max(flushed.distance, snapshot.distance),
-      gems: Math.max(flushed.gems, snapshot.runGems),
-      jumps: Math.max(flushed.jumps, snapshot.jumps),
-      slides: Math.max(flushed.slides, snapshot.slides),
-      styleBonuses: Math.max(flushed.styleBonuses, snapshot.styleBonuses),
-      springHits: Math.max(flushed.springHits, snapshot.springHits),
-    };
+    if (hasCumulativeDelta) {
+      flushedMetricsRef.current = {
+        distance: Math.max(flushed.distance, snapshot.distance),
+        gems: Math.max(flushed.gems, snapshot.runGems),
+        jumps: Math.max(flushed.jumps, snapshot.jumps),
+        slides: Math.max(flushed.slides, snapshot.slides),
+        styleBonuses: Math.max(flushed.styleBonuses, snapshot.styleBonuses),
+        springHits: Math.max(flushed.springHits, snapshot.springHits),
+      };
+    }
 
-    const currentSave = saveRef.current;
     const archiveWithPrev = syncMissionArchive(currentSave.missionArchive, currentSave.dailyMissions);
     const normalized = normalizeDailyMissionState(currentSave.dailyMissions);
-    const { updated, newlyCompleted } = applyMetricsDeltaToMissions(normalized.missions, delta);
+    const { updated, newlyCompleted } = hasCumulativeDelta
+      ? applyMetricsDeltaToMissions(normalized.missions, delta)
+      : { updated: normalized.missions, newlyCompleted: [] };
     const nextDailyMissions = {
       dateKey: normalized.dateKey,
       missions: updated,
@@ -295,12 +343,14 @@ export default function App() {
     const streakExtended = nextStreak.count > currentSave.dailyStreak.count;
 
     const normalizedWeekly = normalizeWeeklyChallengeState(currentSave.weeklyChallenges);
-    const { updated: updatedWeekly, newlyCompleted: newlyCompletedWeekly } =
-      applyMetricsDeltaToWeeklyChallenges(normalizedWeekly.challenges, delta);
+    const { updated: updatedWeekly, newlyCompleted: newlyCompletedWeekly } = hasCumulativeDelta
+      ? applyMetricsDeltaToWeeklyChallenges(normalizedWeekly.challenges, delta)
+      : { updated: normalizedWeekly.challenges, newlyCompleted: [] };
 
     const nextSave: SaveData = {
       ...currentSave,
       dailyMissions: nextDailyMissions,
+      dailyRunObjective: dailyEval.nextState,
       missionArchive: syncMissionArchive(archiveWithPrev, nextDailyMissions),
       weeklyChallenges: {
         weekKey: normalizedWeekly.weekKey,
@@ -313,7 +363,10 @@ export default function App() {
     persistSaveData(nextSave);
 
     if (!silentBanner) {
-      if (newlyCompletedWeekly.length > 0) {
+      if (dailyEval.newlyCompleted) {
+        engineRef.current?.audio.playUnlock();
+        engineRef.current?.announceBanner('DAILY RUN OBJECTIVE COMPLETE!');
+      } else if (newlyCompletedWeekly.length > 0) {
         engineRef.current?.audio.playUnlock();
         engineRef.current?.announceBanner('WEEKLY CHALLENGE DONE!');
       } else if (newlyCompleted.length > 0) {
@@ -364,120 +417,136 @@ export default function App() {
       initialSave.unlockedSkinIds,
       initialEventStatus.active,
     );
-    const engine = new SkyboundEngine(
-      container,
-      getSkinById(initialSkinId),
-      initialSave.muted,
-      initialSave.difficulty,
-      {
-        onHudUpdate: (snapshot) => {
-          setHud(snapshot);
-          if (phaseRef.current === 'playing') {
-            flushRunMetrics(snapshot, false);
-          }
-        },
-        onHapticEvent: (event) => {
-          vibrationServiceRef.current?.triggerEvent(event);
-        },
-        onGlobalEventChange: (status) => {
-          setGlobalEvent(status);
-          const currentSave = saveRef.current;
-          const resolved = resolveActiveSkinId(
-            currentSave.selectedSkinId,
-            currentSave.unlockedSkinIds,
-            status.active,
-          );
-          if (resolved !== currentSave.selectedSkinId) {
-            const updatedSave: SaveData = { ...currentSave, selectedSkinId: resolved };
-            saveRef.current = updatedSave;
-            setSave(updatedSave);
-            persistSaveData(updatedSave);
-            setPreviewSkinId(resolved);
-            engineRef.current?.setSkin(resolved);
-          }
-        },
-        onLandmarkEncountered: (landmark) => {
-          const prev = saveRef.current;
-          if (prev.unlockedLandmarkIds.includes(landmark)) return false;
-          const nextSave: SaveData = {
-            ...prev,
-            unlockedLandmarkIds: [...prev.unlockedLandmarkIds, landmark],
-          };
-          saveRef.current = nextSave;
-          setSave(nextSave);
-          persistSaveData(nextSave);
-          return true;
-        },
-        onGameOver: (stats) => {
-          vibrationServiceRef.current?.cancel();
-          const prev = saveRef.current;
-          const isNewBestDistance = stats.distance > prev.bestDistance;
-          const nextBestDistance = Math.max(prev.bestDistance, stats.distance);
-          const nextBestScore = Math.max(prev.bestScore, stats.score);
-          const nextTotalGems = prev.totalGems + stats.gemsEarned;
-
-          const newlyUnlocked: CharacterSkin[] = [];
-          const nextUnlockedSet = new Set(prev.unlockedSkinIds);
-          for (const skin of CHARACTER_SKINS) {
-            if (!nextUnlockedSet.has(skin.id) && stats.distance >= skin.milestoneMeters) {
-              nextUnlockedSet.add(skin.id);
-              newlyUnlocked.push(skin);
+    let engine: SkyboundEngine;
+    try {
+      engine = new SkyboundEngine(
+        container,
+        getSkinById(initialSkinId),
+        initialSave.muted,
+        initialSave.difficulty,
+        {
+          onHudUpdate: (snapshot) => {
+            setHud(snapshot);
+            if (phaseRef.current === 'playing') {
+              flushRunMetrics(snapshot, false);
             }
-          }
+          },
+          onHapticEvent: (event) => {
+            vibrationServiceRef.current?.triggerEvent(event);
+          },
+          onWebGlStatusChange: (status) => {
+            setWebglStatus(status === 'lost' ? 'lost' : 'ok');
+          },
+          onGlobalEventChange: (status) => {
+            setGlobalEvent(status);
+            const currentSave = saveRef.current;
+            const resolved = resolveActiveSkinId(
+              currentSave.selectedSkinId,
+              currentSave.unlockedSkinIds,
+              status.active,
+            );
+            if (resolved !== currentSave.selectedSkinId) {
+              const updatedSave: SaveData = { ...currentSave, selectedSkinId: resolved };
+              saveRef.current = updatedSave;
+              setSave(updatedSave);
+              persistSaveData(updatedSave);
+              setPreviewSkinId(resolved);
+              engineRef.current?.setSkin(resolved);
+            }
+          },
+          onLandmarkEncountered: (landmark) => {
+            const prev = saveRef.current;
+            if (prev.unlockedLandmarkIds.includes(landmark)) return false;
+            const nextSave: SaveData = {
+              ...prev,
+              unlockedLandmarkIds: [...prev.unlockedLandmarkIds, landmark],
+            };
+            saveRef.current = nextSave;
+            setSave(nextSave);
+            persistSaveData(nextSave);
+            return true;
+          },
+          onGameOver: (stats) => {
+            vibrationServiceRef.current?.cancel();
+            const prev = saveRef.current;
+            const isNewBestDistance = stats.distance > prev.bestDistance;
+            const nextBestDistance = Math.max(prev.bestDistance, stats.distance);
+            const nextBestScore = Math.max(prev.bestScore, stats.score);
+            const nextTotalGems = prev.totalGems + stats.gemsEarned;
 
-          const entry: LeaderboardEntry = {
-            id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            score: stats.score,
-            distance: stats.distance,
-            skinId: prev.selectedSkinId,
-            recordedAt: new Date().toISOString(),
-          };
-          const { leaderboard, rank } = recordLeaderboardRun(prev.leaderboard, entry);
+            const newlyUnlocked: CharacterSkin[] = [];
+            const nextUnlockedSet = new Set(prev.unlockedSkinIds);
+            for (const skin of CHARACTER_SKINS) {
+              if (!nextUnlockedSet.has(skin.id) && stats.distance >= skin.milestoneMeters) {
+                nextUnlockedSet.add(skin.id);
+                newlyUnlocked.push(skin);
+              }
+            }
 
-          const nextSave: SaveData = {
-            ...prev,
-            totalGems: nextTotalGems,
-            bestDistance: nextBestDistance,
-            bestScore: nextBestScore,
-            unlockedSkinIds: Array.from(nextUnlockedSet),
-            leaderboard,
-          };
-          saveRef.current = nextSave;
-          setSave(nextSave);
-          persistSaveData(nextSave);
+            const recordedSkinId = resolveActiveSkinId(
+              prev.selectedSkinId,
+              prev.unlockedSkinIds,
+              getStreetCarnivalStatus(prev.eventMode).active,
+            );
+            const entry: LeaderboardEntry = {
+              id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              score: stats.score,
+              distance: stats.distance,
+              skinId: recordedSkinId,
+              recordedAt: new Date().toISOString(),
+            };
+            const { leaderboard, rank } = recordLeaderboardRun(prev.leaderboard, entry);
 
-          if (newlyUnlocked.length > 0) {
-            engine.audio.playUnlock();
-          }
+            const nextSave: SaveData = {
+              ...prev,
+              totalGems: nextTotalGems,
+              bestDistance: nextBestDistance,
+              bestScore: nextBestScore,
+              unlockedSkinIds: Array.from(nextUnlockedSet),
+              leaderboard,
+            };
+            saveRef.current = nextSave;
+            setSave(nextSave);
+            persistSaveData(nextSave);
 
-          setRunSummary({
-            entryId: entry.id,
-            distance: stats.distance,
-            score: stats.score,
-            gemsEarned: stats.gemsEarned,
-            maxCombo: stats.maxCombo,
-            peakSpeedMultiplier: stats.peakSpeedMultiplier,
-            biomeReached: stats.biomeReached,
-            landmarkReached: stats.landmarkReached,
-            landmarkReachedName: stats.landmarkReachedName,
-            weatherReached: stats.weatherReached,
-            weatherLabel: stats.weatherLabel,
-            difficulty: stats.difficulty,
-            isNewBestDistance,
-            leaderboardRank: rank,
-            newlyUnlockedSkins: newlyUnlocked,
-            reason: stats.reason,
-          });
-          setPhase('gameover');
+            if (newlyUnlocked.length > 0) {
+              engine.audio.playUnlock();
+            }
+
+            setRunSummary({
+              entryId: entry.id,
+              distance: stats.distance,
+              score: stats.score,
+              gemsEarned: stats.gemsEarned,
+              maxCombo: stats.maxCombo,
+              peakSpeedMultiplier: stats.peakSpeedMultiplier,
+              biomeReached: stats.biomeReached,
+              landmarkReached: stats.landmarkReached,
+              landmarkReachedName: stats.landmarkReachedName,
+              weatherReached: stats.weatherReached,
+              weatherLabel: stats.weatherLabel,
+              difficulty: stats.difficulty,
+              isNewBestDistance,
+              leaderboardRank: rank,
+              newlyUnlockedSkins: newlyUnlocked,
+              reason: stats.reason,
+            });
+            setPhase('gameover');
+          },
         },
-      },
-      initialSave.equippedCosmeticId,
-      initialSave.radioStation,
-      initialSave.lightingMode,
-      initialSave.eventMode,
-    );
+        initialSave.equippedCosmeticId,
+        initialSave.radioStation,
+        initialSave.lightingMode,
+        initialSave.eventMode,
+        initialSave.ambientWeatherOverlay,
+      );
+    } catch {
+      setWebglStatus('unavailable');
+      return;
+    }
 
     engineRef.current = engine;
+    setWebglStatus('ok');
 
     return () => {
       vibrationServiceRef.current?.cancel();
@@ -504,6 +573,14 @@ export default function App() {
       const hapticsEnabled = !prev.hapticsEnabled;
       vibrationServiceRef.current?.setEnabled(hapticsEnabled);
       return { ...prev, hapticsEnabled };
+    });
+  }, [updateSave]);
+
+  const handleToggleAmbientOverlay = useCallback(() => {
+    updateSave((prev) => {
+      const ambientWeatherOverlay = !prev.ambientWeatherOverlay;
+      engineRef.current?.setAmbientOverlayEnabled(ambientWeatherOverlay);
+      return { ...prev, ambientWeatherOverlay };
     });
   }, [updateSave]);
 
@@ -576,7 +653,7 @@ export default function App() {
       saveRef.current.unlockedSkinIds,
       currentEvent.active,
     );
-    // Ensure today's missions, streak, login bonus & lucky wheel are current if midnight crossed
+    // Ensure today's missions, run objective, streak, login bonus & lucky wheel are current if midnight crossed
     updateSave((prev) => {
       const archiveWithPrev = syncMissionArchive(prev.missionArchive, prev.dailyMissions);
       const nextDailyMissions = normalizeDailyMissionState(prev.dailyMissions);
@@ -584,6 +661,7 @@ export default function App() {
         ...prev,
         selectedSkinId: activeSkinForRun,
         dailyMissions: nextDailyMissions,
+        dailyRunObjective: normalizeDailyRunObjectiveState(prev.dailyRunObjective),
         missionArchive: syncMissionArchive(archiveWithPrev, nextDailyMissions),
         weeklyChallenges: normalizeWeeklyChallengeState(prev.weeklyChallenges),
         dailyStreak: normalizeDailyStreak(prev.dailyStreak),
@@ -593,6 +671,8 @@ export default function App() {
       };
     });
     flushedMetricsRef.current = { ...ZERO_METRICS };
+    dailyRunAttemptRef.current = { progress: 0, disqualified: false };
+    setDailyRunAttempt({ progress: 0, disqualified: false });
     setWardrobeOpen(false);
     setMissionsOpen(false);
     setDailyBonusOpen(false);
@@ -667,7 +747,12 @@ export default function App() {
     setSettingsOpen(false);
     setPhotoModeOpen(false);
     engineRef.current?.exitPhotoMode();
-    engineRef.current?.setSkin(saveRef.current.selectedSkinId);
+    const activeTitleSkin = resolveActiveSkinId(
+      saveRef.current.selectedSkinId,
+      saveRef.current.unlockedSkinIds,
+      getStreetCarnivalStatus(saveRef.current.eventMode).active,
+    );
+    engineRef.current?.setSkin(activeTitleSkin);
     engineRef.current?.setCosmetic(saveRef.current.equippedCosmeticId);
     engineRef.current?.setShowcaseMode(false);
     engineRef.current?.setPhase('title');
@@ -719,6 +804,7 @@ export default function App() {
       return {
         ...prev,
         dailyMissions: nextDailyMissions,
+        dailyRunObjective: normalizeDailyRunObjectiveState(prev.dailyRunObjective),
         missionArchive: syncMissionArchive(archiveWithPrev, nextDailyMissions),
         dailyStreak: normalizeDailyStreak(prev.dailyStreak),
       };
@@ -971,8 +1057,29 @@ export default function App() {
     [updateSave],
   );
 
+  const handleClaimDailyRunObjective = useCallback(() => {
+    let claimedOutcome = false;
+    let nextCosmetic: SkinCosmeticId | null = saveRef.current.equippedCosmeticId;
+
+    updateSave((prev) => {
+      const outcome = claimDailyRunObjectiveReward(prev);
+      claimedOutcome = outcome.claimed;
+      nextCosmetic = outcome.nextSave.equippedCosmeticId;
+      return outcome.nextSave;
+    });
+
+    if (claimedOutcome) {
+      engineRef.current?.audio.playUnlock();
+      engineRef.current?.setCosmetic(nextCosmetic);
+      setPreviewCosmeticId(nextCosmetic);
+    }
+  }, [updateSave]);
+
   const handleClaimAllMissions = useCallback(() => {
     let totalBonus = 0;
+    let claimedDailyObjective = false;
+    let nextCosmetic: SkinCosmeticId | null = saveRef.current.equippedCosmeticId;
+
     updateSave((prev) => {
       const normalized = normalizeDailyMissionState(prev.dailyMissions);
       const missions = normalized.missions.map((m) => {
@@ -986,15 +1093,24 @@ export default function App() {
         dateKey: normalized.dateKey,
         missions,
       };
-      return {
+      const baseNext: SaveData = {
         ...prev,
         totalGems: prev.totalGems + totalBonus,
         dailyMissions: nextDailyMissions,
         missionArchive: syncMissionArchive(prev.missionArchive, nextDailyMissions),
       };
+      const dailyOutcome = claimDailyRunObjectiveReward(baseNext);
+      claimedDailyObjective = dailyOutcome.claimed;
+      nextCosmetic = dailyOutcome.nextSave.equippedCosmeticId;
+      return dailyOutcome.nextSave;
     });
-    if (totalBonus > 0) {
+
+    if (totalBonus > 0 || claimedDailyObjective) {
       engineRef.current?.audio.playUnlock();
+      if (claimedDailyObjective) {
+        engineRef.current?.setCosmetic(nextCosmetic);
+        setPreviewCosmeticId(nextCosmetic);
+      }
     }
   }, [updateSave]);
 
@@ -1040,6 +1156,12 @@ export default function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.repeat) return;
       const currentPhase = phaseRef.current;
+      const target = e.target as HTMLElement | null;
+      const isInteractiveTarget = Boolean(
+        target?.closest(
+          'button, a, input, select, textarea, [role="button"], [role="radio"], [role="option"], [role="tab"]',
+        ),
+      );
 
       if (currentPhase === 'playing') {
         switch (e.code) {
@@ -1091,7 +1213,11 @@ export default function App() {
           }
           return;
         }
-        if (e.code === 'Escape' || e.code === 'KeyP' || e.code === 'Enter' || e.code === 'Space') {
+        if (
+          e.code === 'Escape' ||
+          e.code === 'KeyP' ||
+          (!isInteractiveTarget && (e.code === 'Enter' || e.code === 'Space'))
+        ) {
           e.preventDefault();
           handleResume();
         }
@@ -1123,6 +1249,7 @@ export default function App() {
         }
       } else if (
         currentPhase === 'title' &&
+        !isInteractiveTarget &&
         !wardrobeOpenRef.current &&
         !missionsOpenRef.current &&
         !dailyBonusOpenRef.current &&
@@ -1138,6 +1265,7 @@ export default function App() {
         }
       } else if (
         currentPhase === 'gameover' &&
+        !isInteractiveTarget &&
         !missionsOpenRef.current &&
         !leaderboardOpenRef.current &&
         !codexOpenRef.current &&
@@ -1231,6 +1359,11 @@ export default function App() {
   const claimableMissionsCount = dailyMissions.filter(
     (m) => m.progress >= m.target && !m.claimed,
   ).length;
+  const dailyRunObj = save.dailyRunObjective;
+  const dailyRunObjTpl = getDailyRunObjectiveTemplateById(dailyRunObj.templateId);
+  const dailyRunClaimable = dailyRunObj.completed && !dailyRunObj.claimed;
+  const totalTodayDoneCount = missionsDoneCount + (dailyRunObj.completed ? 1 : 0);
+  const totalClaimableDailyCount = claimableMissionsCount + (dailyRunClaimable ? 1 : 0);
   const weeklyChallenges = save.weeklyChallenges.challenges;
   const weeklyDoneCount = weeklyChallenges.filter((c) => c.progress >= c.target).length;
   const claimableWeeklyCount = weeklyChallenges.filter(
@@ -1252,6 +1385,36 @@ export default function App() {
         onPointerCancel={handlePointerUp}
         className="fixed inset-0 touch-none"
       />
+
+      {/* WEBGL CONTEXT RECOVERY / UNAVAILABLE NOTICE */}
+      {webglStatus !== 'ok' && (
+        <div
+          role="alert"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[#060b14]/92 p-4"
+        >
+          <div className="w-full max-w-sm rounded-2xl bg-[#0b1322] border border-amber-400/40 p-6 text-center text-white shadow-2xl">
+            <div className="mx-auto w-11 h-11 rounded-xl bg-amber-400/15 border border-amber-400/40 flex items-center justify-center text-amber-300">
+              <AlertTriangle className="w-5 h-5" />
+            </div>
+            <h2 className="mt-3 text-lg font-black uppercase tracking-wide">
+              {webglStatus === 'lost' ? '3D Graphics Paused' : 'WebGL Graphics Unavailable'}
+            </h2>
+            <p className="mt-1.5 text-xs text-slate-300 leading-relaxed">
+              {webglStatus === 'lost'
+                ? 'Your browser temporarily reset the 3D graphics context. Waiting for automatic recovery or reload below.'
+                : 'Hardware or software WebGL acceleration could not be initialized in this browser view.'}
+            </p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="mt-4 inline-flex items-center justify-center gap-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black uppercase tracking-wider text-xs px-4 py-2.5 cursor-pointer"
+            >
+              <RotateCcw className="w-4 h-4" />
+              <span>Reload Lahore Bound</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* TITLE SCREEN */}
       {phase === 'title' && !wardrobeOpen && (
@@ -1496,6 +1659,40 @@ export default function App() {
               </div>
             )}
 
+            <button
+              type="button"
+              onClick={handleOpenMissions}
+              className={`inline-flex items-center gap-2 rounded-xl border px-3.5 py-1.5 text-xs font-bold shadow-lg transition-colors cursor-pointer pointer-events-auto ${
+                dailyRunClaimable
+                  ? 'bg-amber-400 hover:bg-amber-300 border-amber-200 text-slate-950'
+                  : dailyRunObj.claimed
+                    ? 'bg-emerald-950/85 hover:bg-emerald-900/85 border-emerald-400/45 text-emerald-200'
+                    : 'bg-[#0b1322]/88 hover:bg-[#162238] border-white/15 text-slate-200'
+              }`}
+            >
+              <Trophy
+                className={`w-3.5 h-3.5 shrink-0 ${
+                  dailyRunClaimable
+                    ? 'text-slate-950'
+                    : dailyRunObj.claimed
+                      ? 'text-emerald-300'
+                      : 'text-emerald-300'
+                }`}
+              />
+              <span className="font-extrabold">Daily Run Goal:</span>
+              <span className="truncate max-w-[210px] sm:max-w-none">{dailyRunObjTpl.label}</span>
+              <span aria-hidden="true" className="opacity-40">
+                ·
+              </span>
+              <span className="font-black tabular-nums shrink-0">
+                {dailyRunClaimable
+                  ? 'Claim Unique Reward!'
+                  : dailyRunObj.claimed
+                    ? 'Completed'
+                    : `${dailyRunObj.bestProgress}/${dailyRunObjTpl.target}`}
+              </span>
+            </button>
+
             <div className="flex flex-wrap items-center justify-center gap-2.5 sm:gap-3 pointer-events-auto">
               <button
                 type="button"
@@ -1532,34 +1729,34 @@ export default function App() {
                 type="button"
                 onClick={handleOpenMissions}
                 className={`relative inline-flex items-center gap-2 rounded-2xl active:scale-95 border font-extrabold uppercase tracking-wider text-sm px-4 sm:px-5 py-3.5 shadow-lg transition-transform cursor-pointer ${
-                  claimableMissionsCount > 0
+                  totalClaimableDailyCount > 0
                     ? 'bg-emerald-500/90 hover:bg-emerald-400 border-emerald-200/60 text-slate-950'
                     : 'bg-[#0b1322]/90 hover:bg-[#162238] border-white/20 text-white'
                 }`}
               >
                 <Target
                   className={`w-4 h-4 ${
-                    claimableMissionsCount > 0 ? 'text-slate-950' : 'text-amber-300'
+                    totalClaimableDailyCount > 0 ? 'text-slate-950' : 'text-amber-300'
                   }`}
                 />
                 <span>Missions</span>
                 <span
                   className={`ml-0.5 rounded-md px-1.5 py-0.5 text-[11px] font-black tabular-nums ${
-                    claimableMissionsCount > 0
+                    totalClaimableDailyCount > 0
                       ? 'bg-slate-950/20 text-slate-950'
                       : 'bg-white/10 text-amber-200'
                   }`}
                 >
-                  {claimableMissionsCount > 0
-                    ? `Claim ${claimableMissionsCount}`
-                    : `${missionsDoneCount}/3`}
+                  {totalClaimableDailyCount > 0
+                    ? `Claim ${totalClaimableDailyCount}`
+                    : `${totalTodayDoneCount}/4`}
                 </span>
-                {claimableMissionsCount > 0 && (
+                {totalClaimableDailyCount > 0 && (
                   <span
-                    aria-label={`${claimableMissionsCount} mission rewards ready`}
+                    aria-label={`${totalClaimableDailyCount} mission rewards ready`}
                     className="absolute -top-2 -right-2 min-w-5 h-5 px-1.5 rounded-full bg-amber-400 border-2 border-[#0b1322] text-[11px] font-black leading-none text-slate-950 flex items-center justify-center tabular-nums shadow"
                   >
-                    {claimableMissionsCount}
+                    {totalClaimableDailyCount}
                   </span>
                 )}
               </button>
@@ -1685,13 +1882,36 @@ export default function App() {
       {/* PAUSE MODAL */}
       {phase === 'paused' && !photoModeOpen && (
         <div className="fixed inset-0 z-30 flex items-center justify-center bg-[#060b14]/65 p-4">
-          <div className="w-full max-w-sm rounded-2xl bg-[#0b1322] border border-white/15 p-6 shadow-2xl text-white">
-            <h2 className="text-2xl font-black uppercase tracking-wider text-center">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="pause-modal-title"
+            className="w-full max-w-sm rounded-2xl bg-[#0b1322] border border-white/15 p-6 shadow-2xl text-white"
+          >
+            <h2
+              id="pause-modal-title"
+              className="text-2xl font-black uppercase tracking-wider text-center"
+            >
               Paused
             </h2>
             <p className="text-xs text-slate-400 text-center mt-1 tabular-nums">
               {hud.distance}m · {hud.score.toLocaleString()} pts
             </p>
+            <div className="mt-2.5 rounded-lg bg-white/5 border border-white/10 px-3 py-1.5 text-center text-[11px] tabular-nums">
+              <span className="font-bold text-slate-300">{dailyRunObjTpl.label}: </span>
+              {dailyRunObj.completed ? (
+                <span className="font-black text-emerald-300">Complete!</span>
+              ) : dailyRunAttempt.disqualified ? (
+                <span className="font-bold text-rose-300">
+                  Rule broken this run ({dailyRunObjTpl.forbidAction === 'jumps' ? 'jumped' : 'slid'})
+                </span>
+              ) : (
+                <span className="font-black text-sky-300">
+                  {dailyRunAttempt.progress}/{dailyRunObjTpl.target}{' '}
+                  {getDailyRunMetricUnit(dailyRunObjTpl.metric)}
+                </span>
+              )}
+            </div>
 
             <div className="mt-5 flex flex-col gap-2.5">
               <button
@@ -1822,7 +2042,12 @@ export default function App() {
       {/* GAME OVER MODAL */}
       {phase === 'gameover' && runSummary && (
         <div className="fixed inset-0 z-30 flex items-center justify-center bg-[#060b14]/70 p-4 overflow-y-auto">
-          <div className="w-full max-w-md rounded-2xl bg-[#0b1322] border border-white/15 p-5 sm:p-6 shadow-2xl text-white my-auto">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="gameover-modal-title"
+            className="w-full max-w-md rounded-2xl bg-[#0b1322] border border-white/15 p-5 sm:p-6 shadow-2xl text-white my-auto"
+          >
             <div className="text-center">
               <div className="flex items-center justify-center gap-2">
                 <span className="inline-block rounded-lg bg-rose-500/20 border border-rose-400/40 px-2.5 py-0.5 text-[11px] font-black uppercase tracking-widest text-rose-300">
@@ -1838,7 +2063,10 @@ export default function App() {
                   {DIFFICULTY_CONFIGS[runSummary.difficulty].label} Mode
                 </span>
               </div>
-              <h2 className="text-2xl sm:text-3xl font-black uppercase tracking-wide mt-2">
+              <h2
+                id="gameover-modal-title"
+                className="text-2xl sm:text-3xl font-black uppercase tracking-wide mt-2"
+              >
                 Run Complete
               </h2>
             </div>
@@ -1926,17 +2154,17 @@ export default function App() {
               localRank={runSummary.leaderboardRank}
               playerBestScore={save.bestScore}
               playerBestDistance={save.bestDistance}
-              playerSkinId={save.selectedSkinId}
+              playerSkinId={effectiveSkinId}
             />
 
-            {/* Daily Missions Progress Summary */}
+            {/* Daily Missions & Daily Run Objective Summary */}
             <div className="mt-3.5 rounded-xl bg-white/5 border border-white/10 p-3">
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider text-amber-300">
                   <Target className="w-3.5 h-3.5" />
-                  <span>Daily Missions</span>
+                  <span>Daily Objectives</span>
                 </div>
-                {claimableMissionsCount > 0 ? (
+                {totalClaimableDailyCount > 0 ? (
                   <button
                     type="button"
                     onClick={handleClaimAllMissions}
@@ -1947,7 +2175,42 @@ export default function App() {
                   </button>
                 ) : (
                   <span className="text-[11px] font-bold text-slate-400 tabular-nums">
-                    {missionsDoneCount}/3 Complete
+                    {totalTodayDoneCount}/4 Complete
+                  </span>
+                )}
+              </div>
+
+              {/* Featured Daily Single-Run Objective Row */}
+              <div className="mb-2 pb-2 border-b border-white/10 flex items-center justify-between gap-2 text-xs">
+                <div className="min-w-0">
+                  <div className="text-emerald-300 font-bold truncate">
+                    Run Goal: {dailyRunObjTpl.label}
+                  </div>
+                  {!dailyRunObj.completed && (
+                    <div className="text-[11px] text-slate-400 tabular-nums">
+                      {dailyRunAttempt.disqualified
+                        ? `Rule broken this run · Best today: ${dailyRunObj.bestProgress}/${dailyRunObjTpl.target}`
+                        : `This run: ${dailyRunAttempt.progress}/${dailyRunObjTpl.target} · Best today: ${dailyRunObj.bestProgress}/${dailyRunObjTpl.target}`}
+                    </div>
+                  )}
+                </div>
+                {dailyRunClaimable ? (
+                  <button
+                    type="button"
+                    onClick={handleClaimDailyRunObjective}
+                    className="inline-flex items-center gap-1 rounded bg-amber-400 hover:bg-amber-300 px-2 py-0.5 text-[11px] font-black text-slate-950 cursor-pointer shrink-0"
+                  >
+                    <Trophy className="w-3 h-3" />
+                    <span>Claim Reward</span>
+                  </button>
+                ) : dailyRunObj.claimed ? (
+                  <span className="inline-flex items-center gap-0.5 text-[11px] font-bold text-emerald-400 shrink-0">
+                    <Check className="w-3 h-3" />
+                    <span>Claimed</span>
+                  </span>
+                ) : (
+                  <span className="text-[11px] font-bold text-emerald-300 tabular-nums shrink-0">
+                    {dailyRunObj.bestProgress}/{dailyRunObjTpl.target}
                   </span>
                 )}
               </div>
@@ -2064,11 +2327,17 @@ export default function App() {
       {missionsOpen && (
         <MissionsModal
           missions={save.dailyMissions.missions}
+          dailyRunObjective={save.dailyRunObjective}
+          unlockedBadgeIds={save.unlockedBadgeIds}
+          unlockedCosmeticIds={save.unlockedCosmeticIds}
+          lastAttemptProgress={dailyRunAttempt.progress}
+          lastAttemptDisqualified={dailyRunAttempt.disqualified}
           missionArchive={save.missionArchive}
           dailyStreak={save.dailyStreak}
           totalGems={save.totalGems}
           dateKey={save.dailyMissions.dateKey}
           onClaimMission={handleClaimMission}
+          onClaimDailyRunObjective={handleClaimDailyRunObjective}
           onClaimAll={handleClaimAllMissions}
           onClose={() => setMissionsOpen(false)}
         />
@@ -2119,7 +2388,7 @@ export default function App() {
           localEntries={save.leaderboard}
           playerBestScore={save.bestScore}
           playerBestDistance={save.bestDistance}
-          playerSkinId={save.selectedSkinId}
+          playerSkinId={effectiveSkinId}
           onClose={() => setLeaderboardOpen(false)}
         />
       )}
@@ -2141,12 +2410,14 @@ export default function App() {
           radioStation={save.radioStation}
           lightingMode={save.lightingMode}
           eventMode={save.eventMode}
+          ambientWeatherOverlay={save.ambientWeatherOverlay}
           showTouchButtons={save.showTouchButtons}
           hapticsEnabled={save.hapticsEnabled}
           onToggleMute={handleToggleMute}
           onSelectRadioStation={handleSelectRadioStation}
           onSelectLightingMode={handleSelectLightingMode}
           onSelectEventMode={handleSelectEventMode}
+          onToggleAmbientOverlay={handleToggleAmbientOverlay}
           onToggleTouchButtons={handleToggleTouchButtons}
           onToggleHaptics={handleToggleHaptics}
           onClose={() => setSettingsOpen(false)}

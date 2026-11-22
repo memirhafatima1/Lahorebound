@@ -7,6 +7,7 @@ import {
   normalizeDailyStreak,
   syncMissionArchive,
 } from './missions';
+import { normalizeDailyRunObjectiveState } from './dailyRunObjective';
 import {
   PROFILE_BADGES,
   SKIN_COSMETICS,
@@ -206,9 +207,11 @@ function createDefaultSave(): SaveData {
     radioStation: 'auto',
     lightingMode: 'auto',
     eventMode: 'auto',
+    ambientWeatherOverlay: true,
     hapticsEnabled: true,
     showTouchButtons: true,
     dailyMissions,
+    dailyRunObjective: normalizeDailyRunObjectiveState(undefined),
     missionArchive: syncMissionArchive([], dailyMissions),
     weeklyChallenges: normalizeWeeklyChallengeState(undefined),
     unlockedBadgeIds: [],
@@ -244,6 +247,7 @@ export function loadSaveData(): SaveData {
         : 'normal';
     const archiveWithPrev = syncMissionArchive(parsed.missionArchive, parsed.dailyMissions);
     const dailyMissions = normalizeDailyMissionState(parsed.dailyMissions);
+    const dailyRunObjective = normalizeDailyRunObjectiveState(parsed.dailyRunObjective);
     const missionArchive = syncMissionArchive(archiveWithPrev, dailyMissions);
     const normalizedStreak = normalizeDailyStreak(parsed.dailyStreak);
     const dailyStreak = advanceDailyStreakOnMissionComplete(
@@ -330,9 +334,12 @@ export function loadSaveData(): SaveData {
       radioStation,
       lightingMode,
       eventMode,
+      ambientWeatherOverlay:
+        parsed.ambientWeatherOverlay !== undefined ? Boolean(parsed.ambientWeatherOverlay) : true,
       hapticsEnabled: parsed.hapticsEnabled !== undefined ? Boolean(parsed.hapticsEnabled) : true,
       showTouchButtons: parsed.showTouchButtons !== undefined ? Boolean(parsed.showTouchButtons) : true,
       dailyMissions,
+      dailyRunObjective,
       missionArchive,
       weeklyChallenges,
       unlockedBadgeIds,

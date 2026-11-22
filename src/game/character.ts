@@ -500,6 +500,186 @@ export class LowPolyCharacter {
       }
 
       this.cosmeticGroup.add(haloPivot);
+    } else if (cosmeticId === 'marigold_scarf') {
+      const saffronMat = new THREE.MeshStandardMaterial({
+        color: 0xf59e0b,
+        emissive: 0xd97706,
+        emissiveIntensity: 0.45,
+        roughness: 0.45,
+        metalness: 0.25,
+        flatShading: true,
+      });
+      const crimsonMat = new THREE.MeshStandardMaterial({
+        color: 0xe11d48,
+        emissive: 0xbe123c,
+        emissiveIntensity: 0.5,
+        roughness: 0.42,
+        metalness: 0.25,
+        flatShading: true,
+      });
+      const claspMat = new THREE.MeshStandardMaterial({
+        color: 0xfde047,
+        emissive: 0xfbbf24,
+        emissiveIntensity: 0.65,
+        roughness: 0.2,
+        metalness: 0.85,
+        flatShading: true,
+      });
+
+      const scarfPivot = new THREE.Group();
+      scarfPivot.name = 'scarfPivot';
+      scarfPivot.position.set(0, 0.62, 0.26);
+
+      const collar = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.12, 0.16), saffronMat);
+      collar.position.set(0, 0.04, -0.04);
+      scarfPivot.add(collar);
+
+      const clasp = new THREE.Mesh(new THREE.OctahedronGeometry(0.085, 0), claspMat);
+      clasp.position.set(0, 0.04, 0.06);
+      scarfPivot.add(clasp);
+
+      for (const side of [-1, 1]) {
+        const upperRibbon = new THREE.Mesh(
+          new THREE.BoxGeometry(0.14, 0.42, 0.05),
+          side < 0 ? saffronMat : crimsonMat,
+        );
+        upperRibbon.position.set(side * 0.14, -0.14, 0.14);
+        upperRibbon.rotation.set(0.48, side * 0.22, side * 0.18);
+        scarfPivot.add(upperRibbon);
+
+        const tailTip = new THREE.Mesh(
+          new THREE.ConeGeometry(0.08, 0.24, 4),
+          side < 0 ? crimsonMat : saffronMat,
+        );
+        tailTip.position.set(side * 0.2, -0.34, 0.28);
+        tailTip.rotation.set(Math.PI * 0.72, 0, side * -0.2);
+        scarfPivot.add(tailTip);
+      }
+
+      this.cosmeticGroup.add(scarfPivot);
+    } else if (cosmeticId === 'badshahi_crest') {
+      const sandstoneMat = new THREE.MeshStandardMaterial({
+        color: 0xe11d48,
+        emissive: 0x9f1239,
+        emissiveIntensity: 0.42,
+        roughness: 0.35,
+        metalness: 0.45,
+        flatShading: true,
+      });
+      const gildedMat = new THREE.MeshStandardMaterial({
+        color: 0xfbbf24,
+        emissive: 0xf59e0b,
+        emissiveIntensity: 0.78,
+        roughness: 0.2,
+        metalness: 0.86,
+        flatShading: true,
+      });
+
+      const shahiPivot = new THREE.Group();
+      shahiPivot.name = 'shahiPivot';
+
+      for (const side of [-1, 1]) {
+        const spireBase = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, 0.26, 6), sandstoneMat);
+        spireBase.position.set(side * 0.42, 0.7, 0.02);
+        spireBase.rotation.z = side * -0.26;
+        shahiPivot.add(spireBase);
+
+        const dome = new THREE.Mesh(new THREE.OctahedronGeometry(0.105, 0), gildedMat);
+        dome.position.set(side * 0.46, 0.87, 0.02);
+        shahiPivot.add(dome);
+      }
+
+      const backCrest = new THREE.Mesh(new THREE.OctahedronGeometry(0.17, 0), sandstoneMat);
+      backCrest.position.set(0, 0.44, 0.31);
+      shahiPivot.add(backCrest);
+
+      const coreSeal = new THREE.Mesh(new THREE.TorusGeometry(0.24, 0.028, 6, 12), gildedMat);
+      coreSeal.position.set(0, 0.44, 0.32);
+      shahiPivot.add(coreSeal);
+
+      this.cosmeticGroup.add(shahiPivot);
+    } else if (cosmeticId === 'prism_thrusters') {
+      const hullMat = new THREE.MeshStandardMaterial({
+        color: 0x0f172a,
+        roughness: 0.3,
+        metalness: 0.78,
+        flatShading: true,
+      });
+      const cyanFinMat = new THREE.MeshStandardMaterial({
+        color: 0x06b6d4,
+        emissive: 0x22d3ee,
+        emissiveIntensity: 0.72,
+        roughness: 0.24,
+        metalness: 0.65,
+        flatShading: true,
+      });
+      const plumeMat = new THREE.MeshStandardMaterial({
+        color: 0xfbbf24,
+        emissive: 0xf59e0b,
+        emissiveIntensity: 0.95,
+        roughness: 0.2,
+        metalness: 0.35,
+        flatShading: true,
+      });
+
+      const thrusterPivot = new THREE.Group();
+      thrusterPivot.name = 'thrusterPivot';
+      thrusterPivot.position.set(0, 0.42, 0.3);
+
+      for (const side of [-1, 1]) {
+        const pod = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.13, 0.42, 6), hullMat);
+        pod.position.set(side * 0.22, 0.02, 0);
+        pod.rotation.set(-0.36, 0, side * -0.18);
+        thrusterPivot.add(pod);
+
+        const fin = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.14, 0.045), cyanFinMat);
+        fin.position.set(side * 0.36, 0.1, 0.02);
+        fin.rotation.set(0.15, side * -0.25, side * 0.38);
+        thrusterPivot.add(fin);
+
+        const plume = new THREE.Mesh(new THREE.ConeGeometry(0.085, 0.24, 5), plumeMat);
+        plume.position.set(side * 0.25, -0.22, 0.1);
+        plume.rotation.set(Math.PI - 0.36, 0, side * -0.18);
+        thrusterPivot.add(plume);
+      }
+
+      this.cosmeticGroup.add(thrusterPivot);
+    } else if (cosmeticId === 'golden_chakkar') {
+      const brassMat = new THREE.MeshStandardMaterial({
+        color: 0xfacc15,
+        emissive: 0xeab308,
+        emissiveIntensity: 0.72,
+        roughness: 0.2,
+        metalness: 0.88,
+        flatShading: true,
+      });
+      const jadeMat = new THREE.MeshStandardMaterial({
+        color: 0x10b981,
+        emissive: 0x34d399,
+        emissiveIntensity: 0.82,
+        roughness: 0.26,
+        metalness: 0.55,
+        flatShading: true,
+      });
+
+      const chakkarPivot = new THREE.Group();
+      chakkarPivot.name = 'chakkarPivot';
+      chakkarPivot.position.set(0, 0.46, 0.36);
+
+      const outerRing = new THREE.Mesh(new THREE.TorusGeometry(0.42, 0.036, 6, 16), brassMat);
+      chakkarPivot.add(outerRing);
+
+      const innerCore = new THREE.Mesh(new THREE.OctahedronGeometry(0.12, 0), jadeMat);
+      chakkarPivot.add(innerCore);
+
+      const spokeGeo = new THREE.BoxGeometry(0.76, 0.045, 0.035);
+      for (let i = 0; i < 4; i++) {
+        const spoke = new THREE.Mesh(spokeGeo, i % 2 === 0 ? brassMat : jadeMat);
+        spoke.rotation.z = (i * Math.PI) / 4;
+        chakkarPivot.add(spoke);
+      }
+
+      this.cosmeticGroup.add(chakkarPivot);
     }
   }
 
@@ -780,6 +960,17 @@ export class LowPolyCharacter {
       } else if (this.currentCosmeticId === 'emerald_crest') {
         const s = 1 + Math.sin(this.vfxTime * 5.2) * 0.045;
         mainChild.scale.setScalar(s);
+      } else if (this.currentCosmeticId === 'marigold_scarf') {
+        mainChild.rotation.z = Math.sin(this.vfxTime * 7.2) * 0.06;
+        mainChild.rotation.x = Math.sin(this.vfxTime * 5.6) * 0.08;
+      } else if (this.currentCosmeticId === 'badshahi_crest') {
+        const s = 1 + Math.sin(this.vfxTime * 4.8) * 0.04;
+        mainChild.scale.setScalar(s);
+      } else if (this.currentCosmeticId === 'prism_thrusters') {
+        const s = 1 + Math.sin(this.vfxTime * 12) * 0.05;
+        mainChild.scale.set(1, s, s);
+      } else if (this.currentCosmeticId === 'golden_chakkar') {
+        mainChild.rotation.z += dt * 2.6;
       }
     }
 

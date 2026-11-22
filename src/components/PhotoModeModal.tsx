@@ -86,6 +86,11 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
 
     let cancelled = false;
     const img = new Image();
+    img.onerror = () => {
+      if (!cancelled) {
+        setProcessedUrl(snapshotUrl);
+      }
+    };
     img.onload = () => {
       if (cancelled) return;
       const maxW = 1440;
@@ -199,6 +204,23 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
     };
   }, [snapshotUrl, includeStamp, lahoreFilter, hud, skin.name, dailyStreakCount]);
 
+  useEffect(() => {
+    if (!cleanViewfinder) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (hideControlsInViewfinder) {
+          setHideControlsInViewfinder(false);
+        } else {
+          setCleanViewfinder(false);
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [cleanViewfinder, hideControlsInViewfinder]);
+
   const activeFilterMeta = LAHORE_PHOTO_FILTER_MAP[lahoreFilter];
   const activeOutputUrl =
     includeStamp || lahoreFilter !== 'original' ? processedUrl : snapshotUrl;
@@ -238,7 +260,8 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
     try {
       const res = await fetch(activeOutputUrl);
       const blob = await res.blob();
-      const file = new File([blob], `lahore-bound-${hud.distance}m.png`, {
+      const suffix = lahoreFilter !== 'original' ? `-${lahoreFilter}` : '';
+      const file = new File([blob], `lahore-bound-${hud.distance}m${suffix}.png`, {
         type: 'image/png',
       });
 
@@ -304,14 +327,23 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
             </div>
 
             <div className="fixed top-4 left-4 right-4 flex items-center justify-between gap-2 pointer-events-none">
-              <button
-                type="button"
-                onClick={onBackToPause}
-                className="pointer-events-auto inline-flex items-center gap-1.5 rounded-xl bg-[#0b1322]/85 hover:bg-[#162238] border border-white/20 px-3.5 py-2 text-xs font-extrabold uppercase tracking-wider text-white shadow-lg cursor-pointer"
-              >
-                <ArrowLeft className="w-3.5 h-3.5" />
-                <span>Pause Menu</span>
-              </button>
+              <div className="flex items-center gap-2 pointer-events-auto">
+                <button
+                  type="button"
+                  onClick={() => setCleanViewfinder(false)}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#0b1322]/85 hover:bg-[#162238] border border-white/20 px-3.5 py-2 text-xs font-extrabold uppercase tracking-wider text-white shadow-lg cursor-pointer"
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  <span>Studio</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onBackToPause}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[#0b1322]/85 hover:bg-[#162238] border border-white/15 px-3 py-2 text-xs font-bold uppercase tracking-wider text-slate-300 shadow-lg cursor-pointer"
+                >
+                  <span>Pause Menu</span>
+                </button>
+              </div>
 
               <button
                 type="button"
@@ -328,6 +360,7 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
                 <button
                   key={preset}
                   type="button"
+                  aria-pressed={cameraPreset === preset}
                   onClick={() => handlePresetChange(preset)}
                   className={`rounded-xl px-3 py-2 text-[11px] font-black uppercase tracking-wider cursor-pointer transition-colors ${
                     cameraPreset === preset
@@ -413,6 +446,7 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
               <button
                 key={preset}
                 type="button"
+                aria-pressed={cameraPreset === preset}
                 onClick={() => {
                   handlePresetChange(preset);
                   const fresh = onRecapture();
@@ -434,6 +468,7 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
 
           <button
             type="button"
+            aria-pressed={includeStamp}
             onClick={() => setIncludeStamp((v) => !v)}
             className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-bold cursor-pointer transition-colors ${
               includeStamp
@@ -459,6 +494,7 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
                   <button
                     key={opt.id}
                     type="button"
+                    aria-pressed={active}
                     onClick={() => {
                       onChangeLightingMode(opt.id);
                       const fresh = onRecapture();

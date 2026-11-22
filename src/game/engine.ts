@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { AmbientWeatherOverlay } from './ambientWeatherOverlay';
 import { GameAudio, pickComboVoiceoverPhrase } from './audio';
 import { LowPolyCharacter } from './character';
 import {
@@ -105,12 +106,15 @@ const SPRING_VELOCITY = 20.5;
 const SLIDE_DURATION = 0.65;
 const BASE_FOV = 58;
 const MAX_FOV = 68;
+const LANDMARK_TRANSITION_DURATION = 0.92;
+const CARNIVAL_CONFETTI_COLORS = [0xec4899, 0xfbbf24, 0x22d3ee] as const;
 
 export interface EngineCallbacks {
   onHudUpdate: (hud: HudSnapshot) => void;
   onHapticEvent?: (event: HapticEvent) => void;
   onLandmarkEncountered?: (landmark: LahoreLandmarkKind) => boolean | void;
   onGlobalEventChange?: (status: GlobalEventStatus) => void;
+  onWebGlStatusChange?: (status: 'lost' | 'restored') => void;
   onGameOver: (stats: {
     distance: number;
     score: number;
@@ -160,12 +164,26 @@ export class SkyboundEngine {
   private activeSkinId = 'trailblazer';
   private readonly chronosOverlayMesh: THREE.Mesh;
   private readonly chronosOverlayMat: THREE.ShaderMaterial;
+  private readonly transitionTarget: THREE.WebGLRenderTarget;
+  private readonly blurZoomScene: THREE.Scene;
+  private readonly blurZoomCamera: THREE.OrthographicCamera;
+  private readonly blurZoomQuad: THREE.Mesh;
+  private readonly blurZoomMat: THREE.ShaderMaterial;
+  private landmarkTransitionTimer = 0;
+  private landmarkTransitionPhase = 0;
+  private landmarkTransitionIntensity = 0;
+  private readonly landmarkTransitionAccent = new THREE.Color(0xfbbf24);
 
   private readonly character: LowPolyCharacter;
   private readonly worldBuilder: WorldBuilder;
   private readonly particles = new ParticlePool();
   private readonly powerupVfx = new PowerupVfxSystem();
   private readonly weatherSystem = new WeatherSystem(pickWeatherForLandmark('gate', undefined, true));
+  private readonly ambientWeatherOverlay = new AmbientWeatherOverlay(
+    getLandmarkForecast('gate'),
+    'gate',
+    true,
+  );
   public readonly audio: GameAudio;
   public readonly music = new GlobalMusicManager();
   public readonly haptics = new HapticFeedbackService();
@@ -273,12 +291,14 @@ export class SkyboundEngine {
     initialRadioStation: RadioStationId = 'auto',
     initialLightingMode: LightingMode = 'auto',
     initialEventMode: GlobalEventMode = 'auto',
+    initialAmbientOverlay = true,
   ) {
     this.container = container;
     this.callbacks = callbacks;
     this.difficultyMode = initialDifficulty;
     this.lightingMode = initialLightingMode;
     this.eventMode = initialEventMode;
+    this.ambientWeatherOverlay.setEnabled(initialAmbientOverlay);
     this.globalEventStatus = getStreetCarnivalStatus(initialEventMode);
     this.carnivalBlend = this.globalEventStatus.active ? 1 : 0;
     this.activeSkinId = initialSkin.id;
@@ -301,10 +321,16 @@ export class SkyboundEngine {
       }
     })();
 
-    this.renderer = new THREE.WebGLRenderer({
-      antialias: !this.isSoftwareGl,
-      powerPreference: 'high-performance',
-    });
+    try {
+      this.renderer = new THREE.WebGLRenderer({
+        antialias: !this.isSoftwareGl,
+        powerPreference: 'high-performance',
+      });
+    } catch (err) {
+      this.audio.dispose();
+      this.music.dispose();
+      throw err;
+    }
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.08;
@@ -387,6 +413,7 @@ export class SkyboundEngine {
     this.scene.add(this.particles.mesh);
     this.scene.add(this.powerupVfx.group);
     this.scene.add(this.weatherSystem.group);
+    this.scene.add(this.ambientWeatherOverlay.group);
 
     // Clip-space Time-Dilation Shader Veil (radial chrono-ripples & violet-cyan rim)
     this.chronosOverlayMat = new THREE.ShaderMaterial({
@@ -443,10 +470,135 @@ export class SkyboundEngine {
     this.chronosOverlayMesh.visible = false;
     this.scene.add(this.chronosOverlayMesh);
 
+    // Zone-change radial Blur-Zoom post-pass (renders only during landmark transitions)
+    const gl = this.renderer.getContext();
+    const supportsHalfFloat =
+      !this.isSoftwareGl &&
+      Boolean(gl.getExtension('EXT_color_buffer_half_float') || gl.getExtension('EXT_color_buffer_float'));
+    const rtScale = this.isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio, 1.5);
+    this.transitionTarget = new THREE.WebGLRenderTarget(
+      Math.max(1, Math.floor(width * rtScale)),
+      Math.max(1, Math.floor(height * rtScale)),
+      {
+        type: supportsHalfFloat ? THREE.HalfFloatType : THREE.UnsignedByteType,
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        depthBuffer: true,
+        stencilBuffer: false,
+      },
+    );
+
+    this.blurZoomScene = new THREE.Scene();
+    this.blurZoomCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.blurZoomMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: this.transitionTarget.texture },
+        uIntensity: { value: 0 },
+        uZoomAmount: { value: 0 },
+        uTime: { value: 0 },
+        uPhase: { value: 0 },
+        uAccentColor: { value: new THREE.Color(0xfbbf24) },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float uIntensity;
+        uniform float uZoomAmount;
+        uniform float uTime;
+        uniform float uPhase;
+        uniform vec3 uAccentColor;
+        varying vec2 vUv;
+
+        void main() {
+          vec2 center = vec2(0.5, 0.56);
+          vec2 dir = vUv - center;
+          float dist = length(dir);
+          vec2 dirNorm = dir / max(dist, 0.0001);
+          vec2 tangent = vec2(-dirNorm.y, dirNorm.x);
+          float edgeMask = smoothstep(0.08, 0.78, dist);
+          float angle = atan(dirNorm.y, dirNorm.x + 0.0001 * step(dist, 0.0001));
+
+          // Screen-wide magical heat/speed shimmer: expanding horizon pulse + fluid interference ripples
+          float waveFront = exp(-pow((dist - uPhase * 1.28) * 6.5, 2.0));
+          float radialRipple = sin(dist * 28.0 - uTime * 15.0);
+          float fluidWaveA = sin(vUv.y * 32.0 - uTime * 13.5 + cos(vUv.x * 20.0 + uTime * 7.5));
+          float fluidWaveB = cos(vUv.x * 26.0 + uTime * 11.0 - sin(vUv.y * 18.0 - uTime * 8.5));
+          float speedStreams = 0.5 + 0.5 * cos(angle * 18.0 + uTime * 9.0);
+
+          // Subtle across the whole frame while slightly calmer right on central lane obstacles
+          float shimmerMask = mix(0.32, 1.0, edgeMask);
+          vec2 shimmerOffset =
+            dirNorm * (radialRipple * 0.0032 + waveFront * 0.0068) * uIntensity * shimmerMask +
+            tangent * ((fluidWaveA + fluidWaveB * 0.65) * 0.0018) * uIntensity * shimmerMask;
+
+          // Gentle forward optical zoom toward horizon vanishing point with shimmer warp
+          vec2 baseUv = clamp(
+            center + dir * (1.0 - uZoomAmount * 0.085) + shimmerOffset,
+            0.001,
+            0.999
+          );
+
+          // 8-tap radial zoom blur weighted toward outer screen periphery to keep lane obstacles sharp
+          vec3 accum = vec3(0.0);
+          float totalWeight = 0.0;
+          float blurSpread = uIntensity * (0.045 + 0.085 * edgeMask + waveFront * 0.022);
+
+          for (int i = 0; i < 8; i++) {
+            float t = float(i) / 7.0;
+            float w = 1.0 - t * 0.45;
+            vec2 sampleUv = clamp(
+              center + (baseUv - center) * (1.0 - t * blurSpread) + shimmerOffset * (t * 0.45),
+              0.001,
+              0.999
+            );
+            accum += texture2D(tDiffuse, sampleUv).rgb * w;
+            totalWeight += w;
+          }
+          vec3 blurred = accum / totalWeight;
+
+          // Subtle directional & shimmer-modulated chromatic prism fringe
+          float shimmerChroma = (0.65 + 0.35 * fluidWaveA + waveFront * 0.55);
+          float chromaShift = uIntensity * (0.0022 + edgeMask * 0.0075) * shimmerChroma;
+          vec2 rUv = clamp(baseUv + dir * chromaShift + tangent * (fluidWaveB * 0.0015 * uIntensity), 0.001, 0.999);
+          vec2 bUv = clamp(baseUv - dir * chromaShift - tangent * (fluidWaveB * 0.0015 * uIntensity), 0.001, 0.999);
+          float chromaMix = (0.14 + 0.36 * edgeMask) * uIntensity;
+          blurred.r = mix(blurred.r, texture2D(tDiffuse, rUv).r, chromaMix);
+          blurred.b = mix(blurred.b, texture2D(tDiffuse, bUv).b, chromaMix);
+
+          // Delicate magical iridescent shimmer veil along the expanding wave crest & speed streaks
+          float shimmerGlint =
+            (waveFront * (0.55 + 0.45 * speedStreams) + max(0.0, fluidWaveA * fluidWaveB) * 0.28 * edgeMask) *
+            uIntensity;
+          vec3 prismTint = mix(uAccentColor, vec3(0.76, 0.95, 1.0), 0.38 + 0.25 * speedStreams);
+          blurred += prismTint * shimmerGlint * 0.14;
+
+          float rimAura = smoothstep(0.42, 1.15, dist) * uIntensity * 0.2;
+          vec3 finalRgb = mix(blurred, uAccentColor, rimAura);
+
+          gl_FragColor = vec4(finalRgb, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: true,
+    });
+    this.blurZoomQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.blurZoomMat);
+    this.blurZoomQuad.frustumCulled = false;
+    this.blurZoomScene.add(this.blurZoomQuad);
+
     this.resetWorld();
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
+      this.renderer.compile(this.blurZoomScene, this.blurZoomCamera);
     }
 
     this.renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost);
@@ -753,6 +905,22 @@ export class SkyboundEngine {
     return getAllLandmarkForecasts();
   }
 
+  public setAmbientOverlayEnabled(enabled: boolean): void {
+    this.ambientWeatherOverlay.setEnabled(enabled);
+    if (this.photoFrozen) {
+      this.renderer.render(this.scene, this.camera);
+    }
+    this.emitHud();
+  }
+
+  public isAmbientOverlayEnabled(): boolean {
+    return this.ambientWeatherOverlay.isEnabled();
+  }
+
+  public getAmbientOverlaySummary(): string {
+    return this.ambientWeatherOverlay.getSummary();
+  }
+
   public setPhase(phase: GamePhase): void {
     this.phase = phase;
     if (phase === 'playing') {
@@ -911,6 +1079,7 @@ export class SkyboundEngine {
     this.currentLandmarkKind = 'gate';
     const initialWeather = pickWeatherForLandmark('gate', this.weatherSystem.getWeather(), true);
     this.weatherSystem.setWeather(initialWeather, true);
+    this.ambientWeatherOverlay.setForecast(getLandmarkForecast('gate'), 'gate', true);
     this.audio.setAmbientBiome('canyon');
     this.audio.setAmbientLandmark('gate');
     this.audio.setAmbientWeather(initialWeather);
@@ -933,6 +1102,9 @@ export class SkyboundEngine {
     this.hitstopTimer = 0;
     this.shakeIntensity = 0;
     this.hitFlash = 0;
+    this.landmarkTransitionTimer = 0;
+    this.landmarkTransitionPhase = 0;
+    this.landmarkTransitionIntensity = 0;
     this.photoFrozen = false;
     this.savedPhotoCam = null;
 
@@ -1022,6 +1194,11 @@ export class SkyboundEngine {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height);
     this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    const rtScale = this.isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio, 1.5);
+    this.transitionTarget.setSize(
+      Math.max(1, Math.floor(width * rtScale)),
+      Math.max(1, Math.floor(height * rtScale)),
+    );
   };
 
   private groundHeightAt(x: number, z: number): number {
@@ -1059,6 +1236,7 @@ export class SkyboundEngine {
     this.contextLost = true;
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);
+    this.callbacks.onWebGlStatusChange?.('lost');
   };
 
   private handleContextRestored = (): void => {
@@ -1067,6 +1245,7 @@ export class SkyboundEngine {
     this.clock.getDelta();
     this.updateEnvironmentLighting(0, true);
     this.syncFollowLights();
+    this.callbacks.onWebGlStatusChange?.('restored');
     this.tick();
   };
 
@@ -1098,6 +1277,16 @@ export class SkyboundEngine {
         this.currentNightFactor,
         this.clock.elapsedTime,
       );
+      this.ambientWeatherOverlay.update(
+        dt * 0.35,
+        this.playerX,
+        this.playerY,
+        this.playerZ,
+        this.currentNightFactor,
+        this.clock.elapsedTime,
+        0,
+        this.renderer.getPixelRatio(),
+      );
       this.updateEnvironmentLighting(dt);
     }
 
@@ -1117,9 +1306,10 @@ export class SkyboundEngine {
       comboStreak: this.comboStreak,
       chronosStrength: this.phase === 'playing' ? this.chronosStrength : 0,
       muted: this.audio.isMuted(),
+      globalEventActive: this.globalEventStatus.active,
     });
 
-    this.renderer.render(this.scene, this.camera);
+    this.renderFrame();
 
     if (this.isSoftwareGl) {
       this.afterDraw(this.tick);
@@ -1127,6 +1317,32 @@ export class SkyboundEngine {
       this.frameId = requestAnimationFrame(this.tick);
     }
   };
+
+  private renderFrame(): void {
+    const activeBlurZoom =
+      !this.photoFrozen &&
+      this.phase === 'playing' &&
+      this.landmarkTransitionIntensity > 0.004;
+
+    if (!activeBlurZoom) {
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
+
+    this.blurZoomMat.uniforms.uIntensity.value = this.landmarkTransitionIntensity;
+    this.blurZoomMat.uniforms.uZoomAmount.value = this.landmarkTransitionIntensity;
+    this.blurZoomMat.uniforms.uTime.value = this.clock.elapsedTime;
+    this.blurZoomMat.uniforms.uPhase.value = this.landmarkTransitionPhase;
+    (this.blurZoomMat.uniforms.uAccentColor.value as THREE.Color).copy(
+      this.landmarkTransitionAccent,
+    );
+
+    this.renderer.setRenderTarget(this.transitionTarget);
+    this.renderer.clear();
+    this.renderer.render(this.scene, this.camera);
+    this.renderer.setRenderTarget(null);
+    this.renderer.render(this.blurZoomScene, this.blurZoomCamera);
+  }
 
   private afterDraw(cb: () => void): void {
     const gl = this.renderer.getContext() as WebGL2RenderingContext;
@@ -1235,6 +1451,7 @@ export class SkyboundEngine {
           this.weatherSystem.getWeather(),
         );
         this.weatherSystem.setWeather(nextWeather);
+        this.ambientWeatherOverlay.setForecast(getLandmarkForecast(scenicLandmark), scenicLandmark);
         this.audio.setAmbientWeather(nextWeather);
       }
     }
@@ -1247,6 +1464,16 @@ export class SkyboundEngine {
       this.playerZ,
       this.currentNightFactor,
       this.simTime,
+    );
+    this.ambientWeatherOverlay.update(
+      dt,
+      this.playerX,
+      this.playerY,
+      this.playerZ,
+      this.currentNightFactor,
+      this.simTime,
+      0.24,
+      this.renderer.getPixelRatio(),
     );
     this.syncFollowLights();
     this.updateEnvironmentLighting(dt);
@@ -1352,6 +1579,18 @@ export class SkyboundEngine {
         this.chronosTimer > 0 && this.chronosTimer < 1.25 ? 1.0 : 0.0;
     }
 
+    if (this.landmarkTransitionTimer > 0) {
+      this.landmarkTransitionTimer = Math.max(0, this.landmarkTransitionTimer - dt);
+      const p = 1 - this.landmarkTransitionTimer / LANDMARK_TRANSITION_DURATION;
+      const rise = THREE.MathUtils.smoothstep(p, 0, 0.16);
+      const fall = Math.pow(1 - THREE.MathUtils.smoothstep(p, 0.16, 1.0), 1.65);
+      this.landmarkTransitionPhase = p;
+      this.landmarkTransitionIntensity = rise * fall;
+    } else {
+      this.landmarkTransitionPhase = 0;
+      this.landmarkTransitionIntensity = 0;
+    }
+
     if (this.powerupSurge > 0) this.powerupSurge = Math.max(0, this.powerupSurge - dt * 2.6);
     if (this.eventBannerTimer > 0) {
       this.eventBannerTimer -= dt;
@@ -1426,6 +1665,7 @@ export class SkyboundEngine {
       this.runJumps++;
       this.audio.playJump();
       this.particles.spawnBurst(this.playerX, this.playerY + 0.1, this.playerZ, 0xe2e8f0, 7, 3.6, 0.8);
+      this.emitHud();
     }
 
     // Execute buffered Slide
@@ -1510,8 +1750,8 @@ export class SkyboundEngine {
               : 0.095)
     ) {
       this.trailAccum = 0;
-      const carnivalPalette = [0xec4899, 0xfbbf24, 0x22d3ee];
-      const carnivalHue = carnivalPalette[Math.floor(this.simTime * 8) % carnivalPalette.length];
+      const carnivalHue =
+        CARNIVAL_CONFETTI_COLORS[Math.floor(this.simTime * 8) % CARNIVAL_CONFETTI_COLORS.length];
       const trailColor =
         this.chronosTimer > 0
           ? 0xc084fc
@@ -1557,8 +1797,8 @@ export class SkyboundEngine {
       if (this.carnivalConfettiAccum >= 0.52) {
         this.carnivalConfettiAccum = 0;
         const side = Math.random() < 0.5 ? -1 : 1;
-        const colors = [0xec4899, 0xfbbf24, 0x22d3ee];
-        const color = colors[Math.floor(Math.random() * colors.length)];
+        const color =
+          CARNIVAL_CONFETTI_COLORS[Math.floor(Math.random() * CARNIVAL_CONFETTI_COLORS.length)];
         this.particles.spawnBurst(
           side * (4.1 + Math.random() * 1.4),
           2.6 + Math.random() * 1.8,
@@ -1617,6 +1857,22 @@ export class SkyboundEngine {
       this.playerZ,
       this.currentNightFactor,
       this.simTime,
+    );
+    const maxMultForOverlay = DIFFICULTY_CONFIGS[this.difficultyMode].maxMultiplier;
+    const overlaySpeedRatio = THREE.MathUtils.clamp(
+      (this.speedMultiplier - 1) / Math.max(0.1, maxMultForOverlay - 1),
+      0,
+      1,
+    );
+    this.ambientWeatherOverlay.update(
+      dt * timeScale,
+      this.playerX,
+      this.playerY,
+      this.playerZ,
+      this.currentNightFactor,
+      this.simTime,
+      overlaySpeedRatio,
+      this.renderer.getPixelRatio(),
     );
     this.updateCamera(dt);
     this.syncFollowLights();
@@ -1755,6 +2011,7 @@ export class SkyboundEngine {
             4.2,
             0.9,
           );
+          this.emitHud();
         }
       }
 
@@ -1916,6 +2173,9 @@ export class SkyboundEngine {
   private endRun(reason: 'obstacle' | 'fall'): void {
     this.phase = 'gameover';
     this.chronosTimer = 0;
+    this.landmarkTransitionTimer = 0;
+    this.landmarkTransitionPhase = 0;
+    this.landmarkTransitionIntensity = 0;
     this.audio.stopVoiceover();
     const finalScore = this.computeTotalScore();
     const journey = getJourneyProgressForDistance(this.distance);
@@ -1953,6 +2213,7 @@ export class SkyboundEngine {
     this.audio.setAmbientLandmark(kind);
     const nextWeather = pickWeatherForLandmark(kind, this.weatherSystem.getWeather());
     this.weatherSystem.setWeather(nextWeather);
+    this.ambientWeatherOverlay.setForecast(getLandmarkForecast(kind), kind);
     this.audio.setAmbientWeather(nextWeather);
     const isNewEntry = Boolean(this.callbacks.onLandmarkEncountered?.(kind));
     this.landmarkPopupName = name;
@@ -1962,6 +2223,9 @@ export class SkyboundEngine {
     this.landmarkPopupTimer = 2.8;
     this.landmarkPopupSeq++;
     this.landmarkPopupIsNew = isNewEntry;
+    this.landmarkTransitionTimer = LANDMARK_TRANSITION_DURATION;
+    this.landmarkTransitionPhase = 0;
+    this.landmarkTransitionAccent.set(accentHex);
     this.audio.playCityLandmark();
 
     const accentHexNum = Number.parseInt(accentHex.slice(1), 16) || 0xfbbf24;
@@ -2009,6 +2273,7 @@ export class SkyboundEngine {
       weather: weatherMeta.id,
       weatherLabel: weatherMeta.shortLabel,
       weatherAccentHex: weatherMeta.accentHex,
+      ambientOverlayLabel: this.ambientWeatherOverlay.getSummary(),
       musicTrack: musicMeta.id,
       musicTrackLabel: musicMeta.shortLabel,
       radioStation: stationMeta.id,
@@ -2051,8 +2316,10 @@ export class SkyboundEngine {
       1,
     );
     const targetFov =
-      THREE.MathUtils.lerp(BASE_FOV, MAX_FOV, speedRatio) + this.chronosStrength * 5.5;
-    const nextFov = THREE.MathUtils.damp(this.camera.fov, targetFov, 4.5, dt);
+      THREE.MathUtils.lerp(BASE_FOV, MAX_FOV, speedRatio) +
+      this.chronosStrength * 5.5 +
+      this.landmarkTransitionIntensity * 9.5;
+    const nextFov = THREE.MathUtils.damp(this.camera.fov, targetFov, 5.8, dt);
     if (Math.abs(nextFov - this.camera.fov) > 0.01) {
       this.camera.fov = nextFov;
       this.camera.updateProjectionMatrix();
@@ -2060,7 +2327,12 @@ export class SkyboundEngine {
 
     const camX = this.playerX * 0.58;
     const camY = 3.85 + Math.max(0, this.playerY * 0.72) + (this.isSliding ? -0.35 : 0);
-    const camZ = this.playerZ + 6.9 - speedRatio * 0.55 + this.chronosStrength * 0.65;
+    const camZ =
+      this.playerZ +
+      6.9 -
+      speedRatio * 0.55 +
+      this.chronosStrength * 0.65 -
+      this.landmarkTransitionIntensity * 0.85;
 
     _camDesired.set(camX, camY, camZ);
     this.camera.position.lerp(_camDesired, 1 - Math.exp(-10 * dt));
@@ -2298,8 +2570,12 @@ export class SkyboundEngine {
     this.particles.dispose();
     this.powerupVfx.dispose();
     this.weatherSystem.dispose();
+    this.ambientWeatherOverlay.dispose();
     this.chronosOverlayMesh.geometry.dispose();
     this.chronosOverlayMat.dispose();
+    this.transitionTarget.dispose();
+    this.blurZoomQuad.geometry.dispose();
+    this.blurZoomMat.dispose();
     this.music.dispose();
     this.audio.dispose();
     this.haptics.cancel();

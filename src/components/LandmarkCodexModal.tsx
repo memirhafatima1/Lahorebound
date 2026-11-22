@@ -13,6 +13,7 @@ import {
   Wind,
   X,
 } from 'lucide-react';
+import { getAmbientOverlayProfile } from '../game/ambientWeatherOverlay';
 import { LAHORE_TRACK_STOPS, type TrackJourneyStop } from '../game/lahoreJourney';
 import { getAllLandmarkForecasts, type LandmarkForecast } from '../game/weather';
 import type { LahoreLandmarkKind, WeatherCondition } from '../game/types';
@@ -220,6 +221,7 @@ export const LandmarkCodexModal: React.FC<LandmarkCodexModalProps> = ({
 
   const selectedStop = LAHORE_TRACK_STOPS[selectedIndex] ?? LAHORE_TRACK_STOPS[0];
   const selectedForecast = forecasts[selectedStop.landmark];
+  const selectedAmbientProfile = getAmbientOverlayProfile(selectedForecast, selectedStop.landmark);
   const isSelectedUnlocked = unlockedSet.has(selectedStop.landmark);
   const selectedPhotoAvailable = isSelectedUnlocked && !failedImages[selectedStop.landmark];
 
@@ -413,13 +415,29 @@ export const LandmarkCodexModal: React.FC<LandmarkCodexModalProps> = ({
                     <Compass className="w-3.5 h-3.5 shrink-0 text-amber-300" />
                     <span>Highlight: {selectedStop.architecturalHighlight}</span>
                   </div>
+                  <div className="text-[11px] font-semibold flex items-center gap-1.5 text-sky-300/90">
+                    <ForecastWeatherIcon
+                      condition={selectedForecast.condition}
+                      color={selectedForecast.accentHex}
+                    />
+                    <span>Ambient Overlay: {selectedAmbientProfile.summary}</span>
+                  </div>
                 </>
               ) : (
-                <p className="text-xs sm:text-sm text-slate-400 leading-relaxed tabular-nums">
-                  Pass through <span className="text-slate-200 font-semibold">{selectedStop.name}</span>{' '}
-                  at the <span className="text-amber-300 font-semibold">{selectedStop.encounterMeters}m</span>{' '}
-                  mark during a run to unlock its architectural silhouette and historical chronicle in the Codex.
-                </p>
+                <>
+                  <p className="text-xs sm:text-sm text-slate-400 leading-relaxed tabular-nums">
+                    Pass through <span className="text-slate-200 font-semibold">{selectedStop.name}</span>{' '}
+                    at the <span className="text-amber-300 font-semibold">{selectedStop.encounterMeters}m</span>{' '}
+                    mark during a run to unlock its architectural silhouette and historical chronicle in the Codex.
+                  </p>
+                  <div className="text-[11px] font-semibold flex items-center gap-1.5 text-slate-300/85">
+                    <ForecastWeatherIcon
+                      condition={selectedForecast.condition}
+                      color={selectedForecast.accentHex}
+                    />
+                    <span>Ambient Overlay: {selectedAmbientProfile.summary}</span>
+                  </div>
+                </>
               )}
             </div>
           </div>

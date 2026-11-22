@@ -13,6 +13,7 @@ import {
   Sunset,
   Volume2,
   VolumeX,
+  Wind,
   X,
 } from 'lucide-react';
 import { LIGHTING_MODES, formatLahoreClockAndPhase } from '../game/dayNightCycle';
@@ -25,12 +26,14 @@ interface SettingsModalProps {
   radioStation: RadioStationId;
   lightingMode: LightingMode;
   eventMode: GlobalEventMode;
+  ambientWeatherOverlay: boolean;
   showTouchButtons: boolean;
   hapticsEnabled: boolean;
   onToggleMute: () => void;
   onSelectRadioStation: (station: RadioStationId) => void;
   onSelectLightingMode: (mode: LightingMode) => void;
   onSelectEventMode: (mode: GlobalEventMode) => void;
+  onToggleAmbientOverlay: () => void;
   onToggleTouchButtons: () => void;
   onToggleHaptics: () => void;
   onClose: () => void;
@@ -58,12 +61,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   radioStation,
   lightingMode,
   eventMode,
+  ambientWeatherOverlay,
   showTouchButtons,
   hapticsEnabled,
   onToggleMute,
   onSelectRadioStation,
   onSelectLightingMode,
   onSelectEventMode,
+  onToggleAmbientOverlay,
   onToggleTouchButtons,
   onToggleHaptics,
   onClose,
@@ -265,6 +270,36 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 );
               })}
             </div>
+
+            <button
+              type="button"
+              aria-pressed={ambientWeatherOverlay}
+              onClick={onToggleAmbientOverlay}
+              className="w-full flex items-center justify-between gap-3 rounded-xl bg-white/5 hover:bg-white/10 border border-white/12 px-3.5 py-2.5 text-left cursor-pointer transition-colors"
+            >
+              <span className="inline-flex items-center gap-2.5 min-w-0">
+                <Wind
+                  className={`w-4 h-4 shrink-0 ${
+                    ambientWeatherOverlay ? 'text-sky-300' : 'text-slate-400'
+                  }`}
+                />
+                <span className="min-w-0">
+                  <span className="block text-xs font-bold text-white">
+                    Ambient Weather Overlay
+                  </span>
+                  <span className="block text-[11px] text-slate-400 truncate">
+                    Forecast swirling leaves, heat shimmers &amp; light mist
+                  </span>
+                </span>
+              </span>
+              <span
+                className={`text-xs font-black uppercase tracking-wider shrink-0 ${
+                  ambientWeatherOverlay ? 'text-emerald-400' : 'text-slate-400'
+                }`}
+              >
+                {ambientWeatherOverlay ? 'ON' : 'OFF'}
+              </span>
+            </button>
           </section>
 
           {/* Street Carnival Global Event */}

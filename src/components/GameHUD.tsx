@@ -115,8 +115,13 @@ export const GameHUD: React.FC<GameHUDProps> = ({
 }) => {
   const [flashVisible, setFlashVisible] = useState(false);
   const [comboPopPulse, setComboPopPulse] = useState(false);
+  const [gemPopSeq, setGemPopSeq] = useState(0);
+  const [distPopSeq, setDistPopSeq] = useState(0);
   const [radioMenuOpen, setRadioMenuOpen] = useState(false);
   const radioMenuRef = useRef<HTMLDivElement | null>(null);
+  const prevGemsRef = useRef(hud.runGems);
+  const prevDistanceRef = useRef(hud.distance);
+  const lastDistPopAtRef = useRef(0);
 
   useEffect(() => {
     if (!radioMenuOpen) return;
@@ -125,8 +130,19 @@ export const GameHUD: React.FC<GameHUDProps> = ({
         setRadioMenuOpen(false);
       }
     };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setRadioMenuOpen(false);
+      }
+    };
     window.addEventListener('pointerdown', handlePointerDown);
-    return () => window.removeEventListener('pointerdown', handlePointerDown);
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown);
+      window.removeEventListener('keydown', handleKeyDown, true);
+    };
   }, [radioMenuOpen]);
 
   useEffect(() => {
@@ -142,6 +158,25 @@ export const GameHUD: React.FC<GameHUDProps> = ({
     const id = window.setTimeout(() => setComboPopPulse(false), 170);
     return () => window.clearTimeout(id);
   }, [hud.comboPopSeq, hud.comboStreak]);
+
+  useEffect(() => {
+    if (hud.runGems === prevGemsRef.current) return;
+    prevGemsRef.current = hud.runGems;
+    if (hud.runGems > 0) {
+      setGemPopSeq((seq) => seq + 1);
+    }
+  }, [hud.runGems]);
+
+  useEffect(() => {
+    if (hud.distance === prevDistanceRef.current) return;
+    prevDistanceRef.current = hud.distance;
+    if (hud.distance <= 0) return;
+    const now = performance.now();
+    if (now - lastDistPopAtRef.current >= 150) {
+      lastDistPopAtRef.current = now;
+      setDistPopSeq((seq) => seq + 1);
+    }
+  }, [hud.distance]);
 
   const activeStation = RADIO_STATION_MAP[radioStation];
   const pulseColor = hud.journeyAccentHex || '#f97316';
@@ -238,6 +273,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           <span
             className="inline-flex items-center gap-1 text-[11px] font-bold"
             style={{ color: hud.weatherAccentHex }}
+            title={hud.ambientOverlayLabel ? `Ambient Overlay: ${hud.ambientOverlayLabel}` : undefined}
           >
             <WeatherIcon weather={hud.weather} color={hud.weatherAccentHex} />
             <span>{hud.weatherLabel}</span>
@@ -285,7 +321,15 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               <div className="text-[10px] font-bold uppercase tracking-wider text-sky-300/80">
                 Distance
               </div>
-              <div className="text-lg sm:text-xl font-black text-white tabular-nums leading-tight">
+              <div
+                className={`text-lg sm:text-xl font-black text-white tabular-nums leading-tight ${
+                  distPopSeq === 0
+                    ? ''
+                    : distPopSeq % 2 === 0
+                      ? 'animate-hud-distance-pop-a'
+                      : 'animate-hud-distance-pop-b'
+                }`}
+              >
                 {hud.distance}
                 <span className="text-xs font-bold text-sky-300 ml-0.5">m</span>
               </div>
@@ -300,7 +344,15 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               </div>
             </div>
             <div className="h-7 w-px bg-white/15" />
-            <div className="flex items-center gap-1.5">
+            <div
+              className={`flex items-center gap-1.5 ${
+                gemPopSeq === 0
+                  ? ''
+                  : gemPopSeq % 2 === 0
+                    ? 'animate-hud-gem-pop-a'
+                    : 'animate-hud-gem-pop-b'
+              }`}
+            >
               <Gem className="w-4 h-4 text-sky-400 shrink-0" />
               <span className="text-base sm:text-lg font-black text-sky-200 tabular-nums">
                 {hud.runGems}

@@ -94,6 +94,7 @@ export interface MusicUpdateInput {
   comboStreak: number;
   chronosStrength: number; // 0..1 time dilation
   muted: boolean;
+  globalEventActive?: boolean;
 }
 
 // Raag Yaman / Kalyan & Bhupali tonal palettes rooted in D
@@ -297,17 +298,23 @@ export class GlobalMusicManager {
         targetStreet = 0.85;
         targetQawwali = 0.15;
       }
+      if (input.globalEventActive) {
+        targetStreet = Math.max(0.25, targetStreet - 0.18);
+        targetQawwali += 0.1;
+        targetSufi += 0.08;
+      }
     } else if (input.phase === 'gameover' || input.phase === 'paused') {
       targetStreet = 0.72;
       targetQawwali = 0.28;
     } else {
-      // Dynamic gameplay intensity combining speed progress, Lucky Boost, combo energy, & landmark
+      // Dynamic gameplay intensity combining speed progress, Lucky Boost, combo energy, landmark & Street Carnival event
       const comboBoost = input.comboStreak >= 4 ? Math.min(0.14, (input.comboStreak - 3) * 0.035) : 0;
       const boostBonus = input.speedBoostActive ? 0.34 : 0;
+      const eventBonus = input.globalEventActive ? 0.1 : 0;
       const landmarkShift = this.getLandmarkIntensityBias(input.landmark);
       const effectiveIntensity = Math.max(
         0,
-        Math.min(1, input.speedRatio + boostBonus + comboBoost + landmarkShift),
+        Math.min(1, input.speedRatio + boostBonus + comboBoost + eventBonus + landmarkShift),
       );
 
       // Heritage landmarks hold Qawwali character slightly longer; Liberty/Minar ignite Sufi-Fusion earlier

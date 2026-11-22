@@ -3,32 +3,50 @@ import {
   ArrowDown,
   ArrowRight,
   ArrowUp,
+  Award,
   CalendarDays,
   Check,
   Flame,
   Footprints,
   Gem,
   History,
+  ShieldAlert,
   Sparkles,
   Target,
+  Trophy,
   X,
   Zap,
 } from 'lucide-react';
+import {
+  getDailyRunMetricUnit,
+  getDailyRunObjectiveTemplateById,
+} from '../game/dailyRunObjective';
 import { buildWeeklyMissionArchive } from '../game/missions';
+import { getBadgeById, getCosmeticById } from '../game/weeklyChallenges';
 import type {
   DailyMission,
   DailyMissionArchiveEntry,
+  DailyRunObjectiveMetric,
+  DailyRunObjectiveState,
   DailyStreakData,
   MissionType,
+  ProfileBadgeId,
+  SkinCosmeticId,
 } from '../game/types';
 
 interface MissionsModalProps {
   missions: DailyMission[];
+  dailyRunObjective: DailyRunObjectiveState;
+  unlockedBadgeIds: ProfileBadgeId[];
+  unlockedCosmeticIds: SkinCosmeticId[];
+  lastAttemptProgress: number;
+  lastAttemptDisqualified: boolean;
   missionArchive: DailyMissionArchiveEntry[];
   dailyStreak: DailyStreakData;
   totalGems: number;
   dateKey: string;
   onClaimMission: (missionId: string) => void;
+  onClaimDailyRunObjective: () => void;
   onClaimAll: () => void;
   onClose: () => void;
 }
@@ -67,13 +85,36 @@ function getMissionTypeLabel(type: MissionType): string {
   }
 }
 
+function getDailyRunIcon(metric: DailyRunObjectiveMetric) {
+  switch (metric) {
+    case 'slides':
+      return <ArrowDown className="w-4 h-4 text-amber-300" />;
+    case 'gems':
+      return <Gem className="w-4 h-4 text-emerald-300" />;
+    case 'distance':
+      return <Footprints className="w-4 h-4 text-sky-300" />;
+    case 'styleBonuses':
+      return <Sparkles className="w-4 h-4 text-rose-300" />;
+    case 'jumps':
+      return <ArrowUp className="w-4 h-4 text-sky-300" />;
+    case 'springHits':
+      return <Zap className="w-4 h-4 text-yellow-300" />;
+  }
+}
+
 export const MissionsModal: React.FC<MissionsModalProps> = ({
   missions,
+  dailyRunObjective,
+  unlockedBadgeIds,
+  unlockedCosmeticIds,
+  lastAttemptProgress,
+  lastAttemptDisqualified,
   missionArchive,
   dailyStreak,
   totalGems,
   dateKey,
   onClaimMission,
+  onClaimDailyRunObjective,
   onClaimAll,
   onClose,
 }) => {
@@ -81,8 +122,24 @@ export const MissionsModal: React.FC<MissionsModalProps> = ({
   const [historyScope, setHistoryScope] = useState<'week' | 'previous'>('week');
   const [selectedDayKey, setSelectedDayKey] = useState<string | null>(null);
 
-  const claimableCount = missions.filter((m) => m.progress >= m.target && !m.claimed).length;
+  const dailyRunTpl = getDailyRunObjectiveTemplateById(dailyRunObjective.templateId);
+  const dailyRunBadge = getBadgeById(dailyRunTpl.rewardBadgeId);
+  const dailyRunCosmetic = getCosmeticById(dailyRunTpl.rewardCosmeticId);
+  const dailyRunCanClaim = dailyRunObjective.completed && !dailyRunObjective.claimed;
+  const dailyRunPct = Math.min(
+    100,
+    Math.round((dailyRunObjective.bestProgress / dailyRunTpl.target) * 100),
+  );
+  const alreadyOwnsBadge = unlockedBadgeIds.includes(dailyRunTpl.rewardBadgeId);
+  const alreadyOwnsCosmetic = unlockedCosmeticIds.includes(dailyRunTpl.rewardCosmeticId);
+  const effectiveDailyGems =
+    dailyRunTpl.rewardGems + (alreadyOwnsBadge && alreadyOwnsCosmetic ? dailyRunTpl.repeatBonusGems : 0);
+
+  const claimableMissionsCount = missions.filter((m) => m.progress >= m.target && !m.claimed).length;
+  const claimableCount = claimableMissionsCount + (dailyRunCanClaim ? 1 : 0);
   const completedCount = missions.filter((m) => m.progress >= m.target).length;
+  const totalTodayDone = completedCount + (dailyRunObjective.completed ? 1 : 0);
+  const totalTodayGoalCount = missions.length + 1;
   const securedToday = dailyStreak.lastCompletedDateKey === dateKey;
 
   const weeklySummary = useMemo(
@@ -142,7 +199,7 @@ export const MissionsModal: React.FC<MissionsModalProps> = ({
             </h2>
             <p className="text-xs text-slate-300 mt-0.5 tabular-nums">
               {activeTab === 'today'
-                ? `${completedCount}/${missions.length} completed · Progress carries across runs`
+                ? `${totalTodayDone}/${totalTodayGoalCount} completed · Daily Challenge + cumulative runs`
                 : `Last 7 days · ${weeklySummary.totalCompleted}/${weeklySummary.totalPossible} missions · +${weeklySummary.totalGemsEarned} gems`}
             </p>
           </div>
@@ -169,7 +226,7 @@ export const MissionsModal: React.FC<MissionsModalProps> = ({
             }`}
           >
             <Target className="w-3.5 h-3.5 shrink-0" />
-            <span>Today ({completedCount}/{missions.length})</span>
+            <span>Today ({totalTodayDone}/{totalTodayGoalCount})</span>
           </button>
           <button
             type="button"
@@ -214,8 +271,156 @@ export const MissionsModal: React.FC<MissionsModalProps> = ({
                 </span>
               </div>
 
-              {/* Mission List */}
-              <div className="mt-3.5 flex flex-col gap-3">
+              {/* Daily Featured Single-Run Objective */}
+              <section aria-labelledby="daily-run-objective-heading" className="mt-3.5">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <h3
+                    id="daily-run-objective-heading"
+                    className="text-[11px] font-black uppercase tracking-widest text-emerald-300 flex items-center gap-1.5"
+                  >
+                    <Trophy className="w-3.5 h-3.5 shrink-0" />
+                    <span>Daily Run Objective</span>
+                  </h3>
+                  <span className="text-[11px] font-semibold text-slate-400">
+                    Single-run milestone
+                  </span>
+                </div>
+
+                <div
+                  className={`rounded-xl border p-3.5 transition-colors ${
+                    dailyRunCanClaim
+                      ? 'bg-amber-400/14 border-amber-400/60'
+                      : dailyRunObjective.claimed
+                        ? 'bg-emerald-500/10 border-emerald-400/35'
+                        : 'bg-[#101c33] border-emerald-400/30'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2.5">
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <div className="w-9 h-9 rounded-lg bg-[#080f1d] border border-white/10 flex items-center justify-center shrink-0 mt-0.5">
+                        {getDailyRunIcon(dailyRunTpl.metric)}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-[10px] font-black uppercase tracking-widest text-emerald-300">
+                          {dailyRunTpl.title}
+                        </div>
+                        <div className="text-sm font-extrabold text-white mt-0.5">
+                          {dailyRunTpl.label}
+                        </div>
+                        <p className="text-[11px] text-slate-300 mt-0.5 leading-snug">
+                          {dailyRunTpl.ruleHint}
+                        </p>
+                      </div>
+                    </div>
+
+                    {dailyRunCanClaim ? (
+                      <button
+                        type="button"
+                        onClick={onClaimDailyRunObjective}
+                        className="inline-flex items-center gap-1 rounded-lg bg-amber-400 hover:bg-amber-300 active:scale-95 text-slate-950 font-black uppercase tracking-wider text-xs px-3 py-2 transition-transform cursor-pointer shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
+                      >
+                        <Trophy className="w-3.5 h-3.5" />
+                        <span>Claim</span>
+                      </button>
+                    ) : dailyRunObjective.claimed ? (
+                      <div className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/20 border border-emerald-400/40 px-2.5 py-1 text-[11px] font-black uppercase tracking-wider text-emerald-300 shrink-0">
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Claimed</span>
+                      </div>
+                    ) : (
+                      <div className="text-right shrink-0 tabular-nums">
+                        <div className="text-xs font-black text-emerald-300">
+                          {dailyRunObjective.bestProgress}/{dailyRunTpl.target}
+                        </div>
+                        <div className="text-[10px] font-semibold text-slate-400">
+                          Best today
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Progress bar */}
+                  <div className="mt-2.5 h-2 w-full rounded-full bg-slate-900 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all duration-200 ${
+                        dailyRunObjective.claimed
+                          ? 'bg-emerald-400'
+                          : dailyRunObjective.completed
+                            ? 'bg-amber-400'
+                            : 'bg-emerald-400'
+                      }`}
+                      style={{ width: `${dailyRunPct}%` }}
+                    />
+                  </div>
+
+                  <div className="mt-2 flex items-center justify-between gap-2 text-[11px] text-slate-300 tabular-nums">
+                    <span>
+                      Best single run: <strong className="text-white">{dailyRunObjective.bestProgress}</strong> /{' '}
+                      {dailyRunTpl.target} {getDailyRunMetricUnit(dailyRunTpl.metric)} ({dailyRunPct}%)
+                    </span>
+                    {!dailyRunObjective.completed && lastAttemptDisqualified && (
+                      <span className="inline-flex items-center gap-1 text-rose-300 font-bold">
+                        <ShieldAlert className="w-3 h-3 shrink-0" />
+                        <span>Last run broke rule</span>
+                      </span>
+                    )}
+                    {!dailyRunObjective.completed && !lastAttemptDisqualified && lastAttemptProgress > 0 && (
+                      <span className="text-slate-400">
+                        Last run: {lastAttemptProgress}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Unique Reward Breakdown (unboxed typographic row) */}
+                  <div className="mt-2.5 pt-2 border-t border-white/10 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-bold">
+                    <span className="text-sky-300 inline-flex items-center gap-1 tabular-nums">
+                      <Gem className="w-3 h-3 shrink-0" />
+                      <span>+{effectiveDailyGems} Gems</span>
+                    </span>
+                    {dailyRunCosmetic && (
+                      <span
+                        className="inline-flex items-center gap-1"
+                        style={{ color: dailyRunCosmetic.accentHex }}
+                      >
+                        <Sparkles className="w-3 h-3 shrink-0" />
+                        <span>
+                          {alreadyOwnsCosmetic
+                            ? `Gear: ${dailyRunCosmetic.name} (Owned)`
+                            : `Unique Gear: ${dailyRunCosmetic.name}`}
+                        </span>
+                      </span>
+                    )}
+                    {dailyRunBadge && (
+                      <span
+                        className="inline-flex items-center gap-1"
+                        style={{ color: dailyRunBadge.accentHex }}
+                      >
+                        <Award className="w-3 h-3 shrink-0" />
+                        <span>
+                          {alreadyOwnsBadge
+                            ? `Badge: ${dailyRunBadge.name} (Owned)`
+                            : `Badge: ${dailyRunBadge.name}`}
+                        </span>
+                      </span>
+                    )}
+                    <span className="inline-flex items-center gap-1 text-amber-300 tabular-nums">
+                      <Zap className="w-3 h-3 shrink-0" />
+                      <span>
+                        +{Math.round((dailyRunTpl.rewardBoost.multiplier - 1) * 100)}% Next-Run Boost
+                      </span>
+                    </span>
+                  </div>
+                </div>
+              </section>
+
+              {/* Cumulative Mission List */}
+              <div className="mt-4 flex items-center justify-between text-[11px] font-black uppercase tracking-widest text-amber-300">
+                <span>Cumulative Daily Missions</span>
+                <span className="font-semibold normal-case tracking-normal text-slate-400">
+                  Progress carries across runs
+                </span>
+              </div>
+              <div className="mt-2 flex flex-col gap-3">
                 {missions.map((mission) => {
                   const pct = Math.min(100, Math.round((mission.progress / mission.target) * 100));
                   const isComplete = mission.progress >= mission.target;

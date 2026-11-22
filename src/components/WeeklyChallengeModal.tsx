@@ -307,6 +307,7 @@ export const WeeklyChallengeModal: React.FC<WeeklyChallengeModalProps> = ({
                         </div>
                         <p className="text-[11px] text-slate-400 mt-1 leading-snug">
                           {badge.description}
+                          {badge.source === 'daily_run' ? ' · Daily Run' : ' · Weekly'}
                         </p>
                       </button>
                     );
@@ -363,6 +364,7 @@ export const WeeklyChallengeModal: React.FC<WeeklyChallengeModalProps> = ({
                         </div>
                         <p className="text-[11px] text-slate-400 mt-1 leading-snug">
                           {cosmetic.description}
+                          {cosmetic.source === 'daily_run' ? ' · Daily Run' : ' · Weekly'}
                         </p>
                       </button>
                     );

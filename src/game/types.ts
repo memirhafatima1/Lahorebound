@@ -102,19 +102,28 @@ export type ProfileBadgeId =
   | 'lahore_legend'
   | 'gem_sovereign'
   | 'street_virtuoso'
-  | 'sky_acrobat';
+  | 'sky_acrobat'
+  | 'slide_phantom'
+  | 'grounded_jade'
+  | 'iron_strider'
+  | 'bazaar_virtuoso';
 
 export type SkinCosmeticId =
   | 'starlight_crown'
   | 'truckart_wings'
   | 'emerald_crest'
-  | 'comet_halo';
+  | 'comet_halo'
+  | 'marigold_scarf'
+  | 'badshahi_crest'
+  | 'prism_thrusters'
+  | 'golden_chakkar';
 
 export interface ProfileBadge {
   id: ProfileBadgeId;
   name: string;
   description: string;
   accentHex: string;
+  source?: 'weekly' | 'daily_run';
 }
 
 export interface SkinCosmetic {
@@ -123,6 +132,40 @@ export interface SkinCosmetic {
   description: string;
   accentHex: string;
   secondaryHex: string;
+  source?: 'weekly' | 'daily_run';
+}
+
+export type DailyRunObjectiveMetric =
+  | 'slides'
+  | 'gems'
+  | 'distance'
+  | 'styleBonuses'
+  | 'jumps'
+  | 'springHits';
+
+export type DailyRunForbiddenAction = 'jumps' | 'slides';
+
+export interface DailyRunObjectiveTemplate {
+  id: string;
+  title: string;
+  label: string;
+  ruleHint: string;
+  metric: DailyRunObjectiveMetric;
+  target: number;
+  forbidAction: DailyRunForbiddenAction | null;
+  rewardGems: number;
+  repeatBonusGems: number;
+  rewardBadgeId: ProfileBadgeId;
+  rewardCosmeticId: SkinCosmeticId;
+  rewardBoost: TemporarySpeedBoostState;
+}
+
+export interface DailyRunObjectiveState {
+  dateKey: string;
+  templateId: string;
+  bestProgress: number;
+  completed: boolean;
+  claimed: boolean;
 }
 
 export interface WeeklyChallenge {
@@ -211,6 +254,7 @@ export interface HudSnapshot {
   weather: WeatherCondition;
   weatherLabel: string;
   weatherAccentHex: string;
+  ambientOverlayLabel: string;
   musicTrack: MusicTrackId;
   musicTrackLabel: string;
   radioStation: RadioStationId;
@@ -284,9 +328,11 @@ export interface SaveData {
   radioStation: RadioStationId;
   lightingMode: LightingMode;
   eventMode: GlobalEventMode;
+  ambientWeatherOverlay: boolean;
   hapticsEnabled: boolean;
   showTouchButtons: boolean;
   dailyMissions: DailyMissionState;
+  dailyRunObjective: DailyRunObjectiveState;
   missionArchive: DailyMissionArchiveEntry[];
   weeklyChallenges: WeeklyChallengeState;
   unlockedBadgeIds: ProfileBadgeId[];
