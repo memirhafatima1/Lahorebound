@@ -1,0 +1,6 @@
+{
+  "name": "Lahore Bound",
+  "description": "A 3D low-poly endless runner through the streets and landmarks of Lahore, with dynamic courses, mobile touch controls, and unlockable runner skins.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
