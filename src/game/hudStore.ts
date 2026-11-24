@@ -20,6 +20,8 @@ export const INITIAL_HUD_SNAPSHOT: HudSnapshot = {
   weatherLabel: 'Sunny Haze',
   weatherAccentHex: '#fbbf24',
   ambientOverlayLabel: 'Warm Sandstone Heat Shimmer · Courtyard Breeze',
+  timeOfDayLabel: 'Sunrise',
+  timeOfDayHour: 6.15,
   musicTrack: 'street_ambient',
   musicTrackLabel: 'Street Breeze',
   radioStation: 'auto',

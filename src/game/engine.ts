@@ -6,6 +6,7 @@ import { LowPolyCharacter } from './character';
 import {
   createDayNightState,
   getHourForLightingMode,
+  getTimePhaseLabel,
   sampleDayNightState,
   type DayNightState,
 } from './dayNightCycle';
@@ -53,11 +54,13 @@ import {
   getBiomeForDistance,
 } from './world';
 
+const _targetZenith = new THREE.Color();
 const _targetSky = new THREE.Color();
 const _targetFog = new THREE.Color();
 const _targetHemiSky = new THREE.Color();
 const _targetHemiGround = new THREE.Color();
 const _targetSun = new THREE.Color();
+const _targetSunGlow = new THREE.Color();
 const _targetRim = new THREE.Color();
 const _biomeSky = new THREE.Color();
 const _biomeFog = new THREE.Color();
@@ -88,6 +91,7 @@ const _carnivalRim = new THREE.Color(0x22d3ee);
 const _carnivalGlow = new THREE.Color(0xf43f5e);
 const _carnivalSky = new THREE.Color();
 const _carnivalFog = new THREE.Color();
+const _skySunDir = new THREE.Vector3(0, 0.35, -1);
 const _lookAtTarget = new THREE.Vector3();
 const _camDesired = new THREE.Vector3();
 const _weatherModifiers: WeatherLightingModifiers = {
@@ -111,6 +115,22 @@ const MAX_FOV = 68;
 const LANDMARK_TRANSITION_DURATION = 0.92;
 const SONIC_BREAK_DURATION = 0.46;
 const CARNIVAL_CONFETTI_COLORS = [0xec4899, 0xfbbf24, 0x22d3ee] as const;
+
+function createSsaoKernel(count = 16): THREE.Vector3[] {
+  const kernel: THREE.Vector3[] = [];
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < count; i++) {
+    const t = (i + 0.5) / count;
+    const z = Math.sqrt(1 - t * 0.88);
+    const rXY = Math.sqrt(Math.max(0, 1 - z * z));
+    const theta = i * goldenAngle;
+    const scale = THREE.MathUtils.lerp(0.1, 1.0, (i / count) * (i / count));
+    kernel.push(
+      new THREE.Vector3(Math.cos(theta) * rXY, Math.sin(theta) * rXY, z).multiplyScalar(scale),
+    );
+  }
+  return kernel;
+}
 
 function segmentPointDistSq(
   ax: number,
@@ -239,6 +259,7 @@ export class SkyboundEngine {
   private readonly nightGlowLight: THREE.PointLight;
   private readonly horizonRing: THREE.Group;
   private readonly celestialGroup: THREE.Group;
+  private readonly skyDomeMat: THREE.ShaderMaterial;
   private readonly sunGroup: THREE.Group;
   private readonly sunDiscMat: THREE.MeshBasicMaterial;
   private readonly sunHaloMat: THREE.MeshBasicMaterial;
@@ -252,14 +273,29 @@ export class SkyboundEngine {
   private eventMode: GlobalEventMode = 'auto';
   private globalEventStatus: GlobalEventStatus = getStreetCarnivalStatus('auto');
   private carnivalBlend = this.globalEventStatus.active ? 1 : 0;
-  private timeCheckAccum = 0;
   private eventCheckAccum = 0;
   private carnivalConfettiAccum = 0;
   private currentNightFactor = 0;
   private activeSkinId = 'trailblazer';
   private readonly chronosOverlayMesh: THREE.Mesh;
   private readonly chronosOverlayMat: THREE.ShaderMaterial;
+  private readonly sceneDepthTexture: THREE.DepthTexture;
   private readonly transitionTarget: THREE.WebGLRenderTarget;
+  private readonly ssaoTarget: THREE.WebGLRenderTarget;
+  private readonly ssaoBlurTarget: THREE.WebGLRenderTarget;
+  private readonly ssaoScene: THREE.Scene;
+  private readonly ssaoMat: THREE.ShaderMaterial;
+  private readonly ssaoBlurScene: THREE.Scene;
+  private readonly ssaoBlurMat: THREE.ShaderMaterial;
+  private readonly bloomQuarterA: THREE.WebGLRenderTarget;
+  private readonly bloomQuarterB: THREE.WebGLRenderTarget;
+  private readonly bloomEighthA: THREE.WebGLRenderTarget;
+  private readonly bloomEighthB: THREE.WebGLRenderTarget;
+  private readonly bloomPrefilterScene: THREE.Scene;
+  private readonly bloomPrefilterMat: THREE.ShaderMaterial;
+  private readonly bloomBlurScene: THREE.Scene;
+  private readonly bloomBlurMat: THREE.ShaderMaterial;
+  private readonly postQuadGeo: THREE.PlaneGeometry;
   private readonly blurZoomScene: THREE.Scene;
   private readonly blurZoomCamera: THREE.OrthographicCamera;
   private readonly blurZoomQuad: THREE.Mesh;
@@ -279,6 +315,8 @@ export class SkyboundEngine {
   private smoothedTierSpeed = 1.0;
 
   private readonly character: LowPolyCharacter;
+  private readonly boundFootTerrainSampler = (x: number, z: number): number =>
+    this.sampleFootSurfaceHeight(x, z);
   private readonly worldBuilder: WorldBuilder;
   private readonly particles = new ParticlePool();
   private readonly powerupVfx = new PowerupVfxSystem();
@@ -310,6 +348,11 @@ export class SkyboundEngine {
   private playerY = 0;
   private playerZ = 0;
   private laneVelX = 0;
+  private prevLaneVelX = 0;
+  private smoothedLaneAccelX = 0;
+  private smoothedObstacleProx = 0;
+  private smoothedObstacleSide = 0;
+  private nearestObstacleKind: 'none' | 'jump' | 'slide' | 'tall' | 'moving' = 'none';
   private vy = 0;
   private isGrounded = true;
   private isSliding = false;
@@ -407,6 +450,7 @@ export class SkyboundEngine {
     initialLightingMode: LightingMode = 'auto',
     initialEventMode: GlobalEventMode = 'auto',
     initialAmbientOverlay = true,
+    initialDebugFootIk = false,
   ) {
     this.container = container;
     this.callbacks = callbacks;
@@ -505,9 +549,10 @@ export class SkyboundEngine {
     this.nightGlowLight.position.set(0, 3.4, -4);
     this.scene.add(this.nightGlowLight);
 
-    // Distant celestial sky dome (sun, crescent moon, and stars synced to real local time)
+    // Distant celestial skybox dome (gradient sky, sun, crescent moon, and stars)
     const celestial = this.createCelestialDome();
     this.celestialGroup = celestial.group;
+    this.skyDomeMat = celestial.skyDomeMat;
     this.sunGroup = celestial.sunGroup;
     this.sunDiscMat = celestial.sunDiscMat;
     this.sunHaloMat = celestial.sunHaloMat;
@@ -524,7 +569,9 @@ export class SkyboundEngine {
 
     // Character & pooled particles / power-up VFX
     this.character = new LowPolyCharacter(initialSkin, initialCosmeticId);
+    this.character.setFootIkDebugVisible(initialDebugFootIk);
     this.scene.add(this.character.root);
+    this.scene.add(this.character.debugFootIkGroup);
     this.scene.add(this.particles.mesh);
     this.scene.add(this.powerupVfx.group);
     this.scene.add(this.weatherSystem.group);
@@ -587,29 +634,381 @@ export class SkyboundEngine {
     this.chronosOverlayMesh.visible = false;
     this.scene.add(this.chronosOverlayMesh);
 
-    // Zone-change radial Blur-Zoom post-pass (renders only during landmark transitions)
+    // Scene color+depth target, half-res SSAO + bilateral blur targets, and final composite pass
     const gl = this.renderer.getContext();
     const supportsHalfFloat =
       !this.isSoftwareGl &&
       Boolean(gl.getExtension('EXT_color_buffer_half_float') || gl.getExtension('EXT_color_buffer_float'));
     const rtScale = this.isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio, 1.5);
-    this.transitionTarget = new THREE.WebGLRenderTarget(
-      Math.max(1, Math.floor(width * rtScale)),
-      Math.max(1, Math.floor(height * rtScale)),
-      {
-        type: supportsHalfFloat ? THREE.HalfFloatType : THREE.UnsignedByteType,
-        minFilter: THREE.LinearFilter,
-        magFilter: THREE.LinearFilter,
-        depthBuffer: true,
-        stencilBuffer: false,
+    const rtWidth = Math.max(1, Math.floor(width * rtScale));
+    const rtHeight = Math.max(1, Math.floor(height * rtScale));
+    const halfRtWidth = Math.max(1, Math.floor(rtWidth * 0.5));
+    const halfRtHeight = Math.max(1, Math.floor(rtHeight * 0.5));
+    const quarterRtWidth = Math.max(1, Math.floor(rtWidth * 0.25));
+    const quarterRtHeight = Math.max(1, Math.floor(rtHeight * 0.25));
+    const eighthRtWidth = Math.max(1, Math.floor(rtWidth * 0.125));
+    const eighthRtHeight = Math.max(1, Math.floor(rtHeight * 0.125));
+    const hdrType = supportsHalfFloat ? THREE.HalfFloatType : THREE.UnsignedByteType;
+
+    this.sceneDepthTexture = new THREE.DepthTexture(rtWidth, rtHeight, THREE.UnsignedIntType);
+    this.sceneDepthTexture.format = THREE.DepthFormat;
+    this.sceneDepthTexture.minFilter = THREE.NearestFilter;
+    this.sceneDepthTexture.magFilter = THREE.NearestFilter;
+
+    this.transitionTarget = new THREE.WebGLRenderTarget(rtWidth, rtHeight, {
+      type: hdrType,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: true,
+      stencilBuffer: false,
+      depthTexture: this.sceneDepthTexture,
+    });
+
+    this.ssaoTarget = new THREE.WebGLRenderTarget(halfRtWidth, halfRtHeight, {
+      type: THREE.UnsignedByteType,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+
+    this.ssaoBlurTarget = new THREE.WebGLRenderTarget(halfRtWidth, halfRtHeight, {
+      type: THREE.UnsignedByteType,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+
+    const bloomRtOptions: THREE.RenderTargetOptions = {
+      type: hdrType,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+    };
+    this.bloomQuarterA = new THREE.WebGLRenderTarget(quarterRtWidth, quarterRtHeight, bloomRtOptions);
+    this.bloomQuarterB = new THREE.WebGLRenderTarget(quarterRtWidth, quarterRtHeight, bloomRtOptions);
+    this.bloomEighthA = new THREE.WebGLRenderTarget(eighthRtWidth, eighthRtHeight, bloomRtOptions);
+    this.bloomEighthB = new THREE.WebGLRenderTarget(eighthRtWidth, eighthRtHeight, bloomRtOptions);
+
+    this.postQuadGeo = new THREE.PlaneGeometry(2, 2);
+    this.blurZoomCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+    this.ssaoScene = new THREE.Scene();
+    this.ssaoMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tDepth: { value: this.sceneDepthTexture },
+        uProjection: { value: this.camera.projectionMatrix.clone() },
+        uInvProjection: { value: this.camera.projectionMatrixInverse.clone() },
+        uDepthTexelSize: { value: new THREE.Vector2(1 / rtWidth, 1 / rtHeight) },
+        uKernel: { value: createSsaoKernel(16) },
+        uRadius: { value: 0.72 },
+        uBias: { value: 0.03 },
       },
-    );
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDepth;
+        uniform mat4 uProjection;
+        uniform mat4 uInvProjection;
+        uniform vec2 uDepthTexelSize;
+        uniform vec3 uKernel[16];
+        uniform float uRadius;
+        uniform float uBias;
+        varying vec2 vUv;
+
+        vec3 reconstructViewPos(vec2 uv, float rawDepth) {
+          vec4 clipPos = vec4(uv * 2.0 - 1.0, rawDepth * 2.0 - 1.0, 1.0);
+          vec4 viewPos = uInvProjection * clipPos;
+          return viewPos.xyz / max(viewPos.w, 1e-5);
+        }
+
+        // Edge-preserving 4-tap cross normal reconstruction (prevents silhouette haloing)
+        vec3 reconstructNormal(vec2 uv, vec3 viewPos) {
+          vec2 dxUv = vec2(uDepthTexelSize.x, 0.0);
+          vec2 dyUv = vec2(0.0, uDepthTexelSize.y);
+
+          float dL = texture2D(tDepth, clamp(uv - dxUv, 0.0005, 0.9995)).x;
+          float dR = texture2D(tDepth, clamp(uv + dxUv, 0.0005, 0.9995)).x;
+          float dD = texture2D(tDepth, clamp(uv - dyUv, 0.0005, 0.9995)).x;
+          float dU = texture2D(tDepth, clamp(uv + dyUv, 0.0005, 0.9995)).x;
+
+          vec3 pL = reconstructViewPos(uv - dxUv, dL);
+          vec3 pR = reconstructViewPos(uv + dxUv, dR);
+          vec3 pD = reconstructViewPos(uv - dyUv, dD);
+          vec3 pU = reconstructViewPos(uv + dyUv, dU);
+
+          vec3 dX1 = pR - viewPos;
+          vec3 dX2 = viewPos - pL;
+          vec3 dX = abs(dX1.z) < abs(dX2.z) ? dX1 : dX2;
+
+          vec3 dY1 = pU - viewPos;
+          vec3 dY2 = viewPos - pD;
+          vec3 dY = abs(dY1.z) < abs(dY2.z) ? dY1 : dY2;
+
+          vec3 n = cross(dX, dY);
+          float lenSq = dot(n, n);
+          return lenSq > 1e-10 ? n * inversesqrt(lenSq) : vec3(0.0, 0.0, 1.0);
+        }
+
+        void main() {
+          float centerDepth = texture2D(tDepth, vUv).x;
+          if (centerDepth >= 0.9994) {
+            gl_FragColor = vec4(1.0);
+            return;
+          }
+
+          vec3 viewPos = reconstructViewPos(vUv, centerDepth);
+          float viewDist = -viewPos.z;
+          if (viewDist > 128.0) {
+            gl_FragColor = vec4(1.0);
+            return;
+          }
+
+          vec3 normal = reconstructNormal(vUv, viewPos);
+
+          // Interleaved 4x4 screen-space rotation angle to break up banding
+          vec2 cell = floor(mod(gl_FragCoord.xy, 4.0));
+          float angle = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+          vec3 rvec = vec3(cos(angle), sin(angle), 0.0);
+
+          vec3 tangentVec = rvec - normal * dot(rvec, normal);
+          if (dot(tangentVec, tangentVec) < 1e-5) {
+            vec3 altAxis = abs(normal.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+            tangentVec = cross(altAxis, normal);
+          }
+          vec3 tangent = normalize(tangentVec);
+          vec3 bitangent = cross(normal, tangent);
+          mat3 tbn = mat3(tangent, bitangent, normal);
+
+          float depthBias = uBias + viewDist * 0.0022;
+          float sampleRadius = uRadius * mix(0.82, 1.35, smoothstep(6.0, 48.0, viewDist));
+          float occlusion = 0.0;
+
+          for (int i = 0; i < 16; i++) {
+            vec3 sampleViewPos = viewPos + (tbn * uKernel[i]) * sampleRadius;
+            vec4 offset = uProjection * vec4(sampleViewPos, 1.0);
+            vec2 sampleUv = (offset.xy / max(offset.w, 0.0001)) * 0.5 + 0.5;
+
+            if (sampleUv.x < 0.001 || sampleUv.x > 0.999 || sampleUv.y < 0.001 || sampleUv.y > 0.999) {
+              continue;
+            }
+
+            float sampleDepthRaw = texture2D(tDepth, sampleUv).x;
+            if (sampleDepthRaw >= 0.9994) {
+              continue;
+            }
+
+            vec3 actualViewPos = reconstructViewPos(sampleUv, sampleDepthRaw);
+            float rangeCheck = smoothstep(0.0, 1.0, sampleRadius / max(abs(viewPos.z - actualViewPos.z), 0.0001));
+            float occ = step(sampleViewPos.z + depthBias, actualViewPos.z);
+            occlusion += occ * rangeCheck;
+          }
+
+          float rawAo = clamp(1.0 - (occlusion / 16.0), 0.0, 1.0);
+          // Fade smoothly into horizon fog so distant skyline stays crisp
+          float distFade = 1.0 - smoothstep(42.0, 128.0, viewDist);
+          float ao = mix(1.0, pow(rawAo, 1.35), distFade);
+
+          gl_FragColor = vec4(ao, ao, ao, 1.0);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const ssaoQuad = new THREE.Mesh(this.postQuadGeo, this.ssaoMat);
+    ssaoQuad.frustumCulled = false;
+    this.ssaoScene.add(ssaoQuad);
+
+    this.ssaoBlurScene = new THREE.Scene();
+    this.ssaoBlurMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tSsao: { value: this.ssaoTarget.texture },
+        tDepth: { value: this.sceneDepthTexture },
+        uTexelSize: { value: new THREE.Vector2(1 / halfRtWidth, 1 / halfRtHeight) },
+        uCameraNearFar: { value: new THREE.Vector2(this.camera.near, this.camera.far) },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tSsao;
+        uniform sampler2D tDepth;
+        uniform vec2 uTexelSize;
+        uniform vec2 uCameraNearFar;
+        varying vec2 vUv;
+
+        float linearizeDepth(float d) {
+          float nearP = uCameraNearFar.x;
+          float farP = uCameraNearFar.y;
+          float z = d * 2.0 - 1.0;
+          return (2.0 * nearP * farP) / max(farP + nearP - z * (farP - nearP), 0.0001);
+        }
+
+        void main() {
+          float centerDepthRaw = texture2D(tDepth, vUv).x;
+          if (centerDepthRaw >= 0.9994) {
+            gl_FragColor = vec4(1.0);
+            return;
+          }
+
+          float centerLinZ = linearizeDepth(centerDepthRaw);
+          float accum = 0.0;
+          float weightSum = 0.0;
+
+          // Centered 4x4 depth-aware bilateral kernel matching 4x4 interleaved rotation noise
+          for (int x = 0; x < 4; x++) {
+            for (int y = 0; y < 4; y++) {
+              vec2 offset = vec2(float(x) - 1.5, float(y) - 1.5) * uTexelSize;
+              vec2 sampleUv = clamp(vUv + offset, 0.0005, 0.9995);
+              float sampleAo = texture2D(tSsao, sampleUv).r;
+              float sampleLinZ = linearizeDepth(texture2D(tDepth, sampleUv).x);
+              float depthDiff = abs(sampleLinZ - centerLinZ);
+              float w = exp(-depthDiff * 2.4);
+              accum += sampleAo * w;
+              weightSum += w;
+            }
+          }
+
+          float ao = weightSum > 0.0001 ? accum / weightSum : texture2D(tSsao, vUv).r;
+          gl_FragColor = vec4(ao, ao, ao, 1.0);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const ssaoBlurQuad = new THREE.Mesh(this.postQuadGeo, this.ssaoBlurMat);
+    ssaoBlurQuad.frustumCulled = false;
+    this.ssaoBlurScene.add(ssaoBlurQuad);
+
+    this.bloomPrefilterScene = new THREE.Scene();
+    this.bloomPrefilterMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: this.transitionTarget.texture },
+        uTexelSize: { value: new THREE.Vector2(1 / rtWidth, 1 / rtHeight) },
+        uThreshold: { value: 0.9 },
+        uKnee: { value: 0.28 },
+        uOverdriveFactor: { value: 0 },
+        uAuraTint: { value: new THREE.Color(0xfbbf24) },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform vec2 uTexelSize;
+        uniform float uThreshold;
+        uniform float uKnee;
+        uniform float uOverdriveFactor;
+        uniform vec3 uAuraTint;
+        varying vec2 vUv;
+
+        float luma(vec3 c) {
+          return dot(c, vec3(0.2126, 0.7152, 0.0722));
+        }
+
+        void main() {
+          // 4-tap Karis-weighted anti-firefly box downsample to prevent specular shimmering
+          vec2 d = uTexelSize * 0.75;
+          vec3 c0 = texture2D(tDiffuse, clamp(vUv + vec2(-d.x, -d.y), 0.001, 0.999)).rgb;
+          vec3 c1 = texture2D(tDiffuse, clamp(vUv + vec2( d.x, -d.y), 0.001, 0.999)).rgb;
+          vec3 c2 = texture2D(tDiffuse, clamp(vUv + vec2(-d.x,  d.y), 0.001, 0.999)).rgb;
+          vec3 c3 = texture2D(tDiffuse, clamp(vUv + vec2( d.x,  d.y), 0.001, 0.999)).rgb;
+
+          float w0 = 1.0 / (1.0 + luma(c0));
+          float w1 = 1.0 / (1.0 + luma(c1));
+          float w2 = 1.0 / (1.0 + luma(c2));
+          float w3 = 1.0 / (1.0 + luma(c3));
+          vec3 avgColor = (c0 * w0 + c1 * w1 + c2 * w2 + c3 * w3) / max(w0 + w1 + w2 + w3, 1e-4);
+
+          float brightness = max(max(avgColor.r, avgColor.g), avgColor.b);
+          float soft = brightness - uThreshold + uKnee;
+          soft = clamp(soft, 0.0, 2.0 * uKnee);
+          soft = (soft * soft) / max(4.0 * uKnee, 1e-4);
+          float contrib = max(soft, brightness - uThreshold) / max(brightness, 1e-4);
+          vec3 extracted = min(avgColor * contrib, vec3(6.0));
+
+          // Infuse an ethereal iridescent aura into reflective/emissive highlights during overdrive
+          vec3 etherealTint = mix(uAuraTint, vec3(0.68, 0.92, 1.0), 0.35);
+          extracted = mix(extracted, extracted * etherealTint * 1.18, uOverdriveFactor * 0.45);
+
+          gl_FragColor = vec4(extracted, 1.0);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const bloomPrefilterQuad = new THREE.Mesh(this.postQuadGeo, this.bloomPrefilterMat);
+    bloomPrefilterQuad.frustumCulled = false;
+    this.bloomPrefilterScene.add(bloomPrefilterQuad);
+
+    this.bloomBlurScene = new THREE.Scene();
+    this.bloomBlurMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tInput: { value: this.bloomQuarterA.texture },
+        uDirection: { value: new THREE.Vector2(1 / quarterRtWidth, 0) },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tInput;
+        uniform vec2 uDirection;
+        varying vec2 vUv;
+
+        void main() {
+          // 9-tap separable Gaussian kernel
+          vec3 sum = texture2D(tInput, vUv).rgb * 0.227027;
+          sum += texture2D(tInput, clamp(vUv + uDirection * 1.0, 0.001, 0.999)).rgb * 0.1945946;
+          sum += texture2D(tInput, clamp(vUv - uDirection * 1.0, 0.001, 0.999)).rgb * 0.1945946;
+          sum += texture2D(tInput, clamp(vUv + uDirection * 2.0, 0.001, 0.999)).rgb * 0.1216216;
+          sum += texture2D(tInput, clamp(vUv - uDirection * 2.0, 0.001, 0.999)).rgb * 0.1216216;
+          sum += texture2D(tInput, clamp(vUv + uDirection * 3.0, 0.001, 0.999)).rgb * 0.054054;
+          sum += texture2D(tInput, clamp(vUv - uDirection * 3.0, 0.001, 0.999)).rgb * 0.054054;
+          sum += texture2D(tInput, clamp(vUv + uDirection * 4.0, 0.001, 0.999)).rgb * 0.016216;
+          sum += texture2D(tInput, clamp(vUv - uDirection * 4.0, 0.001, 0.999)).rgb * 0.016216;
+          gl_FragColor = vec4(sum, 1.0);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const bloomBlurQuad = new THREE.Mesh(this.postQuadGeo, this.bloomBlurMat);
+    bloomBlurQuad.frustumCulled = false;
+    this.bloomBlurScene.add(bloomBlurQuad);
 
     this.blurZoomScene = new THREE.Scene();
-    this.blurZoomCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     this.blurZoomMat = new THREE.ShaderMaterial({
       uniforms: {
         tDiffuse: { value: this.transitionTarget.texture },
+        tAo: { value: this.ssaoBlurTarget.texture },
+        tBloomTight: { value: this.bloomQuarterA.texture },
+        tBloomWide: { value: this.bloomEighthB.texture },
+        uAoStrength: { value: 0.68 },
+        uBloomIntensity: { value: 0.24 },
+        uOverdriveFactor: { value: 0 },
         uIntensity: { value: 0 },
         uZoomAmount: { value: 0 },
         uTime: { value: 0 },
@@ -630,6 +1029,12 @@ export class SkyboundEngine {
       `,
       fragmentShader: `
         uniform sampler2D tDiffuse;
+        uniform sampler2D tAo;
+        uniform sampler2D tBloomTight;
+        uniform sampler2D tBloomWide;
+        uniform float uAoStrength;
+        uniform float uBloomIntensity;
+        uniform float uOverdriveFactor;
         uniform float uIntensity;
         uniform float uZoomAmount;
         uniform float uTime;
@@ -711,6 +1116,13 @@ export class SkyboundEngine {
             blurred = accum / totalWeight;
           }
 
+          // Composite Screen-Space Ambient Occlusion (SSAO) into crevices while keeping bright emissives vivid
+          float aoSample = texture2D(tAo, baseUv).r;
+          float lum = dot(blurred, vec3(0.2126, 0.7152, 0.0722));
+          float aoWeight = uAoStrength * (1.0 - smoothstep(0.68, 1.55, lum));
+          vec3 aoTint = mix(vec3(0.10, 0.14, 0.26), vec3(1.0), aoSample);
+          blurred *= mix(vec3(1.0), aoTint, aoWeight);
+
           // Subtle landmark prism fringe + velocity edge dispersion + 3.0x sound-barrier RGB chromatic aberration
           float chromaMix = clamp(
             (0.14 + 0.36 * edgeMask) * uIntensity + uSonicIntensity * 0.92 + uVelocityWarp * outerVelocityMask * 0.28,
@@ -729,9 +1141,9 @@ export class SkyboundEngine {
             vec2 rUv = clamp(baseUv + rOffset, 0.001, 0.999);
             vec2 gUv = clamp(baseUv + gOffset, 0.001, 0.999);
             vec2 bUv = clamp(baseUv - bOffset, 0.001, 0.999);
-            blurred.r = mix(blurred.r, texture2D(tDiffuse, rUv).r, chromaMix);
-            blurred.g = mix(blurred.g, texture2D(tDiffuse, gUv).g, uSonicIntensity * 0.65);
-            blurred.b = mix(blurred.b, texture2D(tDiffuse, bUv).b, chromaMix);
+            blurred.r = mix(blurred.r, texture2D(tDiffuse, rUv).r * mix(1.0, aoSample, aoWeight), chromaMix);
+            blurred.g = mix(blurred.g, texture2D(tDiffuse, gUv).g * mix(1.0, aoSample, aoWeight), uSonicIntensity * 0.65);
+            blurred.b = mix(blurred.b, texture2D(tDiffuse, bUv).b * mix(1.0, aoSample, aoWeight), chromaMix);
           }
 
           // Delicate magical iridescent shimmer veil along the expanding wave crest & speed streaks
@@ -740,6 +1152,12 @@ export class SkyboundEngine {
             uIntensity;
           vec3 prismTint = mix(uAccentColor, vec3(0.76, 0.95, 1.0), 0.38 + 0.25 * speedStreams);
           blurred += prismTint * shimmerGlint * 0.14;
+
+          // Multi-scale HDR Bloom + Ethereal Overdrive Aura (applied in linear HDR before ACES tone mapping)
+          vec3 bloomCore = texture2D(tBloomTight, baseUv).rgb;
+          vec3 bloomAura = texture2D(tBloomWide, baseUv).rgb;
+          vec3 auraTint = mix(vec3(1.0), mix(uAccentColor, vec3(0.72, 0.93, 1.0), 0.34), uOverdriveFactor * 0.42);
+          blurred += (bloomCore * 0.58 + bloomAura * (0.62 + 0.40 * uOverdriveFactor) * auraTint) * uBloomIntensity;
 
           // Momentary high-intensity Mach 3.0 flash (amber-white core -> electric violet shockwave)
           float flashPower = pow(uSonicIntensity, 1.85);
@@ -758,7 +1176,7 @@ export class SkyboundEngine {
       depthWrite: false,
       toneMapped: true,
     });
-    this.blurZoomQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.blurZoomMat);
+    this.blurZoomQuad = new THREE.Mesh(this.postQuadGeo, this.blurZoomMat);
     this.blurZoomQuad.frustumCulled = false;
     this.blurZoomScene.add(this.blurZoomQuad);
 
@@ -766,6 +1184,10 @@ export class SkyboundEngine {
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
+      this.renderer.compile(this.ssaoScene, this.blurZoomCamera);
+      this.renderer.compile(this.ssaoBlurScene, this.blurZoomCamera);
+      this.renderer.compile(this.bloomPrefilterScene, this.blurZoomCamera);
+      this.renderer.compile(this.bloomBlurScene, this.blurZoomCamera);
       this.renderer.compile(this.blurZoomScene, this.blurZoomCamera);
     }
 
@@ -778,6 +1200,7 @@ export class SkyboundEngine {
 
   private createCelestialDome(): {
     group: THREE.Group;
+    skyDomeMat: THREE.ShaderMaterial;
     sunGroup: THREE.Group;
     sunDiscMat: THREE.MeshBasicMaterial;
     sunHaloMat: THREE.MeshBasicMaterial;
@@ -789,6 +1212,64 @@ export class SkyboundEngine {
   } {
     const group = new THREE.Group();
 
+    // Procedural atmospheric gradient skybox dome (zenith -> horizon -> solar corona)
+    const skyDomeMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uZenithColor: { value: new THREE.Color(0x3666a6) },
+        uHorizonColor: { value: new THREE.Color(0xf08c6e) },
+        uSunGlowColor: { value: new THREE.Color(0xfb923c) },
+        uSunDir: { value: new THREE.Vector3(-0.26, 0.08, -0.96).normalize() },
+        uSunGlowStrength: { value: 0.9 },
+        uTime: { value: 0 },
+      },
+      vertexShader: `
+        varying vec3 vWorldDir;
+        void main() {
+          vWorldDir = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 uZenithColor;
+        uniform vec3 uHorizonColor;
+        uniform vec3 uSunGlowColor;
+        uniform vec3 uSunDir;
+        uniform float uSunGlowStrength;
+        uniform float uTime;
+        varying vec3 vWorldDir;
+
+        void main() {
+          vec3 dir = normalize(vWorldDir);
+          float elev = clamp(dir.y, -0.18, 1.0);
+          float gradientT = pow(smoothstep(-0.04, 0.68, elev), 0.72);
+          vec3 skyCol = mix(uHorizonColor, uZenithColor, gradientT);
+
+          // Soft atmospheric twilight/horizon band and directional solar scattering glow
+          float horizonBand = exp(-abs(elev - 0.04) * 7.5);
+          float sunDot = max(0.0, dot(dir, normalize(uSunDir)));
+          float sunHalo = pow(sunDot, 5.0) * 0.58 + pow(sunDot, 22.0) * 0.45;
+          skyCol += uSunGlowColor * (horizonBand * 0.22 + sunHalo) * uSunGlowStrength;
+
+          // Subtle drifting high-altitude atmospheric wisps
+          float wisp = sin(dir.x * 6.5 + uTime * 0.035) * cos(dir.z * 5.2 - uTime * 0.025);
+          float wispMask = smoothstep(0.08, 0.55, elev) * (1.0 - smoothstep(0.55, 0.92, elev));
+          skyCol = mix(skyCol, uHorizonColor * 1.12, max(0.0, wisp) * 0.06 * wispMask);
+
+          gl_FragColor = vec4(skyCol, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      toneMapped: true,
+    });
+    const skyDome = new THREE.Mesh(new THREE.SphereGeometry(180, 32, 20), skyDomeMat);
+    skyDome.renderOrder = -20;
+    skyDome.frustumCulled = false;
+    group.add(skyDome);
+
     // Sun + soft warm atmospheric halo
     const sunGroup = new THREE.Group();
     sunGroup.position.set(16, 36, -134);
@@ -796,6 +1277,7 @@ export class SkyboundEngine {
       color: 0xfff3b0,
       transparent: true,
       opacity: 1,
+      depthWrite: false,
       fog: false,
       toneMapped: false,
     });
@@ -808,8 +1290,10 @@ export class SkyboundEngine {
       toneMapped: false,
     });
     const sunDisc = new THREE.Mesh(new THREE.CircleGeometry(4.4, 24), sunDiscMat);
+    sunDisc.renderOrder = -10;
     const sunHalo = new THREE.Mesh(new THREE.CircleGeometry(8.8, 24), sunHaloMat);
     sunHalo.position.z = -0.2;
+    sunHalo.renderOrder = -11;
     sunGroup.add(sunHalo, sunDisc);
     group.add(sunGroup);
 
@@ -825,6 +1309,7 @@ export class SkyboundEngine {
       color: 0xfef3c7,
       transparent: true,
       opacity: 1,
+      depthWrite: false,
       fog: false,
       toneMapped: false,
     });
@@ -837,13 +1322,15 @@ export class SkyboundEngine {
       toneMapped: false,
     });
     const moonMesh = new THREE.Mesh(new THREE.ShapeGeometry(crescentShape, 20), moonMat);
+    moonMesh.renderOrder = -10;
     const moonHalo = new THREE.Mesh(new THREE.CircleGeometry(6.4, 20), moonHaloMat);
     moonHalo.position.z = -0.2;
+    moonHalo.renderOrder = -11;
     moonGroup.add(moonHalo, moonMesh);
     group.add(moonGroup);
 
     // Starfield across upper sky hemisphere
-    const starCount = 210;
+    const starCount = 240;
     const positions = new Float32Array(starCount * 3);
     const colors = new Float32Array(starCount * 3);
     const starPalette = [
@@ -856,7 +1343,7 @@ export class SkyboundEngine {
     for (let i = 0; i < starCount; i++) {
       const theta = Math.random() * Math.PI * 2;
       const phi = Math.random() * (Math.PI * 0.42); // upper hemisphere well above horizon
-      const radius = 128 + Math.random() * 24;
+      const radius = 136 + Math.random() * 24;
       positions[i * 3] = Math.sin(theta) * Math.cos(phi) * radius;
       positions[i * 3 + 1] = 10 + Math.sin(phi) * radius * 0.85;
       positions[i * 3 + 2] = -Math.abs(Math.cos(theta) * Math.cos(phi) * radius) - 12;
@@ -873,7 +1360,7 @@ export class SkyboundEngine {
     starGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
     const starMat = new THREE.PointsMaterial({
-      size: 1.15,
+      size: 1.25,
       sizeAttenuation: true,
       vertexColors: true,
       transparent: true,
@@ -884,10 +1371,12 @@ export class SkyboundEngine {
     });
     const starField = new THREE.Points(starGeo, starMat);
     starField.frustumCulled = false;
+    starField.renderOrder = -15;
     group.add(starField);
 
     return {
       group,
+      skyDomeMat,
       sunGroup,
       sunDiscMat,
       sunHaloMat,
@@ -1027,7 +1516,7 @@ export class SkyboundEngine {
     this.lightingMode = mode;
     this.updateEnvironmentLighting(0, true);
     if (this.photoFrozen) {
-      this.renderer.render(this.scene, this.camera);
+      this.renderFrame();
     }
   }
 
@@ -1036,7 +1525,7 @@ export class SkyboundEngine {
     this.refreshGlobalEventStatus(true);
     this.updateEnvironmentLighting(0, true);
     if (this.photoFrozen) {
-      this.renderer.render(this.scene, this.camera);
+      this.renderFrame();
     }
     this.emitHud();
   }
@@ -1076,7 +1565,7 @@ export class SkyboundEngine {
   public setAmbientOverlayEnabled(enabled: boolean): void {
     this.ambientWeatherOverlay.setEnabled(enabled);
     if (this.photoFrozen) {
-      this.renderer.render(this.scene, this.camera);
+      this.renderFrame();
     }
     this.emitHud();
   }
@@ -1087,6 +1576,17 @@ export class SkyboundEngine {
 
   public getAmbientOverlaySummary(): string {
     return this.ambientWeatherOverlay.getSummary();
+  }
+
+  public setFootIkDebugVisible(enabled: boolean): void {
+    this.character.setFootIkDebugVisible(enabled);
+    if (this.photoFrozen || this.phase === 'paused') {
+      this.renderFrame();
+    }
+  }
+
+  public isFootIkDebugVisible(): boolean {
+    return this.character.isFootIkDebugVisible();
   }
 
   public setPhase(phase: GamePhase): void {
@@ -1165,11 +1665,11 @@ export class SkyboundEngine {
       this.camera.fov = 62;
       this.camera.updateProjectionMatrix();
     }
-    this.renderer.render(this.scene, this.camera);
+    this.renderFrame();
   }
 
   public captureSnapshot(): string {
-    this.renderer.render(this.scene, this.camera);
+    this.renderFrame();
     return this.renderer.domElement.toDataURL('image/png');
   }
 
@@ -1206,6 +1706,11 @@ export class SkyboundEngine {
     this.playerY = 0;
     this.playerZ = 0;
     this.laneVelX = 0;
+    this.prevLaneVelX = 0;
+    this.smoothedLaneAccelX = 0;
+    this.smoothedObstacleProx = 0;
+    this.smoothedObstacleSide = 0;
+    this.nearestObstacleKind = 'none';
     this.vy = 0;
     this.isGrounded = true;
     this.isSliding = false;
@@ -1390,10 +1895,25 @@ export class SkyboundEngine {
     this.renderer.setSize(width, height);
     this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
     const rtScale = this.isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio, 1.5);
-    this.transitionTarget.setSize(
-      Math.max(1, Math.floor(width * rtScale)),
-      Math.max(1, Math.floor(height * rtScale)),
-    );
+    const rtWidth = Math.max(1, Math.floor(width * rtScale));
+    const rtHeight = Math.max(1, Math.floor(height * rtScale));
+    const halfRtWidth = Math.max(1, Math.floor(rtWidth * 0.5));
+    const halfRtHeight = Math.max(1, Math.floor(rtHeight * 0.5));
+    const quarterRtWidth = Math.max(1, Math.floor(rtWidth * 0.25));
+    const quarterRtHeight = Math.max(1, Math.floor(rtHeight * 0.25));
+    const eighthRtWidth = Math.max(1, Math.floor(rtWidth * 0.125));
+    const eighthRtHeight = Math.max(1, Math.floor(rtHeight * 0.125));
+
+    this.transitionTarget.setSize(rtWidth, rtHeight);
+    this.ssaoTarget.setSize(halfRtWidth, halfRtHeight);
+    this.ssaoBlurTarget.setSize(halfRtWidth, halfRtHeight);
+    this.bloomQuarterA.setSize(quarterRtWidth, quarterRtHeight);
+    this.bloomQuarterB.setSize(quarterRtWidth, quarterRtHeight);
+    this.bloomEighthA.setSize(eighthRtWidth, eighthRtHeight);
+    this.bloomEighthB.setSize(eighthRtWidth, eighthRtHeight);
+    (this.ssaoMat.uniforms.uDepthTexelSize.value as THREE.Vector2).set(1 / rtWidth, 1 / rtHeight);
+    (this.ssaoBlurMat.uniforms.uTexelSize.value as THREE.Vector2).set(1 / halfRtWidth, 1 / halfRtHeight);
+    (this.bloomPrefilterMat.uniforms.uTexelSize.value as THREE.Vector2).set(1 / rtWidth, 1 / rtHeight);
   };
 
   private groundHeightAt(x: number, z: number): number {
@@ -1418,6 +1938,40 @@ export class SkyboundEngine {
             surfaceY = THREE.MathUtils.lerp(deck.rampStartY, deck.rampEndY, t);
           }
           if (surfaceY > highest && surfaceY <= this.playerY + 0.85) {
+            highest = surfaceY;
+          }
+        }
+      }
+    }
+    return highest;
+  }
+
+  private sampleFootSurfaceHeight(x: number, z: number): number {
+    let highest = -999;
+    const maxStepUp = this.playerY + 0.95;
+    for (let c = 0; c < this.chunks.length; c++) {
+      const chunk = this.chunks[c];
+      if (z > chunk.zStart + 0.5 || z < chunk.zEnd - 0.5) continue;
+      const decks = chunk.decks;
+      for (let d = 0; d < decks.length; d++) {
+        const deck = decks[d];
+        if (x >= deck.xMin - 0.16 && x <= deck.xMax + 0.16 && z <= deck.zMax + 0.12 && z >= deck.zMin - 0.12) {
+          let surfaceY = deck.topY;
+          if (
+            deck.isRamp &&
+            deck.rampStartZ !== undefined &&
+            deck.rampEndZ !== undefined &&
+            deck.rampStartY !== undefined &&
+            deck.rampEndY !== undefined
+          ) {
+            const t = THREE.MathUtils.clamp(
+              (deck.rampStartZ - z) / Math.max(0.01, deck.rampStartZ - deck.rampEndZ),
+              0,
+              1,
+            );
+            surfaceY = THREE.MathUtils.lerp(deck.rampStartY, deck.rampEndY, t);
+          }
+          if (surfaceY > highest && surfaceY <= maxStepUp) {
             highest = surfaceY;
           }
         }
@@ -1526,8 +2080,12 @@ export class SkyboundEngine {
   };
 
   private renderFrame(): void {
-    const activePostPass =
-      !this.isSoftwareGl &&
+    if (this.isSoftwareGl) {
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
+
+    const activePlayWarp =
       !this.photoFrozen &&
       this.phase === 'playing' &&
       (this.landmarkTransitionIntensity > 0.004 ||
@@ -1536,30 +2094,120 @@ export class SkyboundEngine {
         this.lensZoomStrength > 0.002 ||
         this.screenDistortionStrength > 0.002);
 
-    if (!activePostPass) {
-      this.renderer.render(this.scene, this.camera);
-      return;
-    }
-
-    this.blurZoomMat.uniforms.uIntensity.value = this.landmarkTransitionIntensity;
-    this.blurZoomMat.uniforms.uZoomAmount.value = Math.min(
-      1.4,
-      this.landmarkTransitionIntensity + this.lensZoomStrength * 0.58,
-    );
-    this.blurZoomMat.uniforms.uTime.value = this.clock.elapsedTime;
-    this.blurZoomMat.uniforms.uPhase.value = this.landmarkTransitionPhase;
-    this.blurZoomMat.uniforms.uSonicIntensity.value = this.sonicBreakIntensity;
-    this.blurZoomMat.uniforms.uSonicPhase.value = this.sonicBreakPhase;
-    this.blurZoomMat.uniforms.uBarrelStrength.value = this.lensDistortionStrength;
-    this.blurZoomMat.uniforms.uVelocityWarp.value = this.screenDistortionStrength;
-    this.blurZoomMat.uniforms.uHeatShimmer.value = this.heatShimmerStrength;
-    (this.blurZoomMat.uniforms.uAccentColor.value as THREE.Color).copy(
-      this.landmarkTransitionAccent,
-    );
-
+    // Pass 1: Render 3D scene color + hardware depth buffer
     this.renderer.setRenderTarget(this.transitionTarget);
     this.renderer.clear();
     this.renderer.render(this.scene, this.camera);
+
+    // Pass 2: Half-resolution Screen Space Ambient Occlusion from depth buffer
+    (this.ssaoMat.uniforms.uProjection.value as THREE.Matrix4).copy(this.camera.projectionMatrix);
+    (this.ssaoMat.uniforms.uInvProjection.value as THREE.Matrix4).copy(
+      this.camera.projectionMatrixInverse,
+    );
+    this.renderer.setRenderTarget(this.ssaoTarget);
+    this.renderer.render(this.ssaoScene, this.blurZoomCamera);
+
+    // Pass 3: Depth-aware 4x4 bilateral blur to remove high-frequency kernel rotation noise
+    (this.ssaoBlurMat.uniforms.uCameraNearFar.value as THREE.Vector2).set(
+      this.camera.near,
+      this.camera.far,
+    );
+    this.renderer.setRenderTarget(this.ssaoBlurTarget);
+    this.renderer.render(this.ssaoBlurScene, this.blurZoomCamera);
+
+    // Pass 4: Dynamic Overdrive HDR Bloom (prefilter -> tight 1/4 Gaussian -> wide 1/8 aura)
+    const activeTierSpeed = this.phase === 'playing' ? this.smoothedTierSpeed : 1.0;
+    const boostAura = this.phase === 'playing' && this.speedBoostTimer > 0 ? 0.35 : 0;
+    const overdriveFactor = THREE.MathUtils.clamp(
+      (activeTierSpeed - 1.8) / 1.2 + boostAura,
+      0,
+      1,
+    );
+    const overdriveSurge = THREE.MathUtils.clamp((activeTierSpeed - 3.0) / 0.65, 0, 1);
+
+    const bloomThreshold =
+      THREE.MathUtils.lerp(0.9, 0.56, overdriveFactor) -
+      this.sonicBreakIntensity * 0.08 -
+      this.currentNightFactor * 0.06;
+    const bloomKnee = THREE.MathUtils.lerp(0.28, 0.38, overdriveFactor);
+    const bloomIntensity =
+      0.24 +
+      this.currentNightFactor * 0.1 +
+      overdriveFactor * 0.64 +
+      overdriveSurge * 0.22 +
+      this.sonicBreakIntensity * 0.45 +
+      this.landmarkTransitionIntensity * 0.22;
+
+    this.bloomPrefilterMat.uniforms.uThreshold.value = Math.max(0.36, bloomThreshold);
+    this.bloomPrefilterMat.uniforms.uKnee.value = bloomKnee;
+    this.bloomPrefilterMat.uniforms.uOverdriveFactor.value = overdriveFactor;
+    (this.bloomPrefilterMat.uniforms.uAuraTint.value as THREE.Color).copy(
+      this.landmarkTransitionAccent,
+    );
+    this.renderer.setRenderTarget(this.bloomQuarterA);
+    this.renderer.render(this.bloomPrefilterScene, this.blurZoomCamera);
+
+    const qInvW = 1 / this.bloomQuarterA.width;
+    const qInvH = 1 / this.bloomQuarterA.height;
+    const eInvW = 1 / this.bloomEighthA.width;
+    const eInvH = 1 / this.bloomEighthA.height;
+
+    // Tight bloom horizontal + vertical
+    this.bloomBlurMat.uniforms.tInput.value = this.bloomQuarterA.texture;
+    (this.bloomBlurMat.uniforms.uDirection.value as THREE.Vector2).set(qInvW, 0);
+    this.renderer.setRenderTarget(this.bloomQuarterB);
+    this.renderer.render(this.bloomBlurScene, this.blurZoomCamera);
+
+    this.bloomBlurMat.uniforms.tInput.value = this.bloomQuarterB.texture;
+    (this.bloomBlurMat.uniforms.uDirection.value as THREE.Vector2).set(0, qInvH);
+    this.renderer.setRenderTarget(this.bloomQuarterA);
+    this.renderer.render(this.bloomBlurScene, this.blurZoomCamera);
+
+    // Wide ethereal aura horizontal + vertical (progressively expanded with overdrive)
+    const auraSpread = THREE.MathUtils.lerp(1.45, 2.25, overdriveFactor);
+    this.bloomBlurMat.uniforms.tInput.value = this.bloomQuarterA.texture;
+    (this.bloomBlurMat.uniforms.uDirection.value as THREE.Vector2).set(eInvW * auraSpread, 0);
+    this.renderer.setRenderTarget(this.bloomEighthA);
+    this.renderer.render(this.bloomBlurScene, this.blurZoomCamera);
+
+    this.bloomBlurMat.uniforms.tInput.value = this.bloomEighthA.texture;
+    (this.bloomBlurMat.uniforms.uDirection.value as THREE.Vector2).set(0, eInvH * auraSpread);
+    this.renderer.setRenderTarget(this.bloomEighthB);
+    this.renderer.render(this.bloomBlurScene, this.blurZoomCamera);
+
+    // Pass 5: Composite SSAO + Bloom + active optical/sonic/shimmer post effects to screen
+    this.blurZoomMat.uniforms.uAoStrength.value = THREE.MathUtils.lerp(
+      0.68,
+      0.44,
+      this.currentNightFactor,
+    );
+    this.blurZoomMat.uniforms.uBloomIntensity.value = bloomIntensity;
+    this.blurZoomMat.uniforms.uOverdriveFactor.value = overdriveFactor;
+    (this.blurZoomMat.uniforms.uAccentColor.value as THREE.Color).copy(
+      this.landmarkTransitionAccent,
+    );
+    if (activePlayWarp) {
+      this.blurZoomMat.uniforms.uIntensity.value = this.landmarkTransitionIntensity;
+      this.blurZoomMat.uniforms.uZoomAmount.value = Math.min(
+        1.4,
+        this.landmarkTransitionIntensity + this.lensZoomStrength * 0.58,
+      );
+      this.blurZoomMat.uniforms.uTime.value = this.clock.elapsedTime;
+      this.blurZoomMat.uniforms.uPhase.value = this.landmarkTransitionPhase;
+      this.blurZoomMat.uniforms.uSonicIntensity.value = this.sonicBreakIntensity;
+      this.blurZoomMat.uniforms.uSonicPhase.value = this.sonicBreakPhase;
+      this.blurZoomMat.uniforms.uBarrelStrength.value = this.lensDistortionStrength;
+      this.blurZoomMat.uniforms.uVelocityWarp.value = this.screenDistortionStrength;
+      this.blurZoomMat.uniforms.uHeatShimmer.value = this.heatShimmerStrength;
+    } else {
+      this.blurZoomMat.uniforms.uIntensity.value = 0;
+      this.blurZoomMat.uniforms.uZoomAmount.value = 0;
+      this.blurZoomMat.uniforms.uSonicIntensity.value = 0;
+      this.blurZoomMat.uniforms.uBarrelStrength.value = 0;
+      this.blurZoomMat.uniforms.uVelocityWarp.value = 0;
+      this.blurZoomMat.uniforms.uHeatShimmer.value = 0;
+    }
+
     this.renderer.setRenderTarget(null);
     this.renderer.render(this.blurZoomScene, this.blurZoomCamera);
   }
@@ -1617,8 +2265,8 @@ export class SkyboundEngine {
       this.camera.lookAt(_lookAtTarget);
     } else {
       // Live world forward jog along the scenic track
-      this.playerZ -= 6.8 * dt;
-      this.runCycle += dt * 9.5;
+      this.playerZ -= 8.4 * dt;
+      this.runCycle += dt * 12.6;
       this.character.root.position.set(0, 0, this.playerZ);
       this.character.updatePose(
         {
@@ -1626,6 +2274,8 @@ export class SkyboundEngine {
           isSliding: false,
           vy: 0,
           laneVelX: 0,
+          speedMultiplier: 1.0,
+          forwardSpeed: 8.4,
           runCycle: this.runCycle,
           squashY: 1,
           hasShield: false,
@@ -2144,7 +2794,8 @@ export class SkyboundEngine {
     // Squash recovery, run cycle & rhythmic biome-aware footstep micro-taps
     this.squashY = THREE.MathUtils.damp(this.squashY, 1, 14, dt);
     const prevStepPhase = Math.floor(this.runCycle / Math.PI);
-    this.runCycle += dt * (effectiveForwardSpeed * 0.85);
+    const strideRate = Math.min(28.5, Math.max(12.5, effectiveForwardSpeed * 1.28));
+    this.runCycle += dt * strideRate;
     const nextStepPhase = Math.floor(this.runCycle / Math.PI);
     if (this.isGrounded && !this.isSliding && nextStepPhase > prevStepPhase) {
       this.audio.playFootstep(this.currentBiome, this.rainWetness > 0.3);
@@ -2272,6 +2923,64 @@ export class SkyboundEngine {
     const crashed = this.checkCollisions(dt, prevX, prevY, prevZ);
     if (crashed) return;
 
+    // Compute lateral momentum impulse & obstacle avoidance urgency for Arm/Hand IK
+    const rawLaneAccelX = THREE.MathUtils.clamp(
+      (this.laneVelX - this.prevLaneVelX) / Math.max(0.004, dt),
+      -65,
+      65,
+    );
+    this.prevLaneVelX = this.laneVelX;
+    this.smoothedLaneAccelX = THREE.MathUtils.damp(this.smoothedLaneAccelX, rawLaneAccelX, 16, dt);
+
+    const ikLookAhead = Math.min(11.5, 5.5 + this.speedMultiplier * 2.2);
+    let bestUrgency = 0;
+    let bestSideBias = 0;
+    let bestKind: 'none' | 'jump' | 'slide' | 'tall' | 'moving' = 'none';
+
+    for (let c = 0; c < this.chunks.length; c++) {
+      const chunk = this.chunks[c];
+      if (chunk.zEnd > this.playerZ + 2.0 || chunk.zStart < this.playerZ - ikLookAhead - 4.0) {
+        continue;
+      }
+      const obstacles = chunk.obstacles;
+      for (let i = 0; i < obstacles.length; i++) {
+        const obs = obstacles[i];
+        if (obs.y < -10) continue;
+        const dz = this.playerZ - obs.z; // >0 = ahead of player, <0 = just passed
+        if (dz < -1.4 || dz > ikLookAhead) continue;
+
+        const dx = obs.x - this.playerX;
+        const clearDist = Math.abs(dx) - obs.halfW;
+        if (clearDist >= 1.95) continue;
+
+        const zFactor =
+          dz <= 2.2
+            ? 1.0
+            : 1.0 - THREE.MathUtils.clamp((dz - 2.2) / Math.max(0.5, ikLookAhead - 2.2), 0, 1);
+        const xNorm = THREE.MathUtils.clamp(clearDist / 1.95, 0, 1);
+        const xFactor = 1.0 - xNorm * xNorm * (3 - 2 * xNorm);
+        const urgency = zFactor * xFactor;
+
+        if (urgency > bestUrgency) {
+          bestUrgency = urgency;
+          if (Math.abs(dx) < 0.22) {
+            bestSideBias = Math.abs(this.laneVelX) > 0.5 ? -Math.sign(this.laneVelX) : 0;
+          } else {
+            bestSideBias = THREE.MathUtils.clamp(dx / (obs.halfW + 0.9), -1, 1);
+          }
+          bestKind = obs.kind;
+        }
+      }
+    }
+
+    this.smoothedObstacleProx = THREE.MathUtils.damp(this.smoothedObstacleProx, bestUrgency, 16, dt);
+    this.smoothedObstacleSide = THREE.MathUtils.damp(this.smoothedObstacleSide, bestSideBias, 16, dt);
+    if (bestUrgency > 0.05) {
+      this.nearestObstacleKind = bestKind;
+    } else if (this.smoothedObstacleProx < 0.04) {
+      this.nearestObstacleKind = 'none';
+    }
+
     // Update character rig & power-up shockwave VFX
     this.character.root.position.set(this.playerX, this.playerY, this.playerZ);
     this.character.updatePose(
@@ -2280,6 +2989,12 @@ export class SkyboundEngine {
         isSliding: this.isSliding,
         vy: this.vy,
         laneVelX: this.laneVelX,
+        laneAccelX: this.smoothedLaneAccelX,
+        speedMultiplier: this.smoothedTierSpeed,
+        forwardSpeed: effectiveForwardSpeed,
+        obstacleProximity: this.smoothedObstacleProx,
+        obstacleSideBias: this.smoothedObstacleSide,
+        obstacleKind: this.nearestObstacleKind,
         runCycle: this.runCycle,
         squashY: this.squashY,
         hasShield: this.hasShield,
@@ -2290,6 +3005,7 @@ export class SkyboundEngine {
         hitFlash: this.hitFlash,
         invulnTimer: this.invulnTimer,
         showcaseMode: false,
+        sampleTerrainHeight: this.boundFootTerrainSampler,
       },
       dt,
       groundY > -10 ? groundY : -20,
@@ -2400,12 +3116,12 @@ export class SkyboundEngine {
 
   public announceBanner(text: string): void {
     this.eventBanner = text;
-    this.eventBannerTimer = 2.2;
+    this.eventBannerTimer = 1.75;
   }
 
   private showBanner(text: string): void {
     this.eventBanner = text;
-    this.eventBannerTimer = 2.0;
+    this.eventBannerTimer = 1.4;
     this.emitHud();
   }
 
@@ -2726,7 +3442,7 @@ export class SkyboundEngine {
       const phrase = pickComboVoiceoverPhrase(this.combo);
       if (phrase) {
         this.voiceoverCallout = phrase;
-        this.voiceoverTimer = 1.85;
+        this.voiceoverTimer = 1.45;
         this.voiceoverSeq++;
         this.audio.playComboVoiceover(this.combo, phrase);
       }
@@ -2837,7 +3553,7 @@ export class SkyboundEngine {
     this.landmarkPopupSubtitle = subtitle;
     this.landmarkPopupAccent = accentHex;
     this.landmarkPopupDistance = distanceMeters;
-    this.landmarkPopupTimer = 2.8;
+    this.landmarkPopupTimer = 2.4;
     this.landmarkPopupSeq++;
     this.landmarkPopupIsNew = isNewEntry;
     this.landmarkTransitionTimer = LANDMARK_TRANSITION_DURATION;
@@ -2891,6 +3607,8 @@ export class SkyboundEngine {
       weatherLabel: weatherMeta.shortLabel,
       weatherAccentHex: weatherMeta.accentHex,
       ambientOverlayLabel: this.ambientWeatherOverlay.getSummary(),
+      timeOfDayLabel: getTimePhaseLabel(this.dayNightState.hourDecimal),
+      timeOfDayHour: Number(this.dayNightState.hourDecimal.toFixed(2)),
       musicTrack: musicMeta.id,
       musicTrackLabel: musicMeta.shortLabel,
       radioStation: stationMeta.id,
@@ -2992,12 +3710,16 @@ export class SkyboundEngine {
   }
 
   private updateEnvironmentLighting(dt: number, immediate = false): void {
-    this.timeCheckAccum += dt;
+    const cycleDistance =
+      this.phase === 'title' ? Math.max(0, -this.playerZ) : this.distance;
+    const cycleElapsed =
+      this.phase === 'title' ? 0 : this.elapsedRunTime;
+    sampleDayNightState(
+      getHourForLightingMode(this.lightingMode, cycleDistance, cycleElapsed),
+      this.dayNightState,
+    );
+
     this.eventCheckAccum += dt;
-    if (immediate || this.timeCheckAccum >= 1.0) {
-      this.timeCheckAccum = 0;
-      sampleDayNightState(getHourForLightingMode(this.lightingMode), this.dayNightState);
-    }
     if (immediate || this.eventCheckAccum >= 2.0) {
       this.eventCheckAccum = 0;
       this.refreshGlobalEventStatus(!immediate);
@@ -3006,15 +3728,14 @@ export class SkyboundEngine {
     const dn = this.dayNightState;
     const palette = BIOME_PALETTES[this.currentBiome];
     const landmarkTheme = LAHORE_LANDMARK_THEMES[this.currentLandmarkKind];
-    const t = immediate ? 1 : 1 - Math.exp(-(1.6 + this.chronosStrength * 4.0) * dt);
+    const t = immediate ? 1 : 1 - Math.exp(-(2.4 + this.chronosStrength * 4.0) * dt);
     const chronoBlend = this.chronosStrength * 0.68;
     const targetCarnival = this.globalEventStatus.active ? 1 : 0;
     this.carnivalBlend = immediate
       ? targetCarnival
       : THREE.MathUtils.damp(this.carnivalBlend, targetCarnival, 1.4, dt);
 
-    // Blend biome palette with the current Lahore landmark theme & local Lahore time
-    const todBlend = dn.twilightBlend;
+    // Blend dynamic time-of-day skybox & light rig with subtle Lahore landmark & biome accents
     const nightBlend = dn.nightFactor;
     const goldenHour = dn.goldenHourFactor;
     this.weatherSystem.getLightingModifiers(nightBlend, _weatherModifiers);
@@ -3026,56 +3747,80 @@ export class SkyboundEngine {
     _landmarkNightGlow.setHex(landmarkTheme.nightGlowHex);
 
     const landmarkDayBlend = 0.34 + goldenHour * 0.14;
-    _biomeSky.setHex(palette.sky).lerp(_landmarkSky, landmarkDayBlend).lerp(dn.sky, todBlend);
-    _biomeFog.setHex(palette.fog).lerp(_landmarkFog, landmarkDayBlend).lerp(dn.fog, todBlend);
-    _biomeHemiSky
-      .setHex(palette.hemiSky)
-      .lerp(_landmarkHemiSky, landmarkDayBlend)
-      .lerp(dn.hemiSky, todBlend);
-    _biomeHemiGround
-      .setHex(palette.hemiGround)
-      .lerp(_landmarkHemiGround, landmarkDayBlend)
-      .lerp(dn.hemiGround, todBlend);
-    _biomeSun.setHex(palette.sun).lerp(dn.sunColor, todBlend);
+    const biomeSkyInfluence = (0.24 - goldenHour * 0.08) * (1 - nightBlend * 0.72);
+    const biomeFogInfluence = (0.28 - goldenHour * 0.08) * (1 - nightBlend * 0.75);
+    const biomeLightInfluence = 0.25 * (1 - nightBlend * 0.7);
+
+    _biomeSky.setHex(palette.sky).lerp(_landmarkSky, landmarkDayBlend);
+    _biomeFog.setHex(palette.fog).lerp(_landmarkFog, landmarkDayBlend);
+    _biomeHemiSky.setHex(palette.hemiSky).lerp(_landmarkHemiSky, landmarkDayBlend);
+    _biomeHemiGround.setHex(palette.hemiGround).lerp(_landmarkHemiGround, landmarkDayBlend);
+    _biomeSun.setHex(palette.sun);
+
+    _targetZenith.copy(dn.skyZenith).lerp(_biomeSky, biomeSkyInfluence * 0.55);
+    _targetSky.copy(dn.sky).lerp(_biomeSky, biomeSkyInfluence);
+    _targetFog.copy(dn.fog).lerp(_biomeFog, biomeFogInfluence);
+    _targetHemiSky.copy(dn.hemiSky).lerp(_biomeHemiSky, biomeLightInfluence);
+    _targetHemiGround.copy(dn.hemiGround).lerp(_biomeHemiGround, biomeLightInfluence);
+    _targetSun.copy(dn.sunColor).lerp(_biomeSun, biomeLightInfluence * 0.65);
+    _targetSunGlow.copy(dn.sunGlowColor);
 
     // Soft nocturnal horizon & atmospheric glow synchronized with current landmark theme
     if (nightBlend > 0.02) {
-      _biomeSky.lerp(_landmarkNightGlow, nightBlend * 0.14);
-      _biomeFog.lerp(_landmarkNightGlow, nightBlend * 0.24);
-      _biomeHemiSky.lerp(_landmarkNightGlow, nightBlend * 0.26);
-      _biomeHemiGround.lerp(_landmarkNightGlow, nightBlend * 0.22);
+      _targetZenith.lerp(_landmarkNightGlow, nightBlend * 0.08);
+      _targetSky.lerp(_landmarkNightGlow, nightBlend * 0.14);
+      _targetFog.lerp(_landmarkNightGlow, nightBlend * 0.22);
+      _targetHemiSky.lerp(_landmarkNightGlow, nightBlend * 0.24);
+      _targetHemiGround.lerp(_landmarkNightGlow, nightBlend * 0.2);
     }
 
     // Street Carnival celebratory Basant / Truck-Art sky palette overlay
     if (this.carnivalBlend > 0.001) {
       _carnivalSky.copy(_carnivalDaySky).lerp(_carnivalNightSky, nightBlend);
       _carnivalFog.copy(_carnivalDayFog).lerp(_carnivalNightFog, nightBlend);
-      _biomeSky.lerp(_carnivalSky, this.carnivalBlend * 0.62);
-      _biomeFog.lerp(_carnivalFog, this.carnivalBlend * 0.56);
-      _biomeHemiSky.lerp(_carnivalHemiSky, this.carnivalBlend * 0.38);
-      _biomeHemiGround.lerp(_carnivalHemiGround, this.carnivalBlend * 0.44);
-      _biomeSun.lerp(_carnivalSun, this.carnivalBlend * 0.32);
+      _targetZenith.lerp(_carnivalSky, this.carnivalBlend * 0.45);
+      _targetSky.lerp(_carnivalSky, this.carnivalBlend * 0.58);
+      _targetFog.lerp(_carnivalFog, this.carnivalBlend * 0.54);
+      _targetHemiSky.lerp(_carnivalHemiSky, this.carnivalBlend * 0.36);
+      _targetHemiGround.lerp(_carnivalHemiGround, this.carnivalBlend * 0.42);
+      _targetSun.lerp(_carnivalSun, this.carnivalBlend * 0.3);
       _landmarkNightGlow.lerp(_carnivalGlow, this.carnivalBlend * 0.65);
     }
 
     if (_weatherModifiers.skyTintWeight > 0.001) {
-      _biomeSky.lerp(_weatherModifiers.skyTint, _weatherModifiers.skyTintWeight);
+      _targetZenith.lerp(_weatherModifiers.skyTint, _weatherModifiers.skyTintWeight * 0.8);
+      _targetSky.lerp(_weatherModifiers.skyTint, _weatherModifiers.skyTintWeight);
     }
     if (_weatherModifiers.fogTintWeight > 0.001) {
-      _biomeFog.lerp(_weatherModifiers.fogTint, _weatherModifiers.fogTintWeight);
+      _targetFog.lerp(_weatherModifiers.fogTint, _weatherModifiers.fogTintWeight);
     }
 
-    _targetSky.copy(_biomeSky).lerp(_chronosSky, chronoBlend);
-    _targetFog.copy(_biomeFog).lerp(_chronosFog, chronoBlend);
-    _targetHemiSky.copy(_biomeHemiSky).lerp(_chronosHemiSky, chronoBlend);
-    _targetHemiGround.copy(_biomeHemiGround).lerp(_chronosHemiGround, chronoBlend);
-    _targetSun.copy(_biomeSun).lerp(_chronosSun, chronoBlend);
+    _targetZenith.lerp(_chronosSky, chronoBlend);
+    _targetSky.lerp(_chronosSky, chronoBlend);
+    _targetFog.lerp(_chronosFog, chronoBlend);
+    _targetHemiSky.lerp(_chronosHemiSky, chronoBlend);
+    _targetHemiGround.lerp(_chronosHemiGround, chronoBlend);
+    _targetSun.lerp(_chronosSun, chronoBlend);
+    _targetSunGlow.lerp(_chronosFog, chronoBlend);
     _targetRim
       .copy(dn.rimColor)
       .lerp(_goldenRimColor, goldenHour * 0.45)
       .lerp(_landmarkNightGlow, nightBlend * 0.55)
       .lerp(_carnivalRim, this.carnivalBlend * 0.58)
       .lerp(_chronosHemiSky, chronoBlend);
+
+    // Update procedural atmospheric skybox dome & match horizon fog color
+    (this.skyDomeMat.uniforms.uZenithColor.value as THREE.Color).lerp(_targetZenith, t);
+    (this.skyDomeMat.uniforms.uHorizonColor.value as THREE.Color).lerp(_targetFog, t);
+    (this.skyDomeMat.uniforms.uSunGlowColor.value as THREE.Color).lerp(_targetSunGlow, t);
+    this.skyDomeMat.uniforms.uSunGlowStrength.value = THREE.MathUtils.lerp(
+      this.skyDomeMat.uniforms.uSunGlowStrength.value,
+      dn.sunGlowStrength * (1 - chronoBlend * 0.65),
+      t,
+    );
+    _skySunDir.set(dn.sunX, dn.sunY, -134).normalize();
+    (this.skyDomeMat.uniforms.uSunDir.value as THREE.Vector3).lerp(_skySunDir, t).normalize();
+    this.skyDomeMat.uniforms.uTime.value = this.clock.elapsedTime;
 
     if (this.scene.background instanceof THREE.Color) {
       this.scene.background.lerp(_targetSky, t);
@@ -3118,9 +3863,9 @@ export class SkyboundEngine {
     );
     this.nightGlowLight.color.lerp(_landmarkNightGlow, t);
     const targetNightGlowIntensity =
-      (THREE.MathUtils.smoothstep(nightBlend, 0.15, 0.92) *
+      THREE.MathUtils.smoothstep(nightBlend, 0.15, 0.92) *
         3.1 *
-        landmarkTheme.nightGlowIntensity) +
+        landmarkTheme.nightGlowIntensity +
       this.carnivalBlend * 1.45;
     this.nightGlowLight.intensity = THREE.MathUtils.lerp(
       this.nightGlowLight.intensity,
@@ -3155,10 +3900,10 @@ export class SkyboundEngine {
     this.sunGroup.visible = dn.sunVisible;
     if (dn.sunVisible) {
       this.sunGroup.position.set(dn.sunX, dn.sunY, -134);
-      const sunAlt = THREE.MathUtils.clamp((dn.sunY + 4) / 36, 0, 1);
+      const sunAlt = THREE.MathUtils.clamp((dn.sunY + 4) / 38, 0, 1);
       this.sunDiscMat.color.copy(_sunHorizonColor).lerp(_sunMiddayColor, sunAlt);
       this.sunDiscMat.opacity = THREE.MathUtils.clamp((1 - nightBlend) * 1.15, 0, 1);
-      this.sunHaloMat.opacity = this.sunDiscMat.opacity * 0.28;
+      this.sunHaloMat.opacity = this.sunDiscMat.opacity * 0.34;
     }
 
     this.moonGroup.visible = dn.moonVisible;
@@ -3166,7 +3911,7 @@ export class SkyboundEngine {
       this.moonGroup.position.set(dn.moonX, dn.moonY, -132);
       const moonAlpha = THREE.MathUtils.smoothstep(nightBlend, 0.15, 0.72);
       this.moonMat.opacity = moonAlpha;
-      this.moonHaloMat.opacity = moonAlpha * 0.16;
+      this.moonHaloMat.opacity = moonAlpha * 0.18;
     }
 
     const starBaseOpacity = THREE.MathUtils.smoothstep(nightBlend, 0.25, 0.9);
@@ -3194,6 +3939,7 @@ export class SkyboundEngine {
     }
     this.chunks.length = 0;
     this.worldBuilder.disposeShared();
+    this.scene.remove(this.character.debugFootIkGroup);
     this.character.dispose();
     this.particles.dispose();
     this.powerupVfx.dispose();
@@ -3202,8 +3948,19 @@ export class SkyboundEngine {
     this.speedLines.dispose();
     this.chronosOverlayMesh.geometry.dispose();
     this.chronosOverlayMat.dispose();
+    this.sceneDepthTexture.dispose();
     this.transitionTarget.dispose();
-    this.blurZoomQuad.geometry.dispose();
+    this.ssaoTarget.dispose();
+    this.ssaoBlurTarget.dispose();
+    this.bloomQuarterA.dispose();
+    this.bloomQuarterB.dispose();
+    this.bloomEighthA.dispose();
+    this.bloomEighthB.dispose();
+    this.postQuadGeo.dispose();
+    this.ssaoMat.dispose();
+    this.ssaoBlurMat.dispose();
+    this.bloomPrefilterMat.dispose();
+    this.bloomBlurMat.dispose();
     this.blurZoomMat.dispose();
     this.music.dispose();
     this.audio.dispose();

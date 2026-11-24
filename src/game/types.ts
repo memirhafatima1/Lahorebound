@@ -255,6 +255,8 @@ export interface HudSnapshot {
   weatherLabel: string;
   weatherAccentHex: string;
   ambientOverlayLabel: string;
+  timeOfDayLabel: string;
+  timeOfDayHour: number;
   musicTrack: MusicTrackId;
   musicTrackLabel: string;
   radioStation: RadioStationId;
@@ -336,6 +338,7 @@ export interface SaveData {
   ambientWeatherOverlay: boolean;
   hapticsEnabled: boolean;
   showTouchButtons: boolean;
+  debugFootIk: boolean;
   dailyMissions: DailyMissionState;
   dailyRunObjective: DailyRunObjectiveState;
   missionArchive: DailyMissionArchiveEntry[];

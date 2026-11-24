@@ -536,6 +536,7 @@ export default function App() {
         initialSave.lightingMode,
         initialSave.eventMode,
         initialSave.ambientWeatherOverlay,
+        initialSave.debugFootIk,
       );
     } catch {
       setWebglStatus('unavailable');
@@ -579,6 +580,14 @@ export default function App() {
       const ambientWeatherOverlay = !prev.ambientWeatherOverlay;
       engineRef.current?.setAmbientOverlayEnabled(ambientWeatherOverlay);
       return { ...prev, ambientWeatherOverlay };
+    });
+  }, [updateSave]);
+
+  const handleToggleDebugFootIk = useCallback(() => {
+    updateSave((prev) => {
+      const debugFootIk = !prev.debugFootIk;
+      engineRef.current?.setFootIkDebugVisible(debugFootIk);
+      return { ...prev, debugFootIk };
     });
   }, [updateSave]);
 
@@ -1672,6 +1681,7 @@ export default function App() {
             ambientWeatherOverlay={save.ambientWeatherOverlay}
             showTouchButtons={save.showTouchButtons}
             hapticsEnabled={save.hapticsEnabled}
+            debugFootIk={save.debugFootIk}
             onToggleMute={handleToggleMute}
             onSelectRadioStation={handleSelectRadioStation}
             onSelectLightingMode={handleSelectLightingMode}
@@ -1679,6 +1689,7 @@ export default function App() {
             onToggleAmbientOverlay={handleToggleAmbientOverlay}
             onToggleTouchButtons={handleToggleTouchButtons}
             onToggleHaptics={handleToggleHaptics}
+            onToggleDebugFootIk={handleToggleDebugFootIk}
             onClose={() => setSettingsOpen(false)}
           />
         )}

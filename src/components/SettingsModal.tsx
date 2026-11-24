@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import {
   Check,
   Clock,
+  Crosshair,
   Gamepad2,
   Moon,
   PartyPopper,
@@ -29,6 +30,7 @@ interface SettingsModalProps {
   ambientWeatherOverlay: boolean;
   showTouchButtons: boolean;
   hapticsEnabled: boolean;
+  debugFootIk: boolean;
   onToggleMute: () => void;
   onSelectRadioStation: (station: RadioStationId) => void;
   onSelectLightingMode: (mode: LightingMode) => void;
@@ -36,6 +38,7 @@ interface SettingsModalProps {
   onToggleAmbientOverlay: () => void;
   onToggleTouchButtons: () => void;
   onToggleHaptics: () => void;
+  onToggleDebugFootIk: () => void;
   onClose: () => void;
 }
 
@@ -64,6 +67,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   ambientWeatherOverlay,
   showTouchButtons,
   hapticsEnabled,
+  debugFootIk,
   onToggleMute,
   onSelectRadioStation,
   onSelectLightingMode,
@@ -71,6 +75,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onToggleAmbientOverlay,
   onToggleTouchButtons,
   onToggleHaptics,
+  onToggleDebugFootIk,
   onClose,
 }) => {
   const [timeSummary, setTimeSummary] = useState(() =>
@@ -403,6 +408,42 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </span>
               </button>
             </div>
+          </section>
+
+          {/* Developer & Animation Debug */}
+          <section className="flex flex-col gap-2">
+            <h3 className="text-[11px] font-black uppercase tracking-wider text-slate-300">
+              Animation Diagnostics
+            </h3>
+            <button
+              type="button"
+              aria-pressed={debugFootIk}
+              onClick={onToggleDebugFootIk}
+              className="w-full flex items-center justify-between gap-3 rounded-xl bg-white/5 hover:bg-white/10 border border-white/12 px-3.5 py-2.5 text-left cursor-pointer transition-colors"
+            >
+              <span className="inline-flex items-center gap-2.5 min-w-0">
+                <Crosshair
+                  className={`w-4 h-4 shrink-0 ${
+                    debugFootIk ? 'text-cyan-300' : 'text-slate-400'
+                  }`}
+                />
+                <span className="min-w-0">
+                  <span className="block text-xs font-bold text-white">
+                    Foot IK Target Wireframes
+                  </span>
+                  <span className="block text-[11px] text-slate-400 truncate">
+                    Render terrain snap targets, slope normals &amp; stance pins
+                  </span>
+                </span>
+              </span>
+              <span
+                className={`text-xs font-black uppercase tracking-wider shrink-0 ${
+                  debugFootIk ? 'text-emerald-400' : 'text-slate-400'
+                }`}
+              >
+                {debugFootIk ? 'ON' : 'OFF'}
+              </span>
+            </button>
           </section>
         </div>
 
