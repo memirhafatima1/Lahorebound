@@ -17,7 +17,7 @@ interface ParticleSlot {
   color: THREE.Color;
 }
 
-const MAX_PARTICLES = 180;
+const MAX_PARTICLES = 240;
 const _dummy = new THREE.Object3D();
 const _tempColor = new THREE.Color();
 
@@ -131,6 +131,46 @@ export class ParticlePool {
     slot.size = size;
     slot.gravity = 2.0;
     slot.color.setHex(hexColor);
+  }
+
+  public spawnSpeedBurstTrail(
+    x: number,
+    y: number,
+    z: number,
+    primaryHex: number,
+    secondaryHex: number,
+    count: number,
+    mode: 'jump' | 'slide',
+    intensity = 1.0,
+  ): void {
+    const clampedIntensity = Math.min(1.8, Math.max(0.6, intensity));
+    for (let i = 0; i < count; i++) {
+      const slot = this.slots[this.cursor];
+      this.cursor = (this.cursor + 1) % MAX_PARTICLES;
+
+      const spreadSide = (Math.random() - 0.5) * 2; // -1..1
+      const isJump = mode === 'jump';
+      const lateralAngle = (Math.random() - 0.5) * Math.PI * 0.85;
+
+      slot.active = true;
+      slot.life = 0;
+      slot.maxLife = (isJump ? 0.36 : 0.32) + Math.random() * 0.16;
+      slot.px = x + spreadSide * (isJump ? 0.38 : 0.46);
+      slot.py = y + (isJump ? 0.18 + Math.random() * 0.55 : 0.08 + Math.random() * 0.28);
+      slot.pz = z + 0.18 + Math.random() * 0.42;
+
+      slot.vx = Math.sin(lateralAngle) * (isJump ? 2.8 : 3.8) * clampedIntensity;
+      slot.vy = isJump
+        ? (1.4 + Math.random() * 3.1) * clampedIntensity
+        : (0.45 + Math.random() * 1.65) * clampedIntensity;
+      slot.vz = (4.2 + Math.random() * 4.4) * clampedIntensity;
+
+      slot.rx = Math.random() * Math.PI;
+      slot.ry = Math.random() * Math.PI;
+      slot.size = (0.72 + Math.random() * 0.55) * (0.85 + clampedIntensity * 0.25);
+      slot.gravity = isJump ? 4.2 : 1.6;
+      slot.color.setHex(i % 2 === 0 ? primaryHex : secondaryHex);
+    }
   }
 
   public update(dt: number): void {

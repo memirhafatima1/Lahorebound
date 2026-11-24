@@ -161,11 +161,91 @@
   animation: hud-distance-pop-b 145ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+@keyframes speed-overdrive-glow {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scale(1.03);
+    opacity: 0.92;
+  }
+}
+
+@keyframes speed-mach-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.045);
+  }
+}
+
+@keyframes speed-mach-amber-fade {
+  0%,
+  100% {
+    opacity: 0.96;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.12;
+    transform: scale(1.04);
+  }
+}
+
+@keyframes speed-mach-violet-fade {
+  0%,
+  100% {
+    opacity: 0.12;
+    transform: scale(1.04);
+  }
+  50% {
+    opacity: 0.98;
+    transform: scale(1);
+  }
+}
+
+@keyframes speed-mach-amber-violet-shift {
+  0% {
+    filter: hue-rotate(0deg) saturate(1.15) brightness(1.05);
+  }
+  100% {
+    filter: hue-rotate(-132deg) saturate(1.38) brightness(1.18);
+  }
+}
+
+.animate-speed-overdrive {
+  animation: speed-overdrive-glow 0.9s ease-in-out infinite;
+}
+
+.animate-speed-mach-pulse {
+  animation: speed-mach-pulse 0.44s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.animate-speed-mach-amber {
+  animation: speed-mach-amber-fade 0.48s ease-in-out infinite;
+}
+
+.animate-speed-mach-violet {
+  animation: speed-mach-violet-fade 0.48s ease-in-out infinite;
+}
+
+.animate-speed-mach-shift {
+  animation: speed-mach-amber-violet-shift 0.48s ease-in-out infinite alternate;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-hud-gem-pop-a,
   .animate-hud-gem-pop-b,
   .animate-hud-distance-pop-a,
-  .animate-hud-distance-pop-b {
+  .animate-hud-distance-pop-b,
+  .animate-speed-overdrive,
+  .animate-speed-mach-pulse,
+  .animate-speed-mach-amber,
+  .animate-speed-mach-violet,
+  .animate-speed-mach-shift {
     animation: none;
   }
 }

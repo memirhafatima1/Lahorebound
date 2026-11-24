@@ -9,7 +9,6 @@ import {
   CloudFog,
   CloudRain,
   Flame,
-  Gauge,
   Gem,
   Hourglass,
   Landmark,
@@ -29,6 +28,7 @@ import {
 } from 'lucide-react';
 import { DIFFICULTY_CONFIGS } from '../game/difficulty';
 import { RADIO_STATIONS, RADIO_STATION_MAP } from '../game/music';
+import { SpeedVisualization } from './SpeedVisualization';
 import type {
   HudSnapshot,
   PowerupType,
@@ -181,22 +181,11 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   const activeStation = RADIO_STATION_MAP[radioStation];
   const pulseColor = hud.journeyAccentHex || '#f97316';
   const diffCfg = DIFFICULTY_CONFIGS[hud.difficulty];
-  const speedPct = Math.min(
-    100,
-    Math.max(0, ((hud.speedMultiplier - 1) / Math.max(0.1, diffCfg.maxMultiplier - 1)) * 100),
-  );
-  const speedColor =
-    hud.speedMultiplier >= 1.8
-      ? 'text-rose-300'
-      : hud.speedMultiplier >= 1.4
-        ? 'text-amber-300'
-        : 'text-sky-300';
-  const speedBarColor =
-    hud.speedMultiplier >= 1.8
-      ? 'bg-rose-400'
-      : hud.speedMultiplier >= 1.4
-        ? 'bg-amber-400'
-        : 'bg-sky-400';
+  const overdriveActive = hud.chronosTimer <= 0 && hud.speedMultiplier > 2.0;
+  const supersonicActive = hud.chronosTimer <= 0 && hud.speedMultiplier >= 3.0;
+  const overdriveIntensity = overdriveActive
+    ? Math.min(1, 0.25 + ((hud.speedMultiplier - 2.0) / 0.55) * 0.75)
+    : 0;
 
   const comboActive = hud.comboStreak >= 2;
   const comboBaseScale = comboActive
@@ -301,6 +290,36 @@ export const GameHUD: React.FC<GameHUDProps> = ({
         </div>
       </div>
 
+      {/* High-Velocity (>2.0x) & Supersonic (>=3.0x) Peripheral Screen Glow (pure opacity/boxShadow, zero backdrop-filter) */}
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 pointer-events-none transition-opacity duration-300"
+        style={{
+          opacity: overdriveActive && !supersonicActive ? 0.55 + overdriveIntensity * 0.45 : 0,
+          boxShadow: `inset 0 0 ${Math.round(56 + overdriveIntensity * 48)}px ${Math.round(
+            8 + overdriveIntensity * 14,
+          )}px rgba(244, 63, 94, ${(0.22 + overdriveIntensity * 0.28).toFixed(2)})`,
+        }}
+      />
+      {supersonicActive && (
+        <>
+          <div
+            aria-hidden="true"
+            className="fixed inset-0 pointer-events-none animate-speed-mach-amber"
+            style={{
+              boxShadow: 'inset 0 0 110px 24px rgba(251, 191, 36, 0.46)',
+            }}
+          />
+          <div
+            aria-hidden="true"
+            className="fixed inset-0 pointer-events-none animate-speed-mach-violet"
+            style={{
+              boxShadow: 'inset 0 0 120px 28px rgba(168, 85, 247, 0.52)',
+            }}
+          />
+        </>
+      )}
+
       {/* Power-up Pickup Edge Flash (pure CSS opacity transition, zero backdrop-filter) */}
       {hud.powerupFlashType && (
         <div
@@ -395,32 +414,12 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               {diffCfg.label}
             </div>
 
-            <div
-              className={`inline-flex items-center gap-1.5 rounded-lg bg-[#0b1322]/85 border px-2.5 py-1 text-[11px] font-black uppercase tracking-wider tabular-nums ${
-                hud.chronosTimer > 0 ? 'border-purple-400/50' : 'border-white/12'
-              }`}
-            >
-              <Gauge
-                className={`w-3.5 h-3.5 ${
-                  hud.chronosTimer > 0 ? 'text-purple-300' : speedColor
-                }`}
-              />
-              <span className={hud.chronosTimer > 0 ? 'text-purple-200' : speedColor}>
-                {hud.chronosTimer > 0
-                  ? `${(hud.speedMultiplier * 0.48).toFixed(2)}×`
-                  : `${hud.speedMultiplier.toFixed(2)}×`}
-              </span>
-              {hud.chronosTimer > 0 ? (
-                <span className="text-[10px] font-black text-cyan-300">SLOW</span>
-              ) : (
-                <span className="w-8 h-1.5 rounded-full bg-slate-800 overflow-hidden">
-                  <span
-                    className={`block h-full rounded-full ${speedBarColor}`}
-                    style={{ width: `${Math.max(8, speedPct)}%` }}
-                  />
-                </span>
-              )}
-            </div>
+            <SpeedVisualization
+              speedMultiplier={hud.speedMultiplier}
+              difficulty={hud.difficulty}
+              chronosTimer={hud.chronosTimer}
+              speedBoostTimer={hud.speedBoostTimer}
+            />
 
             <div
               className="md:hidden inline-flex items-center gap-1 rounded-lg bg-[#0b1322]/85 border border-white/12 px-2 py-1 text-[10px] font-bold"

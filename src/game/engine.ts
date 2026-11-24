@@ -20,6 +20,7 @@ import { GlobalMusicManager } from './music';
 import { ParticlePool } from './particles';
 import { PowerupVfxSystem } from './powerupVfx';
 import { CARNIVAL_RUNNER_SKIN, getSkinById } from './skins';
+import { SpeedLinesEffect } from './speedLines';
 import {
   WeatherSystem,
   getAllLandmarkForecasts,
@@ -107,6 +108,7 @@ const SLIDE_DURATION = 0.65;
 const BASE_FOV = 58;
 const MAX_FOV = 68;
 const LANDMARK_TRANSITION_DURATION = 0.92;
+const SONIC_BREAK_DURATION = 0.46;
 const CARNIVAL_CONFETTI_COLORS = [0xec4899, 0xfbbf24, 0x22d3ee] as const;
 
 export interface EngineCallbacks {
@@ -173,6 +175,14 @@ export class SkyboundEngine {
   private landmarkTransitionPhase = 0;
   private landmarkTransitionIntensity = 0;
   private readonly landmarkTransitionAccent = new THREE.Color(0xfbbf24);
+  private overdrive3xTriggered = false;
+  private sonicBreakTimer = 0;
+  private sonicBreakPhase = 0;
+  private sonicBreakIntensity = 0;
+  private lensDistortionStrength = 0;
+  private lensZoomStrength = 0;
+  private screenDistortionStrength = 0;
+  private smoothedTierSpeed = 1.0;
 
   private readonly character: LowPolyCharacter;
   private readonly worldBuilder: WorldBuilder;
@@ -184,6 +194,7 @@ export class SkyboundEngine {
     'gate',
     true,
   );
+  private readonly speedLines: SpeedLinesEffect;
   public readonly audio: GameAudio;
   public readonly music = new GlobalMusicManager();
   public readonly haptics = new HapticFeedbackService();
@@ -217,6 +228,14 @@ export class SkyboundEngine {
   private runCycle = 0;
   private squashY = 1;
   private trailAccum = 0;
+  private actionTrailBurstTimer = 0;
+  private actionTrailBurstAccum = 0;
+  private actionTrailBurstMode: 'jump' | 'slide' = 'jump';
+  private readonly speedBurstStyle = {
+    primaryHex: 0x38bdf8,
+    secondaryHex: 0xc084fc,
+    intensity: 1.0,
+  };
 
   // Run metrics & powerups
   private difficultyMode: DifficultyMode = 'normal';
@@ -414,6 +433,8 @@ export class SkyboundEngine {
     this.scene.add(this.powerupVfx.group);
     this.scene.add(this.weatherSystem.group);
     this.scene.add(this.ambientWeatherOverlay.group);
+    this.speedLines = new SpeedLinesEffect(width / height);
+    this.scene.add(this.speedLines.mesh);
 
     // Clip-space Time-Dilation Shader Veil (radial chrono-ripples & violet-cyan rim)
     this.chronosOverlayMat = new THREE.ShaderMaterial({
@@ -497,6 +518,10 @@ export class SkyboundEngine {
         uZoomAmount: { value: 0 },
         uTime: { value: 0 },
         uPhase: { value: 0 },
+        uSonicIntensity: { value: 0 },
+        uSonicPhase: { value: 0 },
+        uBarrelStrength: { value: 0 },
+        uVelocityWarp: { value: 0 },
         uAccentColor: { value: new THREE.Color(0xfbbf24) },
       },
       vertexShader: `
@@ -512,12 +537,23 @@ export class SkyboundEngine {
         uniform float uZoomAmount;
         uniform float uTime;
         uniform float uPhase;
+        uniform float uSonicIntensity;
+        uniform float uSonicPhase;
+        uniform float uBarrelStrength;
+        uniform float uVelocityWarp;
         uniform vec3 uAccentColor;
         varying vec2 vUv;
 
         void main() {
+          // Scale-compensated barrel lens distortion (outward wide-angle velocity warp without corner clipping)
+          vec2 lensCenter = vec2(0.5, 0.52);
+          vec2 lensVec = vUv - lensCenter;
+          float lensR2 = dot(lensVec, lensVec);
+          float lensScale = 1.0 / (1.0 + uBarrelStrength * 0.52);
+          vec2 barrelUv = lensCenter + lensVec * (lensScale * (1.0 + uBarrelStrength * lensR2));
+
           vec2 center = vec2(0.5, 0.56);
-          vec2 dir = vUv - center;
+          vec2 dir = barrelUv - center;
           float dist = length(dir);
           vec2 dirNorm = dir / max(dist, 0.0001);
           vec2 tangent = vec2(-dirNorm.y, dirNorm.x);
@@ -526,50 +562,73 @@ export class SkyboundEngine {
 
           // Screen-wide magical heat/speed shimmer: expanding horizon pulse + fluid interference ripples
           float waveFront = exp(-pow((dist - uPhase * 1.28) * 6.5, 2.0));
+          float sonicRing = exp(-pow((dist - uSonicPhase * 1.45) * 8.5, 2.0)) * uSonicIntensity;
           float radialRipple = sin(dist * 28.0 - uTime * 15.0);
-          float fluidWaveA = sin(vUv.y * 32.0 - uTime * 13.5 + cos(vUv.x * 20.0 + uTime * 7.5));
-          float fluidWaveB = cos(vUv.x * 26.0 + uTime * 11.0 - sin(vUv.y * 18.0 - uTime * 8.5));
+          float fluidWaveA = sin(barrelUv.y * 32.0 - uTime * 13.5 + cos(barrelUv.x * 20.0 + uTime * 7.5));
+          float fluidWaveB = cos(barrelUv.x * 26.0 + uTime * 11.0 - sin(barrelUv.y * 18.0 - uTime * 8.5));
           float speedStreams = 0.5 + 0.5 * cos(angle * 18.0 + uTime * 9.0);
 
           // Subtle across the whole frame while slightly calmer right on central lane obstacles
           float shimmerMask = mix(0.32, 1.0, edgeMask);
+          float outerVelocityMask = smoothstep(0.34, 1.0, dist);
           vec2 shimmerOffset =
             dirNorm * (radialRipple * 0.0032 + waveFront * 0.0068) * uIntensity * shimmerMask +
-            tangent * ((fluidWaveA + fluidWaveB * 0.65) * 0.0018) * uIntensity * shimmerMask;
+            tangent * ((fluidWaveA + fluidWaveB * 0.65) * 0.0018) * uIntensity * shimmerMask +
+            dirNorm * (sonicRing * 0.014) +
+            (dirNorm * (radialRipple * 0.0016) + tangent * (fluidWaveA * 0.0011)) * (uVelocityWarp * outerVelocityMask);
 
           // Gentle forward optical zoom toward horizon vanishing point with shimmer warp
+          float totalZoom = min(0.16, uZoomAmount * 0.085 + uSonicIntensity * 0.055);
           vec2 baseUv = clamp(
-            center + dir * (1.0 - uZoomAmount * 0.085) + shimmerOffset,
+            center + dir * (1.0 - totalZoom) + shimmerOffset,
             0.001,
             0.999
           );
 
-          // 8-tap radial zoom blur weighted toward outer screen periphery to keep lane obstacles sharp
-          vec3 accum = vec3(0.0);
-          float totalWeight = 0.0;
-          float blurSpread = uIntensity * (0.045 + 0.085 * edgeMask + waveFront * 0.022);
-
-          for (int i = 0; i < 8; i++) {
-            float t = float(i) / 7.0;
-            float w = 1.0 - t * 0.45;
-            vec2 sampleUv = clamp(
-              center + (baseUv - center) * (1.0 - t * blurSpread) + shimmerOffset * (t * 0.45),
-              0.001,
-              0.999
-            );
-            accum += texture2D(tDiffuse, sampleUv).rgb * w;
-            totalWeight += w;
+          // 8-tap radial zoom blur weighted toward outer screen periphery (single-tap fast path when no blur active)
+          float blurSpread = uIntensity * (0.045 + 0.085 * edgeMask + waveFront * 0.022) + sonicRing * 0.04;
+          vec3 blurred;
+          if (blurSpread <= 0.0005) {
+            blurred = texture2D(tDiffuse, baseUv).rgb;
+          } else {
+            vec3 accum = vec3(0.0);
+            float totalWeight = 0.0;
+            for (int i = 0; i < 8; i++) {
+              float t = float(i) / 7.0;
+              float w = 1.0 - t * 0.45;
+              vec2 sampleUv = clamp(
+                center + (baseUv - center) * (1.0 - t * blurSpread) + shimmerOffset * (t * 0.45),
+                0.001,
+                0.999
+              );
+              accum += texture2D(tDiffuse, sampleUv).rgb * w;
+              totalWeight += w;
+            }
+            blurred = accum / totalWeight;
           }
-          vec3 blurred = accum / totalWeight;
 
-          // Subtle directional & shimmer-modulated chromatic prism fringe
-          float shimmerChroma = (0.65 + 0.35 * fluidWaveA + waveFront * 0.55);
-          float chromaShift = uIntensity * (0.0022 + edgeMask * 0.0075) * shimmerChroma;
-          vec2 rUv = clamp(baseUv + dir * chromaShift + tangent * (fluidWaveB * 0.0015 * uIntensity), 0.001, 0.999);
-          vec2 bUv = clamp(baseUv - dir * chromaShift - tangent * (fluidWaveB * 0.0015 * uIntensity), 0.001, 0.999);
-          float chromaMix = (0.14 + 0.36 * edgeMask) * uIntensity;
-          blurred.r = mix(blurred.r, texture2D(tDiffuse, rUv).r, chromaMix);
-          blurred.b = mix(blurred.b, texture2D(tDiffuse, bUv).b, chromaMix);
+          // Subtle landmark prism fringe + velocity edge dispersion + 3.0x sound-barrier RGB chromatic aberration
+          float chromaMix = clamp(
+            (0.14 + 0.36 * edgeMask) * uIntensity + uSonicIntensity * 0.92 + uVelocityWarp * outerVelocityMask * 0.28,
+            0.0,
+            1.0
+          );
+          if (chromaMix > 0.001 || uSonicIntensity > 0.001) {
+            float shimmerChroma = (0.65 + 0.35 * fluidWaveA + waveFront * 0.55);
+            float landmarkChroma = uIntensity * (0.0022 + edgeMask * 0.0075) * shimmerChroma;
+            float sonicChroma = uSonicIntensity * (0.011 + 0.032 * edgeMask) + sonicRing * 0.018;
+            float velocityChroma = uVelocityWarp * outerVelocityMask * 0.0052;
+            vec2 rOffset = dir * (landmarkChroma + sonicChroma + velocityChroma) + tangent * (fluidWaveB * 0.0015 * uIntensity + sonicChroma * 0.25);
+            vec2 bOffset = dir * (landmarkChroma + sonicChroma + velocityChroma) + tangent * (fluidWaveB * 0.0015 * uIntensity - sonicChroma * 0.25);
+            vec2 gOffset = tangent * (sonicChroma * 0.18);
+
+            vec2 rUv = clamp(baseUv + rOffset, 0.001, 0.999);
+            vec2 gUv = clamp(baseUv + gOffset, 0.001, 0.999);
+            vec2 bUv = clamp(baseUv - bOffset, 0.001, 0.999);
+            blurred.r = mix(blurred.r, texture2D(tDiffuse, rUv).r, chromaMix);
+            blurred.g = mix(blurred.g, texture2D(tDiffuse, gUv).g, uSonicIntensity * 0.65);
+            blurred.b = mix(blurred.b, texture2D(tDiffuse, bUv).b, chromaMix);
+          }
 
           // Delicate magical iridescent shimmer veil along the expanding wave crest & speed streaks
           float shimmerGlint =
@@ -577,6 +636,11 @@ export class SkyboundEngine {
             uIntensity;
           vec3 prismTint = mix(uAccentColor, vec3(0.76, 0.95, 1.0), 0.38 + 0.25 * speedStreams);
           blurred += prismTint * shimmerGlint * 0.14;
+
+          // Momentary high-intensity Mach 3.0 flash (amber-white core -> electric violet shockwave)
+          float flashPower = pow(uSonicIntensity, 1.85);
+          vec3 sonicFlashColor = mix(vec3(1.0, 0.94, 0.82), vec3(0.74, 0.42, 1.0), smoothstep(0.18, 0.95, dist));
+          blurred += sonicFlashColor * (flashPower * 0.95 + sonicRing * 0.72);
 
           float rimAura = smoothstep(0.42, 1.15, dist) * uIntensity * 0.2;
           vec3 finalRgb = mix(blurred, uAccentColor, rimAura);
@@ -930,6 +994,9 @@ export class SkyboundEngine {
     } else {
       this.audio.stopVoiceover();
       this.haptics.cancel();
+      if (phase !== 'paused') {
+        this.speedLines.reset();
+      }
     }
   }
 
@@ -1072,6 +1139,8 @@ export class SkyboundEngine {
     this.magnetPulseAccum = 0;
     this.powerupSurge = 0;
     this.powerupFlashType = null;
+    this.actionTrailBurstTimer = 0;
+    this.actionTrailBurstAccum = 0;
     this.chronosOverlayMesh.visible = false;
     this.chronosOverlayMat.uniforms.uIntensity.value = 0;
     this.audio.setTimeDilation(0);
@@ -1105,6 +1174,15 @@ export class SkyboundEngine {
     this.landmarkTransitionTimer = 0;
     this.landmarkTransitionPhase = 0;
     this.landmarkTransitionIntensity = 0;
+    this.overdrive3xTriggered = false;
+    this.sonicBreakTimer = 0;
+    this.sonicBreakPhase = 0;
+    this.sonicBreakIntensity = 0;
+    this.lensDistortionStrength = 0;
+    this.lensZoomStrength = 0;
+    this.screenDistortionStrength = 0;
+    this.smoothedTierSpeed = 1.0;
+    this.speedLines.reset();
     this.photoFrozen = false;
     this.savedPhotoCam = null;
 
@@ -1192,6 +1270,7 @@ export class SkyboundEngine {
     const height = this.container.clientHeight || window.innerHeight;
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
+    this.speedLines.setAspect(width / height);
     this.renderer.setSize(width, height);
     this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
     const rtScale = this.isSoftwareGl ? 0.65 : Math.min(window.devicePixelRatio, 1.5);
@@ -1319,20 +1398,31 @@ export class SkyboundEngine {
   };
 
   private renderFrame(): void {
-    const activeBlurZoom =
+    const activePostPass =
       !this.photoFrozen &&
       this.phase === 'playing' &&
-      this.landmarkTransitionIntensity > 0.004;
+      (this.landmarkTransitionIntensity > 0.004 ||
+        this.sonicBreakIntensity > 0.004 ||
+        this.lensDistortionStrength > 0.002 ||
+        this.lensZoomStrength > 0.002 ||
+        this.screenDistortionStrength > 0.002);
 
-    if (!activeBlurZoom) {
+    if (!activePostPass) {
       this.renderer.render(this.scene, this.camera);
       return;
     }
 
     this.blurZoomMat.uniforms.uIntensity.value = this.landmarkTransitionIntensity;
-    this.blurZoomMat.uniforms.uZoomAmount.value = this.landmarkTransitionIntensity;
+    this.blurZoomMat.uniforms.uZoomAmount.value = Math.min(
+      1.4,
+      this.landmarkTransitionIntensity + this.lensZoomStrength * 0.58,
+    );
     this.blurZoomMat.uniforms.uTime.value = this.clock.elapsedTime;
     this.blurZoomMat.uniforms.uPhase.value = this.landmarkTransitionPhase;
+    this.blurZoomMat.uniforms.uSonicIntensity.value = this.sonicBreakIntensity;
+    this.blurZoomMat.uniforms.uSonicPhase.value = this.sonicBreakPhase;
+    this.blurZoomMat.uniforms.uBarrelStrength.value = this.lensDistortionStrength;
+    this.blurZoomMat.uniforms.uVelocityWarp.value = this.screenDistortionStrength;
     (this.blurZoomMat.uniforms.uAccentColor.value as THREE.Color).copy(
       this.landmarkTransitionAccent,
     );
@@ -1511,6 +1601,28 @@ export class SkyboundEngine {
     this.speedMultiplier = this.speed / diffCfg.baseSpeed;
     this.peakSpeedMultiplier = Math.max(this.peakSpeedMultiplier, this.speedMultiplier);
 
+    // Momentary sonic-barrier flash & chromatic aberration on first hitting 3.0x overdrive
+    if (!this.overdrive3xTriggered && this.chronosTimer <= 0 && this.speedMultiplier >= 3.0) {
+      this.overdrive3xTriggered = true;
+      this.sonicBreakTimer = SONIC_BREAK_DURATION;
+      this.sonicBreakPhase = 0;
+      this.shakeIntensity = Math.max(this.shakeIntensity, 0.28);
+      this.powerupSurge = Math.max(this.powerupSurge, 1.0);
+      this.audio.playSpeedUp();
+      this.emitHaptic('jump_land');
+      this.particles.spawnSpeedBurstTrail(
+        this.playerX,
+        this.playerY + 0.6,
+        this.playerZ,
+        0xfbbf24,
+        0xa855f7,
+        24,
+        'jump',
+        1.65,
+      );
+      this.showBanner('MACH 3.0 · SOUND BARRIER');
+    }
+
     // Trigger speed milestone banner & sound at every +0.2x tier up to mode ceiling
     if (this.speedMultiplier >= this.nextSpeedTier && this.nextSpeedTier <= diffCfg.maxMultiplier - 0.05) {
       const tierLabel = this.nextSpeedTier.toFixed(1);
@@ -1591,6 +1703,114 @@ export class SkyboundEngine {
       this.landmarkTransitionIntensity = 0;
     }
 
+    if (this.sonicBreakTimer > 0) {
+      this.sonicBreakTimer = Math.max(0, this.sonicBreakTimer - dt);
+      const p = 1 - this.sonicBreakTimer / SONIC_BREAK_DURATION;
+      this.sonicBreakPhase = p;
+      const targetSonic = Math.pow(1 - p, 1.55);
+      this.sonicBreakIntensity = THREE.MathUtils.lerp(
+        this.sonicBreakIntensity,
+        targetSonic,
+        Math.min(1, dt * 24),
+      );
+    } else {
+      this.sonicBreakPhase = 0;
+      this.sonicBreakIntensity = THREE.MathUtils.lerp(
+        this.sonicBreakIntensity,
+        0,
+        Math.min(1, dt * 12),
+      );
+      if (this.sonicBreakIntensity < 0.001) this.sonicBreakIntensity = 0;
+    }
+
+    // Smoothly linearly interpolate speed tier visual intensity to eliminate step snaps between tiers
+    this.smoothedTierSpeed = THREE.MathUtils.lerp(
+      this.smoothedTierSpeed,
+      this.speedMultiplier,
+      Math.min(1, dt * 4.5),
+    );
+    const tierSpeed = this.smoothedTierSpeed;
+    const chronosDamp = THREE.MathUtils.clamp(1 - this.chronosStrength, 0, 1);
+
+    // Continuous piecewise-linear curves across speed tiers (1.65x -> 2.0x -> 2.5x -> 3.0x -> 3.65x+)
+    let rawBarrel = 0;
+    if (tierSpeed > 1.65 && tierSpeed < 2.5) {
+      rawBarrel = THREE.MathUtils.lerp(0, 0.055, (tierSpeed - 1.65) / 0.85);
+    } else if (tierSpeed >= 2.5 && tierSpeed < 3.0) {
+      rawBarrel = THREE.MathUtils.lerp(0.055, 0.135, (tierSpeed - 2.5) / 0.5);
+    } else if (tierSpeed >= 3.0) {
+      rawBarrel = THREE.MathUtils.lerp(
+        0.135,
+        0.22,
+        THREE.MathUtils.clamp((tierSpeed - 3.0) / 0.65, 0, 1),
+      );
+    }
+    const targetBarrel = (rawBarrel + this.sonicBreakIntensity * 0.045) * chronosDamp;
+
+    let rawLensZoom = 0;
+    if (tierSpeed > 1.85 && tierSpeed < 2.5) {
+      rawLensZoom = THREE.MathUtils.lerp(0, 0.18, (tierSpeed - 1.85) / 0.65);
+    } else if (tierSpeed >= 2.5 && tierSpeed < 3.0) {
+      rawLensZoom = THREE.MathUtils.lerp(0.18, 0.42, (tierSpeed - 2.5) / 0.5);
+    } else if (tierSpeed >= 3.0) {
+      rawLensZoom = THREE.MathUtils.lerp(
+        0.42,
+        0.72,
+        THREE.MathUtils.clamp((tierSpeed - 3.0) / 0.65, 0, 1),
+      );
+    }
+    const targetLensZoom = rawLensZoom * chronosDamp;
+
+    let rawScreenDistortion = 0;
+    if (tierSpeed > 2.0 && tierSpeed < 2.5) {
+      rawScreenDistortion = THREE.MathUtils.lerp(0, 0.25, (tierSpeed - 2.0) / 0.5);
+    } else if (tierSpeed >= 2.5 && tierSpeed < 3.0) {
+      rawScreenDistortion = THREE.MathUtils.lerp(0.25, 0.65, (tierSpeed - 2.5) / 0.5);
+    } else if (tierSpeed >= 3.0) {
+      rawScreenDistortion = THREE.MathUtils.lerp(
+        0.65,
+        1.0,
+        THREE.MathUtils.clamp((tierSpeed - 3.0) / 0.65, 0, 1),
+      );
+    }
+    const targetScreenDistortion = rawScreenDistortion * chronosDamp;
+
+    const lensLerpAlpha = Math.min(1, dt * 5.2);
+    this.lensDistortionStrength = THREE.MathUtils.lerp(
+      this.lensDistortionStrength,
+      targetBarrel,
+      lensLerpAlpha,
+    );
+    this.lensZoomStrength = THREE.MathUtils.lerp(
+      this.lensZoomStrength,
+      targetLensZoom,
+      lensLerpAlpha,
+    );
+    this.screenDistortionStrength = THREE.MathUtils.lerp(
+      this.screenDistortionStrength,
+      targetScreenDistortion,
+      lensLerpAlpha,
+    );
+
+    if (targetBarrel === 0 && this.lensDistortionStrength < 0.001) {
+      this.lensDistortionStrength = 0;
+    }
+    if (targetLensZoom === 0 && this.lensZoomStrength < 0.001) {
+      this.lensZoomStrength = 0;
+    }
+    if (targetScreenDistortion === 0 && this.screenDistortionStrength < 0.001) {
+      this.screenDistortionStrength = 0;
+    }
+
+    this.speedLines.update(
+      dt,
+      tierSpeed,
+      this.chronosStrength,
+      this.sonicBreakIntensity,
+      this.currentNightFactor,
+      timeScale,
+    );
+
     if (this.powerupSurge > 0) this.powerupSurge = Math.max(0, this.powerupSurge - dt * 2.6);
     if (this.eventBannerTimer > 0) {
       this.eventBannerTimer -= dt;
@@ -1665,6 +1885,7 @@ export class SkyboundEngine {
       this.runJumps++;
       this.audio.playJump();
       this.particles.spawnBurst(this.playerX, this.playerY + 0.1, this.playerZ, 0xe2e8f0, 7, 3.6, 0.8);
+      this.triggerHighSpeedActionBurst('jump', false);
       this.emitHud();
     }
 
@@ -1791,6 +2012,33 @@ export class SkyboundEngine {
       }
     }
 
+    // Sustained high-speed burst trail wake along active jump arc or slide carve
+    if (this.actionTrailBurstTimer > 0) {
+      const actionActive =
+        this.chronosTimer <= 0 &&
+        (this.actionTrailBurstMode === 'jump' ? !this.isGrounded : this.isSliding);
+      if (!actionActive) {
+        this.actionTrailBurstTimer = 0;
+      } else {
+        this.actionTrailBurstTimer = Math.max(0, this.actionTrailBurstTimer - dt);
+        this.actionTrailBurstAccum += dt;
+        if (this.actionTrailBurstAccum >= 0.036) {
+          this.actionTrailBurstAccum = 0;
+          this.updateSpeedBurstPalette(this.actionTrailBurstMode);
+          this.particles.spawnSpeedBurstTrail(
+            this.playerX,
+            this.playerY,
+            this.playerZ,
+            this.speedBurstStyle.primaryHex,
+            this.speedBurstStyle.secondaryHex,
+            this.speedMultiplier > 2.0 ? 5 : 3,
+            this.actionTrailBurstMode,
+            this.speedBurstStyle.intensity,
+          );
+        }
+      }
+    }
+
     // Subtle celebratory aerial festival embers along track edges during Street Carnival
     if (this.globalEventStatus.active) {
       this.carnivalConfettiAccum += dt;
@@ -1894,7 +2142,57 @@ export class SkyboundEngine {
     this.runSlides++;
     this.audio.playSlide();
     this.emitHaptic('slide_start');
+    this.triggerHighSpeedActionBurst('slide', fromSlam);
     this.advanceComboSequence(fromSlam ? 'SLAM SLIDE' : 'SLIDE');
+  }
+
+  private updateSpeedBurstPalette(mode: 'jump' | 'slide'): void {
+    const isOverdrive = this.speedMultiplier > 2.0 || this.speedBoostTimer > 0;
+    const isCarnivalSkin = this.activeSkinId === CARNIVAL_RUNNER_SKIN.id;
+    const intensity = isOverdrive
+      ? 1.42
+      : THREE.MathUtils.lerp(
+          0.95,
+          1.25,
+          THREE.MathUtils.clamp((this.speedMultiplier - 1.45) / 0.55, 0, 1),
+        );
+
+    this.speedBurstStyle.intensity = intensity;
+    if (isCarnivalSkin) {
+      this.speedBurstStyle.primaryHex = 0xec4899;
+      this.speedBurstStyle.secondaryHex = 0x22d3ee;
+    } else if (mode === 'jump') {
+      this.speedBurstStyle.primaryHex = isOverdrive ? 0x22d3ee : 0x38bdf8;
+      this.speedBurstStyle.secondaryHex = isOverdrive ? 0xfbbf24 : 0xc084fc;
+    } else {
+      this.speedBurstStyle.primaryHex = isOverdrive ? 0xfb7185 : 0xfbbf24;
+      this.speedBurstStyle.secondaryHex = isOverdrive ? 0xfde047 : 0xf97316;
+    }
+  }
+
+  private triggerHighSpeedActionBurst(mode: 'jump' | 'slide', fromSlam = false): void {
+    if (this.chronosTimer > 0) return;
+    const isHighSpeed = this.speedMultiplier >= 1.45 || this.speedBoostTimer > 0;
+    if (!isHighSpeed) return;
+
+    const isOverdrive = this.speedMultiplier > 2.0 || this.speedBoostTimer > 0;
+    this.updateSpeedBurstPalette(mode);
+    const initialCount = (isOverdrive ? 16 : 11) + (fromSlam ? 4 : 0);
+
+    this.particles.spawnSpeedBurstTrail(
+      this.playerX,
+      this.playerY,
+      this.playerZ,
+      this.speedBurstStyle.primaryHex,
+      this.speedBurstStyle.secondaryHex,
+      initialCount,
+      mode,
+      this.speedBurstStyle.intensity,
+    );
+
+    this.actionTrailBurstMode = mode;
+    this.actionTrailBurstTimer = mode === 'jump' ? 0.34 : fromSlam ? 0.46 : 0.38;
+    this.actionTrailBurstAccum = 0;
   }
 
   public announceBanner(text: string): void {
@@ -2173,9 +2471,19 @@ export class SkyboundEngine {
   private endRun(reason: 'obstacle' | 'fall'): void {
     this.phase = 'gameover';
     this.chronosTimer = 0;
+    this.actionTrailBurstTimer = 0;
+    this.actionTrailBurstAccum = 0;
     this.landmarkTransitionTimer = 0;
     this.landmarkTransitionPhase = 0;
     this.landmarkTransitionIntensity = 0;
+    this.sonicBreakTimer = 0;
+    this.sonicBreakPhase = 0;
+    this.sonicBreakIntensity = 0;
+    this.lensDistortionStrength = 0;
+    this.lensZoomStrength = 0;
+    this.screenDistortionStrength = 0;
+    this.smoothedTierSpeed = 1.0;
+    this.speedLines.reset();
     this.audio.stopVoiceover();
     const finalScore = this.computeTotalScore();
     const journey = getJourneyProgressForDistance(this.distance);
@@ -2311,15 +2619,16 @@ export class SkyboundEngine {
   private updateCamera(dt: number): void {
     const maxMult = DIFFICULTY_CONFIGS[this.difficultyMode].maxMultiplier;
     const speedRatio = THREE.MathUtils.clamp(
-      (this.speedMultiplier - 1) / Math.max(0.1, maxMult - 1),
+      (this.smoothedTierSpeed - 1) / Math.max(0.1, maxMult - 1),
       0,
       1,
     );
     const targetFov =
       THREE.MathUtils.lerp(BASE_FOV, MAX_FOV, speedRatio) +
       this.chronosStrength * 5.5 +
-      this.landmarkTransitionIntensity * 9.5;
-    const nextFov = THREE.MathUtils.damp(this.camera.fov, targetFov, 5.8, dt);
+      this.landmarkTransitionIntensity * 9.5 +
+      this.sonicBreakIntensity * 6.5;
+    const nextFov = THREE.MathUtils.lerp(this.camera.fov, targetFov, Math.min(1, dt * 6.0));
     if (Math.abs(nextFov - this.camera.fov) > 0.01) {
       this.camera.fov = nextFov;
       this.camera.updateProjectionMatrix();
@@ -2332,7 +2641,8 @@ export class SkyboundEngine {
       6.9 -
       speedRatio * 0.55 +
       this.chronosStrength * 0.65 -
-      this.landmarkTransitionIntensity * 0.85;
+      this.landmarkTransitionIntensity * 0.85 -
+      this.sonicBreakIntensity * 0.55;
 
     _camDesired.set(camX, camY, camZ);
     this.camera.position.lerp(_camDesired, 1 - Math.exp(-10 * dt));
@@ -2571,6 +2881,7 @@ export class SkyboundEngine {
     this.powerupVfx.dispose();
     this.weatherSystem.dispose();
     this.ambientWeatherOverlay.dispose();
+    this.speedLines.dispose();
     this.chronosOverlayMesh.geometry.dispose();
     this.chronosOverlayMat.dispose();
     this.transitionTarget.dispose();
