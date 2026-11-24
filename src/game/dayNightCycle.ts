@@ -47,9 +47,14 @@ export const LIGHTING_MODES: LightingModeOption[] = [
   },
 ];
 
+export const SUNSET_TWILIGHT_START_HOUR = 17.45;
+export const DEEP_INDIGO_TWILIGHT_HOUR = 20.65;
+export const TWILIGHT_DISTANCE_SPAN_METERS = 1080;
+
 export interface DayNightState {
   hourDecimal: number;
   skyZenith: THREE.Color;
+  skyMid: THREE.Color;
   sky: THREE.Color;
   fog: THREE.Color;
   hemiSky: THREE.Color;
@@ -80,6 +85,7 @@ export interface DayNightState {
 interface TimeKeyframe {
   hour: number;
   skyZenith: number;
+  skyMid: number;
   sky: number;
   fog: number;
   hemiSky: number;
@@ -102,6 +108,7 @@ const KEYFRAMES: TimeKeyframe[] = [
   {
     hour: 0.0,
     skyZenith: 0x030714,
+    skyMid: 0x0b1030,
     sky: 0x0a1329,
     fog: 0x111a33,
     hemiSky: 0x3b4d82,
@@ -122,6 +129,7 @@ const KEYFRAMES: TimeKeyframe[] = [
   {
     hour: 4.5,
     skyZenith: 0x090f26,
+    skyMid: 0x1a1a46,
     sky: 0x1a1e42,
     fog: 0x262148,
     hemiSky: 0x4b5896,
@@ -142,6 +150,7 @@ const KEYFRAMES: TimeKeyframe[] = [
   {
     hour: 6.15,
     skyZenith: 0x3666a6,
+    skyMid: 0x9a7598,
     sky: 0xf08c6e,
     fog: 0xfdba74,
     hemiSky: 0xfed7aa,
@@ -162,6 +171,7 @@ const KEYFRAMES: TimeKeyframe[] = [
   {
     hour: 8.75,
     skyZenith: 0x2c78d6,
+    skyMid: 0x5eaee8,
     sky: 0x89cff6,
     fog: 0xdbeafe,
     hemiSky: 0xfef3c7,
@@ -182,6 +192,7 @@ const KEYFRAMES: TimeKeyframe[] = [
   {
     hour: 12.5,
     skyZenith: 0x1d68cf,
+    skyMid: 0x5ab1ef,
     sky: 0x9bd8fa,
     fog: 0xe6d2ab,
     hemiSky: 0xfff8e6,
@@ -202,6 +213,7 @@ const KEYFRAMES: TimeKeyframe[] = [
   {
     hour: 16.0,
     skyZenith: 0x3572be,
+    skyMid: 0x679fd2,
     sky: 0x8bc2eb,
     fog: 0xf2d1a0,
     hemiSky: 0xfef3c7,
@@ -220,55 +232,100 @@ const KEYFRAMES: TimeKeyframe[] = [
     goldenHourFactor: 0.42,
   },
   {
-    hour: 17.85,
-    skyZenith: 0x33245c,
-    sky: 0xe8654a,
-    fog: 0xf97316,
+    hour: 17.45,
+    skyZenith: 0x5a2554,
+    skyMid: 0xd9483b,
+    sky: 0xf97316,
+    fog: 0xfb923c,
     hemiSky: 0xfed7aa,
-    hemiGround: 0x452828,
-    sunColor: 0xfb923c,
-    sunGlowColor: 0xf43f5e,
+    hemiGround: 0x5c2c24,
+    sunColor: 0xfdba74,
+    sunGlowColor: 0xf97316,
     sunGlowStrength: 1.0,
-    rimColor: 0xf472b6,
-    sunIntensity: 1.22,
-    hemiIntensity: 0.72,
+    rimColor: 0xfb923c,
+    sunIntensity: 1.28,
+    hemiIntensity: 0.76,
     rimIntensity: 0.88,
-    envIntensity: 0.76,
-    exposure: 1.0,
-    nightFactor: 0.28,
-    twilightBlend: 0.88,
+    envIntensity: 0.8,
+    exposure: 1.02,
+    nightFactor: 0.18,
+    twilightBlend: 0.78,
     goldenHourFactor: 1.0,
   },
   {
-    hour: 19.35,
-    skyZenith: 0x141136,
-    sky: 0x301d52,
-    fog: 0x402158,
-    hemiSky: 0x8b5cf6,
-    hemiGround: 0x17142b,
-    sunColor: 0xc084fc,
-    sunGlowColor: 0xec4899,
-    sunGlowStrength: 0.32,
-    rimColor: 0x60a5fa,
-    sunIntensity: 0.74,
-    hemiIntensity: 0.56,
-    rimIntensity: 0.74,
-    envIntensity: 0.5,
-    exposure: 0.91,
-    nightFactor: 0.84,
-    twilightBlend: 0.96,
-    goldenHourFactor: 0.14,
+    hour: 18.35,
+    skyZenith: 0x341c59,
+    skyMid: 0x933368,
+    sky: 0xe85d3f,
+    fog: 0xf47245,
+    hemiSky: 0xfecdd3,
+    hemiGround: 0x452232,
+    sunColor: 0xfb923c,
+    sunGlowColor: 0xf43f5e,
+    sunGlowStrength: 0.86,
+    rimColor: 0xf472b6,
+    sunIntensity: 1.1,
+    hemiIntensity: 0.68,
+    rimIntensity: 0.86,
+    envIntensity: 0.7,
+    exposure: 0.98,
+    nightFactor: 0.42,
+    twilightBlend: 0.88,
+    goldenHourFactor: 0.78,
   },
   {
-    hour: 21.0,
-    skyZenith: 0x040917,
-    sky: 0x0c1630,
-    fog: 0x131d38,
-    hemiSky: 0x3b4d82,
+    hour: 19.45,
+    skyZenith: 0x1b1448,
+    skyMid: 0x4c287a,
+    sky: 0x6d3b7d,
+    fog: 0x5b357a,
+    hemiSky: 0xa78bfa,
+    hemiGround: 0x1f163b,
+    sunColor: 0xc084fc,
+    sunGlowColor: 0xec4899,
+    sunGlowStrength: 0.36,
+    rimColor: 0x818cf8,
+    sunIntensity: 0.78,
+    hemiIntensity: 0.58,
+    rimIntensity: 0.78,
+    envIntensity: 0.54,
+    exposure: 0.92,
+    nightFactor: 0.76,
+    twilightBlend: 0.96,
+    goldenHourFactor: 0.25,
+  },
+  {
+    hour: 20.65,
+    skyZenith: 0x090826,
+    skyMid: 0x1e1b5e,
+    sky: 0x282672,
+    fog: 0x312e81,
+    hemiSky: 0x6366f1,
+    hemiGround: 0x111033,
+    sunColor: 0x93c5fd,
+    sunGlowColor: 0x4f46e5,
+    sunGlowStrength: 0.14,
+    rimColor: 0x818cf8,
+    sunIntensity: 0.66,
+    hemiIntensity: 0.52,
+    rimIntensity: 0.76,
+    envIntensity: 0.46,
+    exposure: 0.9,
+    nightFactor: 0.94,
+    twilightBlend: 1.0,
+    goldenHourFactor: 0.0,
+  },
+  {
+    hour: 22.0,
+    skyZenith: 0x04071a,
+    skyMid: 0x11143e,
+    sky: 0x131942,
+    fog: 0x1a1f4b,
+    hemiSky: 0x434f8e,
     hemiGround: 0x0b1020,
     sunColor: 0x93c5fd,
     sunGlowColor: 0x1e3a8a,
-    sunGlowStrength: 0.0,
+    sunGlowStrength: 0.04,
     rimColor: 0x60a5fa,
     sunIntensity: 0.6,
     hemiIntensity: 0.48,
@@ -285,33 +342,34 @@ const _colorB = new THREE.Color();
 
 export function createDayNightState(): DayNightState {
   return {
-    hourDecimal: 6.15,
-    skyZenith: new THREE.Color(0x3666a6),
-    sky: new THREE.Color(0xf08c6e),
-    fog: new THREE.Color(0xfdba74),
+    hourDecimal: SUNSET_TWILIGHT_START_HOUR,
+    skyZenith: new THREE.Color(0x5a2554),
+    skyMid: new THREE.Color(0xd9483b),
+    sky: new THREE.Color(0xf97316),
+    fog: new THREE.Color(0xfb923c),
     hemiSky: new THREE.Color(0xfed7aa),
-    hemiGround: new THREE.Color(0x5c3638),
-    sunColor: new THREE.Color(0xfde68a),
-    sunGlowColor: new THREE.Color(0xfb923c),
-    sunGlowStrength: 0.92,
+    hemiGround: new THREE.Color(0x5c2c24),
+    sunColor: new THREE.Color(0xfdba74),
+    sunGlowColor: new THREE.Color(0xf97316),
+    sunGlowStrength: 1.0,
     rimColor: new THREE.Color(0xfb923c),
     sunIntensity: 1.28,
     hemiIntensity: 0.76,
-    rimIntensity: 0.82,
-    envIntensity: 0.82,
-    exposure: 1.03,
+    rimIntensity: 0.88,
+    envIntensity: 0.8,
+    exposure: 1.02,
     nightFactor: 0.18,
-    twilightBlend: 0.84,
+    twilightBlend: 0.78,
     goldenHourFactor: 1.0,
-    sunX: -38,
-    sunY: 4,
+    sunX: 38.5,
+    sunY: 8.05,
     sunVisible: true,
-    moonX: -28,
-    moonY: -20,
-    moonVisible: false,
-    keyOffsetX: -24,
-    keyOffsetY: 8.5,
-    keyOffsetZ: 13.0,
+    moonX: -38,
+    moonY: 2,
+    moonVisible: true,
+    keyOffsetX: 22.6,
+    keyOffsetY: 14.5,
+    keyOffsetZ: 10.6,
   };
 }
 
@@ -358,13 +416,29 @@ export function getLahoreHourDecimal(date = new Date()): number {
 }
 
 /**
- * Computes the dynamic in-run time-of-day hour (0..24) so a single long run
- * smoothly transitions from Sunrise (06:09) -> Noon (12:00+) -> Dusk (17:45) -> Night (21:30+).
+ * Computes normalized [0..1] skybox transition progress from Sunset Orange (0)
+ * at 0m to Deep Indigo Twilight (1) as the runner accumulates distance across
+ * Lahore's landmarks (0m Delhi Gate -> 1080m+ Liberty Chowk & beyond).
+ */
+export function computeDistanceSkyboxProgress(
+  distanceMeters: number,
+  elapsedRunSeconds = 0,
+): number {
+  const safeDist = Number.isFinite(distanceMeters) ? Math.max(0, distanceMeters) : 0;
+  const safeTime = Number.isFinite(elapsedRunSeconds) ? Math.max(0, elapsedRunSeconds) : 0;
+  const effectiveMeters = safeDist + safeTime * 0.45;
+  const raw = THREE.MathUtils.clamp(effectiveMeters / TWILIGHT_DISTANCE_SPAN_METERS, 0, 1);
+  return raw * raw * (3 - 2 * raw);
+}
+
+/**
+ * Computes the dynamic in-run time-of-day hour (17.45 -> 20.65) so each run
+ * smoothly shifts from Sunset Orange at Delhi Gate into Deep Indigo Twilight
+ * as distance accumulates across Lahore's landmarks.
  */
 export function getDynamicRunHourDecimal(distanceMeters: number, elapsedRunSeconds: number): number {
-  const safeDist = Math.max(0, distanceMeters);
-  const safeTime = Math.max(0, elapsedRunSeconds);
-  return (6.15 + safeDist / 78 + safeTime * 0.018) % 24;
+  const progress = computeDistanceSkyboxProgress(distanceMeters, elapsedRunSeconds);
+  return THREE.MathUtils.lerp(SUNSET_TWILIGHT_START_HOUR, DEEP_INDIGO_TWILIGHT_HOUR, progress);
 }
 
 export function getHourForLightingMode(
@@ -384,7 +458,8 @@ export function getTimePhaseLabel(hourDecimal: number): string {
   if (h >= 5.25 && h < 8.0) return 'Sunrise';
   if (h >= 8.0 && h < 11.25) return 'Morning';
   if (h >= 11.25 && h < 15.75) return 'Noon';
-  if (h >= 15.75 && h < 19.25) return 'Dusk';
+  if (h >= 15.75 && h < 18.6) return 'Sunset';
+  if (h >= 18.6 && h < 21.1) return 'Twilight';
   return 'Night';
 }
 
@@ -400,7 +475,7 @@ export function formatLahoreClockAndPhase(
   const clockText = `${hour12}:${String(minutes).padStart(2, '0')} ${period} PKT`;
   const effectivePhaseLabel =
     mode === 'auto'
-      ? 'Sunrise → Night Cycle'
+      ? 'Sunset → Indigo Twilight'
       : getTimePhaseLabel(getHourForLightingMode(mode));
   return {
     clockText,
@@ -434,10 +509,11 @@ export function sampleDayNightState(hourDecimal: number, out: DayNightState): vo
 
   const span = Math.max(0.001, nextHour - prevHour);
   const rawT = THREE.MathUtils.clamp((h - prevHour) / span, 0, 1);
-  // Smoothstep for organic sunrise, noon, dusk & night easing
+  // Smoothstep for organic sunrise, noon, sunset & indigo twilight easing
   const t = rawT * rawT * (3 - 2 * rawT);
 
   out.skyZenith.setHex(prev.skyZenith).lerp(_colorB.setHex(next.skyZenith), t);
+  out.skyMid.setHex(prev.skyMid).lerp(_colorB.setHex(next.skyMid), t);
   out.sky.setHex(prev.sky).lerp(_colorB.setHex(next.sky), t);
   out.fog.setHex(prev.fog).lerp(_colorB.setHex(next.fog), t);
   out.hemiSky.setHex(prev.hemiSky).lerp(_colorB.setHex(next.hemiSky), t);
@@ -456,8 +532,8 @@ export function sampleDayNightState(hourDecimal: number, out: DayNightState): vo
   out.twilightBlend = THREE.MathUtils.lerp(prev.twilightBlend, next.twilightBlend, t);
   out.goldenHourFactor = THREE.MathUtils.lerp(prev.goldenHourFactor, next.goldenHourFactor, t);
 
-  // Sun celestial arc across the forward horizon (approx 05:30 -> 18:30)
-  const dayT = (h - 5.5) / 13.0;
+  // Sun celestial arc across the forward horizon (approx 05:30 -> 18:45)
+  const dayT = (h - 5.5) / 13.15;
   if (dayT >= -0.05 && dayT <= 1.05) {
     const clampedDay = THREE.MathUtils.clamp(dayT, 0, 1);
     const arc = Math.sin(clampedDay * Math.PI);
@@ -470,9 +546,9 @@ export function sampleDayNightState(hourDecimal: number, out: DayNightState): vo
     out.sunVisible = false;
   }
 
-  // Moon celestial arc across the forward horizon (approx 18:00 -> 06:00)
-  const nightHours = h >= 18.0 ? h - 18.0 : h + 6.0;
-  const nightT = nightHours / 12.0;
+  // Moon celestial arc across the forward horizon (approx 17:45 -> 06:00)
+  const nightHours = h >= 17.75 ? h - 17.75 : h + 6.25;
+  const nightT = nightHours / 12.25;
   if (nightT >= 0 && nightT <= 1) {
     const arc = Math.sin(nightT * Math.PI);
     out.moonX = THREE.MathUtils.lerp(-38, 38, nightT);
@@ -484,8 +560,8 @@ export function sampleDayNightState(hourDecimal: number, out: DayNightState): vo
     out.moonVisible = false;
   }
 
-  // Key directional light sweeps low at sunrise/dusk for long shadows,
-  // climbs high at solar noon, and shifts to cool elevated moonlight at night
+  // Key directional light sweeps low at sunrise/sunset for long shadows,
+  // climbs high at solar noon, and shifts to cool elevated twilight/moonlight
   const dayArcT = THREE.MathUtils.clamp(dayT, 0, 1);
   const sunElevation = Math.sin(dayArcT * Math.PI);
   const dayKeyX = THREE.MathUtils.lerp(-27, 27, dayArcT);

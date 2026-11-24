@@ -92,7 +92,10 @@ const TimeOfDayIcon: React.FC<{ label: string }> = ({ label }) => {
     case 'Noon':
       return <Sun className="w-3 h-3 shrink-0 text-amber-300" />;
     case 'Dusk':
-      return <Sunset className="w-3 h-3 shrink-0 text-rose-300" />;
+    case 'Sunset':
+      return <Sunset className="w-3 h-3 shrink-0 text-orange-300" />;
+    case 'Twilight':
+      return <Moon className="w-3 h-3 shrink-0 text-violet-300" />;
     case 'Night':
     default:
       return <Moon className="w-3 h-3 shrink-0 text-indigo-300" />;
@@ -276,10 +279,18 @@ export const GameHUD: React.FC<GameHUDProps> = React.memo(({
           <span
             className="inline-flex items-center gap-1 font-semibold"
             style={{ color: hud.weatherAccentHex }}
-            title={hud.ambientOverlayLabel ? `Ambient Overlay: ${hud.ambientOverlayLabel}` : undefined}
+            title={
+              hud.weatherModifierSummary ??
+              (hud.ambientOverlayLabel ? `Ambient Overlay: ${hud.ambientOverlayLabel}` : undefined)
+            }
           >
             <WeatherIcon weather={hud.weather} color={hud.weatherAccentHex} />
             <span>{hud.weatherLabel}</span>
+            {hud.weatherModifierLabel && (
+              <span className="ml-0.5 rounded bg-white/10 px-1.5 py-[1px] text-[9px] font-black tracking-wide text-white/90">
+                {hud.weatherModifierLabel}
+              </span>
+            )}
           </span>
           <span aria-hidden="true" className="text-white/25">
             ·
@@ -425,6 +436,23 @@ export const GameHUD: React.FC<GameHUDProps> = React.memo(({
                 }}
               />
             </div>
+            {hud.weatherModifierLabel && (
+              <div
+                className="mt-1 flex items-center justify-between gap-1.5 text-[9px] font-bold tracking-wide leading-none"
+                title={hud.weatherModifierSummary ?? undefined}
+              >
+                <span
+                  className="inline-flex items-center gap-1 truncate"
+                  style={{ color: hud.weatherAccentHex }}
+                >
+                  <WeatherIcon weather={hud.weather} color={hud.weatherAccentHex} />
+                  <span>{hud.weatherLabel}</span>
+                </span>
+                <span className="text-slate-200/90 font-black uppercase shrink-0">
+                  {hud.weatherModifierLabel}
+                </span>
+              </div>
+            )}
           </div>
 
           {/* Compact Speedometer */}
@@ -667,7 +695,7 @@ export const GameHUD: React.FC<GameHUDProps> = React.memo(({
                 </div>
                 <div className="text-[10px] font-semibold text-slate-300/90 truncate tabular-nums leading-tight">
                   {hud.landmarkPopupIsNew ? 'Codex Unlocked · ' : ''}
-                  {hud.landmarkPopupDistance}m · {hud.weatherLabel}
+                  {hud.landmarkPopupDistance}m · {hud.weatherModifierLabel ?? hud.weatherLabel}
                 </div>
               </div>
             </div>

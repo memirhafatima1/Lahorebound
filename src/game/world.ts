@@ -769,6 +769,7 @@ export class WorldBuilder {
       for (const dx of [-LANE_WIDTH / 2, LANE_WIDTH / 2]) {
         const dash = new THREE.Mesh(this.dashGeo, this.roadStripeMat);
         dash.position.set(dx, topY + 0.02, dashZ);
+        dash.receiveShadow = true;
         chunk.group.add(dash);
 
         if (i % 2 === 0) {
@@ -786,6 +787,7 @@ export class WorldBuilder {
       const edgeLine = new THREE.Mesh(this.roadEdgeLineGeo, this.roadYellowMat);
       edgeLine.scale.set(1, 1, length / CHUNK_LENGTH);
       edgeLine.position.set(sx, topY + 0.02, zTop - length / 2);
+      edgeLine.receiveShadow = true;
       chunk.group.add(edgeLine);
     }
 
@@ -821,6 +823,7 @@ export class WorldBuilder {
       this.lahoreTextures.truckArtRailMat,
     );
     strip.position.set(x, topY - 0.06, zTop - length / 2);
+    strip.receiveShadow = true;
     chunk.group.add(strip);
 
     chunk.decks.push({
@@ -858,6 +861,7 @@ export class WorldBuilder {
     const guide = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.08, hyp * 0.85), trimMat);
     guide.position.set(x, (startY + endY) / 2 + 0.03, zTop - length / 2);
     guide.rotation.x = angle;
+    guide.receiveShadow = true;
     chunk.group.add(guide);
 
     chunk.decks.push({
@@ -1100,6 +1104,7 @@ export class WorldBuilder {
     const topStrip = new THREE.Mesh(this.hurdleGeo, accentMat);
     topStrip.scale.set(0.96, 0.34, 1.08);
     topStrip.position.y = 0.88;
+    topStrip.receiveShadow = true;
     g.add(topStrip);
 
     // Twin reflective road cones flanking barrier
@@ -1216,6 +1221,7 @@ export class WorldBuilder {
     const cornice = new THREE.Mesh(this.tallArchCapGeo, this.ochreSandMat);
     cornice.position.y = 2.48;
     cornice.castShadow = true;
+    cornice.receiveShadow = true;
     g.add(cornice);
 
     const dome = new THREE.Mesh(this.tallDomeGeo, this.marbleWhiteMat);
@@ -1268,12 +1274,14 @@ export class WorldBuilder {
     const nose = new THREE.Mesh(this.rickshawNoseGeo, this.truckPinkMat);
     nose.position.set(0, 0.5, 0.66);
     nose.castShadow = true;
+    nose.receiveShadow = true;
     g.add(nose);
 
     // 3. Yellow canvas canopy roof
     const roof = new THREE.Mesh(this.rickshawRoofGeo, this.rickshawYellowMat);
     roof.position.set(0, 1.38, -0.04);
     roof.castShadow = true;
+    roof.receiveShadow = true;
     g.add(roof);
 
     // 4. Support pillars
@@ -1340,6 +1348,7 @@ export class WorldBuilder {
 
     const base = new THREE.Mesh(this.springBaseGeo, this.darkMetalMat);
     base.position.y = 0.09;
+    base.receiveShadow = true;
     g.add(base);
 
     const core = new THREE.Mesh(this.springCoreGeo, this.springPadMat);
@@ -1363,6 +1372,7 @@ export class WorldBuilder {
 
     const base = new THREE.Mesh(this.boostBaseGeo, this.darkMetalMat);
     base.position.y = 0.04;
+    base.receiveShadow = true;
     g.add(base);
 
     for (const side of [-1, 1]) {
@@ -1914,6 +1924,7 @@ export class WorldBuilder {
       if (biome === 'skybridge') {
         const canal = new THREE.Mesh(this.canalWaterGeo, this.canalWaterMat);
         canal.position.set(side * 11.4, 0.02, zStart - CHUNK_LENGTH / 2);
+        canal.receiveShadow = true;
         chunk.group.add(canal);
       }
 

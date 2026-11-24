@@ -2,8 +2,9 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { AmbientWeatherOverlay } from './ambientWeatherOverlay';
 import { GameAudio, pickComboVoiceoverPhrase } from './audio';
-import { LowPolyCharacter } from './character';
+import { LowPolyCharacter, RUNNER_SHADOW_LAYER } from './character';
 import {
+  computeDistanceSkyboxProgress,
   createDayNightState,
   getHourForLightingMode,
   getTimePhaseLabel,
@@ -15,9 +16,15 @@ import { getStreetCarnivalStatus, type GlobalEventStatus } from './globalEvents'
 import { HapticFeedbackService, type HapticEvent } from './haptics';
 import {
   LAHORE_LANDMARK_THEMES,
+  LAHORE_TRACK_STOPS,
   getJourneyProgressForDistance,
 } from './lahoreJourney';
 import { GlobalMusicManager } from './music';
+import {
+  OverdriveTrailEffect,
+  OVERDRIVE_SPEED_THRESHOLD,
+  computeOverdriveIntensity,
+} from './overdriveTrail';
 import { ParticlePool } from './particles';
 import { PowerupVfxSystem } from './powerupVfx';
 import { CARNIVAL_RUNNER_SKIN, getSkinById } from './skins';
@@ -27,8 +34,10 @@ import {
   WeatherSystem,
   getAllLandmarkForecasts,
   getLandmarkForecast,
+  getLandmarkWeatherTrigger,
   pickWeatherForLandmark,
   type LandmarkForecast,
+  type LandmarkGameplayModifiers,
   type WeatherLightingModifiers,
 } from './weather';
 import type {
@@ -55,6 +64,7 @@ import {
 } from './world';
 
 const _targetZenith = new THREE.Color();
+const _targetMidSky = new THREE.Color();
 const _targetSky = new THREE.Color();
 const _targetFog = new THREE.Color();
 const _targetHemiSky = new THREE.Color();
@@ -62,6 +72,9 @@ const _targetHemiGround = new THREE.Color();
 const _targetSun = new THREE.Color();
 const _targetSunGlow = new THREE.Color();
 const _targetRim = new THREE.Color();
+const _skyThemeAccent = new THREE.Color();
+const _sunsetOrangeAnchor = new THREE.Color(0xf97316);
+const _indigoTwilightAnchor = new THREE.Color(0x1e1b4b);
 const _biomeSky = new THREE.Color();
 const _biomeFog = new THREE.Color();
 const _biomeHemiSky = new THREE.Color();
@@ -115,6 +128,139 @@ const MAX_FOV = 68;
 const LANDMARK_TRANSITION_DURATION = 0.92;
 const SONIC_BREAK_DURATION = 0.46;
 const CARNIVAL_CONFETTI_COLORS = [0xec4899, 0xfbbf24, 0x22d3ee] as const;
+const LANDMARK_ACCENT_HEX: Record<LahoreLandmarkKind, string> = LAHORE_TRACK_STOPS.reduce(
+  (acc, stop) => {
+    acc[stop.landmark] = stop.accentHex;
+    return acc;
+  },
+  {} as Record<LahoreLandmarkKind, string>,
+);
+
+/**
+ * Computes continuous [0..1] screen-space radial speed-line motion blur intensity
+ * scaling smoothly from brisk cruising speed (1.12x) through 3.0x+ Overdrive.
+ */
+export function computeRunSpeedBlurIntensity(
+  speedMultiplier: number,
+  forwardSpeed: number,
+  chronosStrength: number,
+): number {
+  const chronosDamp = THREE.MathUtils.clamp(1 - chronosStrength, 0, 1);
+  if (chronosDamp <= 0.001) return 0;
+
+  const effectiveMult = Math.max(speedMultiplier, forwardSpeed / 11.2);
+  if (effectiveMult < 1.12) return 0;
+
+  let blur = 0;
+  if (effectiveMult < 1.85) {
+    blur = THREE.MathUtils.lerp(0, 0.34, (effectiveMult - 1.12) / 0.73);
+  } else {
+    blur = THREE.MathUtils.lerp(
+      0.34,
+      1.0,
+      THREE.MathUtils.clamp((effectiveMult - 1.85) / 1.55, 0, 1),
+    );
+  }
+  return blur * chronosDamp;
+}
+
+/**
+ * Computes camera landing screen-shake trauma intensity [0..0.44] from the
+ * vertical drop distance (airborne apex minus landing terrain height).
+ * Returns 0 for micro-steps/ramp seams so only genuine landings trigger shake.
+ */
+export function computeLandingShakeIntensity(jumpHeight: number, wasJump = true): number {
+  const minHeight = wasJump ? 0.25 : 0.65;
+  if (!Number.isFinite(jumpHeight) || jumpHeight < minHeight) return 0;
+
+  const clampedHeight = Math.min(jumpHeight, 8.5);
+  const norm = THREE.MathUtils.clamp((clampedHeight - 0.25) / 6.75, 0, 1);
+  return THREE.MathUtils.lerp(0.045, 0.44, Math.pow(norm, 1.18));
+}
+
+const KEY_SHADOW_MAP_SIZE = 2048;
+const KEY_SHADOW_WORLD_SPAN = 36;
+const KEY_SHADOW_TEXEL_SIZE = KEY_SHADOW_WORLD_SPAN / KEY_SHADOW_MAP_SIZE;
+const RUNNER_SHADOW_MAP_SIZE = 512;
+const RUNNER_SHADOW_FRUSTUM_HALF = 2.5;
+const RUNNER_SHADOW_NEAR = 0.5;
+const RUNNER_SHADOW_FAR = 48.0;
+const RUNNER_SHADOW_CAM_DIST = 12.0;
+
+const _lightUp = new THREE.Vector3(0, 1, 0);
+const _lightAltUp = new THREE.Vector3(0, 0, -1);
+const _lightDirNorm = new THREE.Vector3();
+const _lightTargetDesired = new THREE.Vector3();
+const _lightOffsetVec = new THREE.Vector3();
+const _lightRight = new THREE.Vector3();
+const _lightCamUp = new THREE.Vector3();
+const _lightFwd = new THREE.Vector3();
+const _lightSnapMat = new THREE.Matrix4();
+const _runnerShadowTarget = new THREE.Vector3();
+
+/**
+ * Snaps a directional light's target & position to shadow-map texel increments in light space
+ * so hardware shadow edges stay locked to world geometry without shimmering at high runner speeds.
+ */
+export function snapDirectionalShadowTarget(
+  desiredTarget: THREE.Vector3,
+  lightOffsetFromTarget: THREE.Vector3,
+  texelSize: number,
+  outTarget: THREE.Vector3,
+  outLightPos: THREE.Vector3,
+): void {
+  const lightDist = Math.max(1e-3, lightOffsetFromTarget.length());
+  _lightDirNorm.copy(lightOffsetFromTarget).divideScalar(lightDist);
+  const upRef = Math.abs(_lightDirNorm.y) > 0.96 ? _lightAltUp : _lightUp;
+
+  outLightPos.copy(desiredTarget).addScaledVector(_lightDirNorm, lightDist);
+  _lightSnapMat.lookAt(outLightPos, desiredTarget, upRef);
+  _lightSnapMat.extractBasis(_lightRight, _lightCamUp, _lightFwd);
+
+  const projX = Math.round(desiredTarget.dot(_lightRight) / texelSize) * texelSize;
+  const projY = Math.round(desiredTarget.dot(_lightCamUp) / texelSize) * texelSize;
+  const projZ = desiredTarget.dot(_lightFwd);
+
+  outTarget
+    .set(0, 0, 0)
+    .addScaledVector(_lightRight, projX)
+    .addScaledVector(_lightCamUp, projY)
+    .addScaledVector(_lightFwd, projZ);
+  outLightPos.copy(outTarget).addScaledVector(_lightDirNorm, lightDist);
+}
+
+/**
+ * Updates the dedicated runner shadow orthographic camera and its world-to-shadow-clip matrix
+ * along the active key-light direction.
+ */
+export function updateRunnerShadowCameraTransform(
+  shadowCamera: THREE.OrthographicCamera,
+  runnerX: number,
+  runnerY: number,
+  runnerZ: number,
+  keyLightPos: THREE.Vector3,
+  keyLightTarget: THREE.Vector3,
+  outShadowMatrix: THREE.Matrix4,
+): void {
+  _lightDirNorm.subVectors(keyLightPos, keyLightTarget);
+  if (_lightDirNorm.lengthSq() < 1e-6) {
+    _lightDirNorm.set(0.35, 0.85, 0.4).normalize();
+  } else {
+    _lightDirNorm.normalize();
+  }
+
+  _runnerShadowTarget.set(runnerX, runnerY + 0.82, runnerZ);
+  shadowCamera.up.copy(Math.abs(_lightDirNorm.y) > 0.96 ? _lightAltUp : _lightUp);
+  shadowCamera.position
+    .copy(_runnerShadowTarget)
+    .addScaledVector(_lightDirNorm, RUNNER_SHADOW_CAM_DIST);
+  shadowCamera.lookAt(_runnerShadowTarget);
+  shadowCamera.updateMatrixWorld(true);
+  outShadowMatrix.multiplyMatrices(
+    shadowCamera.projectionMatrix,
+    shadowCamera.matrixWorldInverse,
+  );
+}
 
 function createSsaoKernel(count = 16): THREE.Vector3[] {
   const kernel: THREE.Vector3[] = [];
@@ -279,6 +425,11 @@ export class SkyboundEngine {
   private activeSkinId = 'trailblazer';
   private readonly chronosOverlayMesh: THREE.Mesh;
   private readonly chronosOverlayMat: THREE.ShaderMaterial;
+  private readonly runnerShadowDepthTexture: THREE.DepthTexture;
+  private readonly runnerShadowTarget: THREE.WebGLRenderTarget;
+  private readonly runnerShadowCamera: THREE.OrthographicCamera;
+  private readonly runnerShadowDepthMat: THREE.MeshBasicMaterial;
+  private readonly runnerShadowMatrix = new THREE.Matrix4();
   private readonly sceneDepthTexture: THREE.DepthTexture;
   private readonly transitionTarget: THREE.WebGLRenderTarget;
   private readonly ssaoTarget: THREE.WebGLRenderTarget;
@@ -304,6 +455,8 @@ export class SkyboundEngine {
   private landmarkTransitionPhase = 0;
   private landmarkTransitionIntensity = 0;
   private readonly landmarkTransitionAccent = new THREE.Color(0xfbbf24);
+  private readonly smoothedLandmarkAccent = new THREE.Color(0xf97316);
+  private readonly targetLandmarkAccent = new THREE.Color(0xf97316);
   private overdrive3xTriggered = false;
   private sonicBreakTimer = 0;
   private sonicBreakPhase = 0;
@@ -313,12 +466,15 @@ export class SkyboundEngine {
   private screenDistortionStrength = 0;
   private heatShimmerStrength = 0;
   private smoothedTierSpeed = 1.0;
+  private velocityBlurClock = 0;
+  private currentForwardSpeed = DIFFICULTY_CONFIGS.normal.baseSpeed;
 
   private readonly character: LowPolyCharacter;
   private readonly boundFootTerrainSampler = (x: number, z: number): number =>
     this.sampleFootSurfaceHeight(x, z);
   private readonly worldBuilder: WorldBuilder;
   private readonly particles = new ParticlePool();
+  private readonly overdriveTrail = new OverdriveTrailEffect();
   private readonly powerupVfx = new PowerupVfxSystem();
   private readonly weatherSystem = new WeatherSystem(pickWeatherForLandmark('gate', undefined, true));
   private readonly ambientWeatherOverlay = new AmbientWeatherOverlay(
@@ -326,6 +482,13 @@ export class SkyboundEngine {
     'gate',
     true,
   );
+  private activeLandmarkModifier: LandmarkGameplayModifiers = getLandmarkWeatherTrigger('gate').gameplay;
+  private smoothedSpeedMul = 1.0;
+  private smoothedJumpVelMul = 1.0;
+  private smoothedGravityMul = 1.0;
+  private smoothedSlideDurMul = 1.0;
+  private smoothedCoyoteMul = 1.0;
+  private smoothedLaneSnapMul = 1.0;
   private readonly speedLines: SpeedLinesEffect;
   public readonly audio: GameAudio;
   public readonly music = new GlobalMusicManager();
@@ -362,6 +525,7 @@ export class SkyboundEngine {
   private slideBufferTimer = 0;
   private fastFallQueued = false;
   private jumpedInAir = false;
+  private airbornePeakY = 0;
   private runCycle = 0;
   private squashY = 1;
   private trailAccum = 0;
@@ -430,6 +594,7 @@ export class SkyboundEngine {
   // Juice
   private hitstopTimer = 0;
   private shakeIntensity = 0;
+  private landingShakeDip = 0;
   private hitFlash = 0;
   private rainWetness = 0;
 
@@ -527,16 +692,16 @@ export class SkyboundEngine {
     this.keyLight = new THREE.DirectionalLight(initPalette.sun, 1.55);
     this.keyLight.position.set(14, 24, 12);
     this.keyLight.castShadow = !this.isSoftwareGl;
-    this.keyLight.shadow.mapSize.set(1024, 1024);
-    this.keyLight.shadow.bias = -0.0004;
-    this.keyLight.shadow.normalBias = 0.025;
-    const d = 24;
-    this.keyLight.shadow.camera.left = -d;
-    this.keyLight.shadow.camera.right = d;
-    this.keyLight.shadow.camera.top = d;
-    this.keyLight.shadow.camera.bottom = -d;
+    this.keyLight.shadow.mapSize.set(KEY_SHADOW_MAP_SIZE, KEY_SHADOW_MAP_SIZE);
+    this.keyLight.shadow.bias = -0.00028;
+    this.keyLight.shadow.normalBias = 0.022;
+    this.keyLight.shadow.radius = 2.2;
+    this.keyLight.shadow.camera.left = -KEY_SHADOW_WORLD_SPAN * 0.5;
+    this.keyLight.shadow.camera.right = KEY_SHADOW_WORLD_SPAN * 0.5;
+    this.keyLight.shadow.camera.top = 22;
+    this.keyLight.shadow.camera.bottom = -14;
     this.keyLight.shadow.camera.near = 2;
-    this.keyLight.shadow.camera.far = 92;
+    this.keyLight.shadow.camera.far = 90;
     this.scene.add(this.keyLight);
     this.scene.add(this.keyLight.target);
 
@@ -573,6 +738,7 @@ export class SkyboundEngine {
     this.scene.add(this.character.root);
     this.scene.add(this.character.debugFootIkGroup);
     this.scene.add(this.particles.mesh);
+    this.scene.add(this.overdriveTrail.group);
     this.scene.add(this.powerupVfx.group);
     this.scene.add(this.weatherSystem.group);
     this.scene.add(this.ambientWeatherOverlay.group);
@@ -649,6 +815,44 @@ export class SkyboundEngine {
     const eighthRtWidth = Math.max(1, Math.floor(rtWidth * 0.125));
     const eighthRtHeight = Math.max(1, Math.floor(rtHeight * 0.125));
     const hdrType = supportsHalfFloat ? THREE.HalfFloatType : THREE.UnsignedByteType;
+
+    this.runnerShadowDepthTexture = new THREE.DepthTexture(
+      RUNNER_SHADOW_MAP_SIZE,
+      RUNNER_SHADOW_MAP_SIZE,
+      THREE.UnsignedIntType,
+    );
+    this.runnerShadowDepthTexture.format = THREE.DepthFormat;
+    this.runnerShadowDepthTexture.minFilter = THREE.NearestFilter;
+    this.runnerShadowDepthTexture.magFilter = THREE.NearestFilter;
+
+    this.runnerShadowTarget = new THREE.WebGLRenderTarget(
+      RUNNER_SHADOW_MAP_SIZE,
+      RUNNER_SHADOW_MAP_SIZE,
+      {
+        type: THREE.UnsignedByteType,
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+        depthBuffer: true,
+        stencilBuffer: false,
+        depthTexture: this.runnerShadowDepthTexture,
+      },
+    );
+
+    this.runnerShadowCamera = new THREE.OrthographicCamera(
+      -RUNNER_SHADOW_FRUSTUM_HALF,
+      RUNNER_SHADOW_FRUSTUM_HALF,
+      RUNNER_SHADOW_FRUSTUM_HALF,
+      -RUNNER_SHADOW_FRUSTUM_HALF,
+      RUNNER_SHADOW_NEAR,
+      RUNNER_SHADOW_FAR,
+    );
+    this.runnerShadowCamera.layers.set(RUNNER_SHADOW_LAYER);
+    this.runnerShadowDepthMat = new THREE.MeshBasicMaterial({
+      colorWrite: false,
+      depthWrite: true,
+      depthTest: true,
+      side: THREE.DoubleSide,
+    });
 
     this.sceneDepthTexture = new THREE.DepthTexture(rtWidth, rtHeight, THREE.UnsignedIntType);
     this.sceneDepthTexture.format = THREE.DepthFormat;
@@ -1003,12 +1207,24 @@ export class SkyboundEngine {
     this.blurZoomMat = new THREE.ShaderMaterial({
       uniforms: {
         tDiffuse: { value: this.transitionTarget.texture },
+        tDepth: { value: this.sceneDepthTexture },
+        tRunnerShadow: { value: this.runnerShadowDepthTexture },
         tAo: { value: this.ssaoBlurTarget.texture },
         tBloomTight: { value: this.bloomQuarterA.texture },
         tBloomWide: { value: this.bloomEighthB.texture },
+        uInvViewProjection: { value: new THREE.Matrix4() },
+        uRunnerShadowMatrix: { value: new THREE.Matrix4() },
+        uRunnerShadowTexelSize: { value: 1 / RUNNER_SHADOW_MAP_SIZE },
+        uRunnerShadowRange: { value: RUNNER_SHADOW_FAR - RUNNER_SHADOW_NEAR },
+        uRunnerWorldPos: { value: new THREE.Vector3() },
+        uRunnerShadowStrength: { value: 0.36 },
         uAoStrength: { value: 0.68 },
         uBloomIntensity: { value: 0.24 },
         uOverdriveFactor: { value: 0 },
+        uOverdriveMotionBlur: { value: 0 },
+        uRunSpeedBlur: { value: 0 },
+        uVelocityClock: { value: 0 },
+        uLandmarkAccent: { value: new THREE.Color(0xf97316) },
         uIntensity: { value: 0 },
         uZoomAmount: { value: 0 },
         uTime: { value: 0 },
@@ -1029,12 +1245,24 @@ export class SkyboundEngine {
       `,
       fragmentShader: `
         uniform sampler2D tDiffuse;
+        uniform sampler2D tDepth;
+        uniform sampler2D tRunnerShadow;
         uniform sampler2D tAo;
         uniform sampler2D tBloomTight;
         uniform sampler2D tBloomWide;
+        uniform mat4 uInvViewProjection;
+        uniform mat4 uRunnerShadowMatrix;
+        uniform float uRunnerShadowTexelSize;
+        uniform float uRunnerShadowRange;
+        uniform vec3 uRunnerWorldPos;
+        uniform float uRunnerShadowStrength;
         uniform float uAoStrength;
         uniform float uBloomIntensity;
         uniform float uOverdriveFactor;
+        uniform float uOverdriveMotionBlur;
+        uniform float uRunSpeedBlur;
+        uniform float uVelocityClock;
+        uniform vec3 uLandmarkAccent;
         uniform float uIntensity;
         uniform float uZoomAmount;
         uniform float uTime;
@@ -1094,8 +1322,28 @@ export class SkyboundEngine {
             0.999
           );
 
-          // 8-tap radial zoom blur weighted toward outer screen periphery (single-tap fast path when no blur active)
-          float blurSpread = uIntensity * (0.045 + 0.085 * edgeMask + waveFront * 0.022) + sonicRing * 0.04;
+          // Polar speed-line ray field masked to peripheral corridor so center track & runner stay crisp
+          float speedLineBand = smoothstep(0.22, 0.86, dist);
+          float rayPhaseA = sin(angle * 42.0 + sin(angle * 7.0) * 1.6);
+          float rayPhaseB = sin(angle * 74.0 - uVelocityClock * 1.8 + cos(angle * 11.0));
+          float raySharpA = pow(max(0.0, rayPhaseA), 6.0);
+          float raySharpB = pow(max(0.0, rayPhaseB), 8.0);
+          float radialPulse = 0.55 + 0.45 * sin(dist * 24.0 - uVelocityClock * 14.0 + raySharpA * 3.0);
+          float speedLineMask =
+            clamp((raySharpA * 0.62 + raySharpB * 0.55) * radialPulse, 0.0, 1.0) * speedLineBand;
+
+          // 8-tap radial speed-line & overdrive wake motion blur weighted toward periphery & runner trail (single-tap fast path below threshold)
+          float wakeBandX = exp(-pow((baseUv.x - 0.5) * 4.6, 2.0));
+          float wakeBandY = smoothstep(0.58, 0.14, baseUv.y);
+          float overdriveBlur =
+            uOverdriveMotionBlur * (0.012 + 0.046 * smoothstep(0.16, 0.88, dist) + wakeBandX * wakeBandY * 0.022);
+          float speedLineBlur =
+            uRunSpeedBlur * (0.005 + 0.028 * speedLineBand + 0.022 * speedLineMask);
+          float blurSpread =
+            uIntensity * (0.045 + 0.085 * edgeMask + waveFront * 0.022) +
+            sonicRing * 0.04 +
+            overdriveBlur +
+            speedLineBlur;
           vec3 blurred;
           if (blurSpread <= 0.0005) {
             blurred = texture2D(tDiffuse, baseUv).rgb;
@@ -1122,6 +1370,80 @@ export class SkyboundEngine {
           float aoWeight = uAoStrength * (1.0 - smoothstep(0.68, 1.55, lum));
           vec3 aoTint = mix(vec3(0.10, 0.14, 0.26), vec3(1.0), aoSample);
           blurred *= mix(vec3(1.0), aoTint, aoWeight);
+
+          // Dedicated Runner Shadow Map Pass (world reconstruction + altitude-scaled 9-tap PCF penumbra)
+          float sceneDepthRaw = texture2D(tDepth, baseUv).x;
+          vec4 ndcPos = vec4(baseUv * 2.0 - 1.0, sceneDepthRaw * 2.0 - 1.0, 1.0);
+          vec4 worldPosH = uInvViewProjection * ndcPos;
+          vec3 worldPos = worldPosH.xyz / max(worldPosH.w, 1e-5);
+          vec3 dpdx = dFdx(worldPos);
+          vec3 dpdy = dFdy(worldPos);
+          vec3 surfCross = cross(dpdx, dpdy);
+          float surfCrossLenSq = dot(surfCross, surfCross);
+          vec3 surfNormal = surfCrossLenSq > 1e-10 ? surfCross * inversesqrt(surfCrossLenSq) : vec3(0.0, 1.0, 0.0);
+
+          if (sceneDepthRaw < 0.9994 && abs(surfNormal.y) > 0.32 && uRunnerShadowStrength > 0.005) {
+            float runnerRadial = length(worldPos.xz - uRunnerWorldPos.xz);
+            float selfBodyMask = (runnerRadial < 0.54 && worldPos.y > uRunnerWorldPos.y + 0.065)
+              ? 1.0 - smoothstep(0.065, 0.16, worldPos.y - uRunnerWorldPos.y)
+              : 1.0;
+
+            if (selfBodyMask > 0.005) {
+              vec4 shadowClip = uRunnerShadowMatrix * vec4(worldPos, 1.0);
+              vec3 shadowNdc = shadowClip.xyz / max(shadowClip.w, 1e-5);
+              vec2 shadowUv = shadowNdc.xy * 0.5 + 0.5;
+              float fragDepth = shadowNdc.z * 0.5 + 0.5;
+
+              if (
+                shadowUv.x > 0.005 &&
+                shadowUv.x < 0.995 &&
+                shadowUv.y > 0.005 &&
+                shadowUv.y < 0.995 &&
+                fragDepth > 0.002 &&
+                fragDepth < 0.998
+              ) {
+                float centerCaster = texture2D(tRunnerShadow, shadowUv).x;
+                float centerRayDist = max(0.0, (fragDepth - centerCaster) * uRunnerShadowRange);
+                float jumpAltitude = max(0.0, uRunnerWorldPos.y - worldPos.y);
+                float penumbraRadius = mix(
+                  1.15,
+                  3.65,
+                  clamp(max(jumpAltitude, centerRayDist * 0.45) / 3.8, 0.0, 1.0)
+                );
+                vec2 stepUv = vec2(uRunnerShadowTexelSize * penumbraRadius);
+
+                float shadowHit = 0.0;
+                float rayDistAccum = 0.0;
+                float rayHits = 0.0;
+                for (int sx = -1; sx <= 1; sx++) {
+                  for (int sy = -1; sy <= 1; sy++) {
+                    vec2 tapUv = clamp(shadowUv + vec2(float(sx), float(sy)) * stepUv, 0.001, 0.999);
+                    float casterD = texture2D(tRunnerShadow, tapUv).x;
+                    float tapRayDist = (fragDepth - casterD) * uRunnerShadowRange;
+                    float isCast = (casterD < 0.9994 && tapRayDist > 0.048) ? 1.0 : 0.0;
+                    shadowHit += isCast;
+                    rayDistAccum += tapRayDist * isCast;
+                    rayHits += isCast;
+                  }
+                }
+
+                float pcfFactor = shadowHit / 9.0;
+                if (pcfFactor > 0.001) {
+                  float meanRayDist = rayHits > 0.5 ? rayDistAccum / rayHits : centerRayDist;
+                  float boxEdge = min(min(shadowUv.x, 1.0 - shadowUv.x), min(shadowUv.y, 1.0 - shadowUv.y));
+                  float edgeFade = smoothstep(0.01, 0.09, boxEdge);
+                  float altFade = 1.0 - smoothstep(1.1, 7.5, meanRayDist) * 0.44;
+                  float shadowAmount = clamp(
+                    pcfFactor * edgeFade * altFade * selfBodyMask * uRunnerShadowStrength,
+                    0.0,
+                    0.42
+                  );
+                  vec3 shadowTint = mix(vec3(1.0), vec3(0.40, 0.46, 0.62), shadowAmount);
+                  blurred *= shadowTint;
+                }
+              }
+            }
+          }
 
           // Subtle landmark prism fringe + velocity edge dispersion + 3.0x sound-barrier RGB chromatic aberration
           float chromaMix = clamp(
@@ -1166,6 +1488,12 @@ export class SkyboundEngine {
 
           float rimAura = smoothstep(0.42, 1.15, dist) * uIntensity * 0.2;
           vec3 finalRgb = mix(blurred, uAccentColor, rimAura);
+
+          if (uRunSpeedBlur > 0.002) {
+            vec3 speedLineTint = mix(vec3(0.84, 0.94, 1.0), uLandmarkAccent, 0.42 + 0.25 * raySharpB);
+            finalRgb +=
+              speedLineTint * (speedLineMask * uRunSpeedBlur * (0.085 + 0.135 * uOverdriveFactor));
+          }
 
           gl_FragColor = vec4(finalRgb, 1.0);
           #include <tonemapping_fragment>
@@ -1212,14 +1540,17 @@ export class SkyboundEngine {
   } {
     const group = new THREE.Group();
 
-    // Procedural atmospheric gradient skybox dome (zenith -> horizon -> solar corona)
+    // Procedural atmospheric 3-band skybox dome (sunset orange -> violet dusk -> deep indigo twilight)
     const skyDomeMat = new THREE.ShaderMaterial({
       uniforms: {
-        uZenithColor: { value: new THREE.Color(0x3666a6) },
-        uHorizonColor: { value: new THREE.Color(0xf08c6e) },
-        uSunGlowColor: { value: new THREE.Color(0xfb923c) },
-        uSunDir: { value: new THREE.Vector3(-0.26, 0.08, -0.96).normalize() },
-        uSunGlowStrength: { value: 0.9 },
+        uZenithColor: { value: new THREE.Color(0x5a2554) },
+        uMidSkyColor: { value: new THREE.Color(0xd9483b) },
+        uHorizonColor: { value: new THREE.Color(0xfb923c) },
+        uSunGlowColor: { value: new THREE.Color(0xf97316) },
+        uThemeAccentColor: { value: new THREE.Color(0xfb923c) },
+        uSunDir: { value: new THREE.Vector3(0.28, 0.06, -0.95).normalize() },
+        uSunGlowStrength: { value: 1.0 },
+        uTwilightProgress: { value: 0.0 },
         uTime: { value: 0 },
       },
       vertexShader: `
@@ -1231,29 +1562,39 @@ export class SkyboundEngine {
       `,
       fragmentShader: `
         uniform vec3 uZenithColor;
+        uniform vec3 uMidSkyColor;
         uniform vec3 uHorizonColor;
         uniform vec3 uSunGlowColor;
+        uniform vec3 uThemeAccentColor;
         uniform vec3 uSunDir;
         uniform float uSunGlowStrength;
+        uniform float uTwilightProgress;
         uniform float uTime;
         varying vec3 vWorldDir;
 
         void main() {
           vec3 dir = normalize(vWorldDir);
           float elev = clamp(dir.y, -0.18, 1.0);
-          float gradientT = pow(smoothstep(-0.04, 0.68, elev), 0.72);
-          vec3 skyCol = mix(uHorizonColor, uZenithColor, gradientT);
 
-          // Soft atmospheric twilight/horizon band and directional solar scattering glow
-          float horizonBand = exp(-abs(elev - 0.04) * 7.5);
+          // 3-stop atmospheric sky gradient: horizon -> mid-sky twilight belt -> zenith
+          float lowerMix = smoothstep(-0.04, 0.24, elev);
+          float upperMix = smoothstep(0.18, 0.74, elev);
+          vec3 skyCol = mix(uHorizonColor, uMidSkyColor, lowerMix);
+          skyCol = mix(skyCol, uZenithColor, pow(upperMix, 0.85));
+
+          // Sunset orange / deep indigo horizon band synchronized with active Lahore landmark aura
+          float horizonBand = exp(-abs(elev - 0.03) * 7.2);
           float sunDot = max(0.0, dot(dir, normalize(uSunDir)));
           float sunHalo = pow(sunDot, 5.0) * 0.58 + pow(sunDot, 22.0) * 0.45;
+          vec3 auraCol = mix(uSunGlowColor, uThemeAccentColor, 0.28 + uTwilightProgress * 0.44);
           skyCol += uSunGlowColor * (horizonBand * 0.22 + sunHalo) * uSunGlowStrength;
+          skyCol += uThemeAccentColor * horizonBand * (0.14 + uTwilightProgress * 0.2);
 
-          // Subtle drifting high-altitude atmospheric wisps
+          // Soft twilight belt shimmer & drifting high-altitude wisps
           float wisp = sin(dir.x * 6.5 + uTime * 0.035) * cos(dir.z * 5.2 - uTime * 0.025);
-          float wispMask = smoothstep(0.08, 0.55, elev) * (1.0 - smoothstep(0.55, 0.92, elev));
-          skyCol = mix(skyCol, uHorizonColor * 1.12, max(0.0, wisp) * 0.06 * wispMask);
+          float wispMask = smoothstep(0.06, 0.56, elev) * (1.0 - smoothstep(0.56, 0.92, elev));
+          vec3 wispTint = mix(uHorizonColor * 1.12, auraCol * 1.18, uTwilightProgress * 0.55);
+          skyCol = mix(skyCol, wispTint, max(0.0, wisp) * 0.075 * wispMask);
 
           gl_FragColor = vec4(skyCol, 1.0);
           #include <tonemapping_fragment>
@@ -1720,6 +2061,7 @@ export class SkyboundEngine {
     this.slideBufferTimer = 0;
     this.fastFallQueued = false;
     this.jumpedInAir = false;
+    this.airbornePeakY = 0;
     this.runCycle = 0;
     this.squashY = 1;
 
@@ -1760,12 +2102,19 @@ export class SkyboundEngine {
     this.audio.setTimeDilation(0);
     this.currentBiome = 'canyon';
     this.currentLandmarkKind = 'gate';
-    const initialWeather = pickWeatherForLandmark('gate', this.weatherSystem.getWeather(), true);
-    this.weatherSystem.setWeather(initialWeather, true, 'canyon');
+    const gateTrigger = getLandmarkWeatherTrigger('gate');
+    this.activeLandmarkModifier = gateTrigger.gameplay;
+    this.smoothedSpeedMul = gateTrigger.gameplay.speedMul;
+    this.smoothedJumpVelMul = gateTrigger.gameplay.jumpVelMul;
+    this.smoothedGravityMul = gateTrigger.gameplay.gravityMul;
+    this.smoothedSlideDurMul = gateTrigger.gameplay.slideDurationMul;
+    this.smoothedCoyoteMul = gateTrigger.gameplay.coyoteMul;
+    this.smoothedLaneSnapMul = gateTrigger.gameplay.laneSnapMul;
+    this.weatherSystem.setWeather(gateTrigger.condition, true, 'canyon', 'gate');
     this.ambientWeatherOverlay.setForecast(getLandmarkForecast('gate'), 'gate', true);
     this.audio.setAmbientBiome('canyon');
     this.audio.setAmbientLandmark('gate');
-    this.audio.setAmbientWeather(initialWeather);
+    this.audio.setAmbientWeather(gateTrigger.condition);
     this.eventBanner = null;
     this.eventBannerTimer = 0;
     this.landmarkPopupName = null;
@@ -1784,6 +2133,7 @@ export class SkyboundEngine {
     this.runSpringHits = 0;
     this.hitstopTimer = 0;
     this.shakeIntensity = 0;
+    this.landingShakeDip = 0;
     this.hitFlash = 0;
     this.landmarkTransitionTimer = 0;
     this.landmarkTransitionPhase = 0;
@@ -1796,8 +2146,13 @@ export class SkyboundEngine {
     this.lensZoomStrength = 0;
     this.screenDistortionStrength = 0;
     this.heatShimmerStrength = 0;
+    this.currentForwardSpeed = diffCfg.baseSpeed;
+    this.velocityBlurClock = 0;
+    this.targetLandmarkAccent.set(LANDMARK_ACCENT_HEX.gate);
+    this.smoothedLandmarkAccent.set(LANDMARK_ACCENT_HEX.gate);
     this.smoothedTierSpeed = 1.0;
     this.speedLines.reset();
+    this.overdriveTrail.reset();
     this.photoFrozen = false;
     this.savedPhotoCam = null;
 
@@ -2094,6 +2449,30 @@ export class SkyboundEngine {
         this.lensZoomStrength > 0.002 ||
         this.screenDistortionStrength > 0.002);
 
+    // Pass 0: Dedicated high-precision runner-only shadow map pass (character limbs -> depth buffer)
+    this.syncRunnerShadowCamera();
+    const prevBackground = this.scene.background;
+    const prevFog = this.scene.fog;
+    const prevOverride = this.scene.overrideMaterial;
+    const prevMatrixAutoUpdate = this.scene.matrixWorldAutoUpdate;
+    const prevShadowAutoUpdate = this.renderer.shadowMap.autoUpdate;
+    try {
+      this.scene.background = null;
+      this.scene.fog = null;
+      this.scene.overrideMaterial = this.runnerShadowDepthMat;
+      this.scene.matrixWorldAutoUpdate = false;
+      this.renderer.shadowMap.autoUpdate = false;
+      this.renderer.setRenderTarget(this.runnerShadowTarget);
+      this.renderer.clear(false, true, false);
+      this.renderer.render(this.scene, this.runnerShadowCamera);
+    } finally {
+      this.scene.background = prevBackground;
+      this.scene.fog = prevFog;
+      this.scene.overrideMaterial = prevOverride;
+      this.scene.matrixWorldAutoUpdate = prevMatrixAutoUpdate;
+      this.renderer.shadowMap.autoUpdate = prevShadowAutoUpdate;
+    }
+
     // Pass 1: Render 3D scene color + hardware depth buffer
     this.renderer.setRenderTarget(this.transitionTarget);
     this.renderer.clear();
@@ -2175,14 +2554,49 @@ export class SkyboundEngine {
     this.renderer.setRenderTarget(this.bloomEighthB);
     this.renderer.render(this.bloomBlurScene, this.blurZoomCamera);
 
-    // Pass 5: Composite SSAO + Bloom + active optical/sonic/shimmer post effects to screen
+    // Pass 5: Composite SSAO + Runner Shadow Map + Bloom + active optical/sonic/shimmer post effects to screen
+    this.camera.updateMatrixWorld();
+    (this.blurZoomMat.uniforms.uInvViewProjection.value as THREE.Matrix4).multiplyMatrices(
+      this.camera.matrixWorld,
+      this.camera.projectionMatrixInverse,
+    );
+    (this.blurZoomMat.uniforms.uRunnerShadowMatrix.value as THREE.Matrix4).copy(
+      this.runnerShadowMatrix,
+    );
+    (this.blurZoomMat.uniforms.uRunnerWorldPos.value as THREE.Vector3).set(
+      this.playerX,
+      this.playerY,
+      this.playerZ,
+    );
+    this.blurZoomMat.uniforms.uRunnerShadowStrength.value =
+      THREE.MathUtils.lerp(0.36, 0.15, this.currentNightFactor) *
+      (1 - this.rainWetness * 0.22);
     this.blurZoomMat.uniforms.uAoStrength.value = THREE.MathUtils.lerp(
       0.68,
       0.44,
       this.currentNightFactor,
     );
+    const overdriveMotionBlur =
+      !this.photoFrozen && this.phase === 'playing'
+        ? computeOverdriveIntensity(activeTierSpeed, this.speedBoostTimer, this.chronosTimer) *
+          THREE.MathUtils.clamp(1 - this.chronosStrength, 0, 1)
+        : 0;
+    const runSpeedBlur =
+      !this.photoFrozen && this.phase === 'playing'
+        ? computeRunSpeedBlurIntensity(
+            activeTierSpeed,
+            this.currentForwardSpeed,
+            this.chronosStrength,
+          )
+        : 0;
     this.blurZoomMat.uniforms.uBloomIntensity.value = bloomIntensity;
     this.blurZoomMat.uniforms.uOverdriveFactor.value = overdriveFactor;
+    this.blurZoomMat.uniforms.uOverdriveMotionBlur.value = overdriveMotionBlur;
+    this.blurZoomMat.uniforms.uRunSpeedBlur.value = runSpeedBlur;
+    this.blurZoomMat.uniforms.uVelocityClock.value = this.velocityBlurClock;
+    (this.blurZoomMat.uniforms.uLandmarkAccent.value as THREE.Color).copy(
+      this.smoothedLandmarkAccent,
+    );
     (this.blurZoomMat.uniforms.uAccentColor.value as THREE.Color).copy(
       this.landmarkTransitionAccent,
     );
@@ -2266,7 +2680,7 @@ export class SkyboundEngine {
     } else {
       // Live world forward jog along the scenic track
       this.playerZ -= 8.4 * dt;
-      this.runCycle += dt * 12.6;
+      this.runCycle += dt * 11.4;
       this.character.root.position.set(0, 0, this.playerZ);
       this.character.updatePose(
         {
@@ -2312,19 +2726,20 @@ export class SkyboundEngine {
         this.currentBiome = scenicBiome;
         this.audio.setAmbientBiome(scenicBiome);
       }
+      this.currentForwardSpeed = 8.4;
       const scenicLandmark = getJourneyProgressForDistance(scenicMeters).currentStop.landmark;
       if (scenicLandmark !== this.currentLandmarkKind) {
         this.currentLandmarkKind = scenicLandmark;
+        this.targetLandmarkAccent.set(LANDMARK_ACCENT_HEX[scenicLandmark] ?? '#f97316');
         this.audio.setAmbientLandmark(scenicLandmark, true);
-        const nextWeather = pickWeatherForLandmark(
-          scenicLandmark,
-          this.weatherSystem.getWeather(),
-        );
-        this.weatherSystem.setWeather(nextWeather);
+        const scenicTrigger = getLandmarkWeatherTrigger(scenicLandmark);
+        this.activeLandmarkModifier = scenicTrigger.gameplay;
+        this.weatherSystem.setWeather(scenicTrigger.condition, false, scenicBiome, scenicLandmark);
         this.ambientWeatherOverlay.setForecast(getLandmarkForecast(scenicLandmark), scenicLandmark);
-        this.audio.setAmbientWeather(nextWeather);
+        this.audio.setAmbientWeather(scenicTrigger.condition);
       }
     }
+    this.smoothedLandmarkAccent.lerp(this.targetLandmarkAccent, 1 - Math.exp(-3.5 * dt));
 
     this.simTime += dt;
     this.weatherSystem.update(
@@ -2336,6 +2751,7 @@ export class SkyboundEngine {
       this.simTime,
       this.currentBiome,
       1.15,
+      this.currentLandmarkKind,
     );
     this.ambientWeatherOverlay.update(
       dt,
@@ -2396,10 +2812,18 @@ export class SkyboundEngine {
       }
     }
 
+    const mod = this.activeLandmarkModifier;
+    this.smoothedSpeedMul = THREE.MathUtils.damp(this.smoothedSpeedMul, mod.speedMul, 2.2, dt);
+    this.smoothedJumpVelMul = THREE.MathUtils.damp(this.smoothedJumpVelMul, mod.jumpVelMul, 3.2, dt);
+    this.smoothedGravityMul = THREE.MathUtils.damp(this.smoothedGravityMul, mod.gravityMul, 3.2, dt);
+    this.smoothedSlideDurMul = THREE.MathUtils.damp(this.smoothedSlideDurMul, mod.slideDurationMul, 3.2, dt);
+    this.smoothedCoyoteMul = THREE.MathUtils.damp(this.smoothedCoyoteMul, mod.coyoteMul, 3.2, dt);
+    this.smoothedLaneSnapMul = THREE.MathUtils.damp(this.smoothedLaneSnapMul, mod.laneSnapMul, 3.2, dt);
+
     const activeBoost = this.speedBoostTimer > 0 ? this.speedBoostFactor : 1.0;
     const targetMultiplier =
       1.0 + (diffCfg.maxMultiplier - 1.0) * combinedProgress + this.flowSurgeBonus;
-    const targetSpeed = diffCfg.baseSpeed * targetMultiplier * activeBoost;
+    const targetSpeed = diffCfg.baseSpeed * targetMultiplier * activeBoost * this.smoothedSpeedMul;
     this.speed = THREE.MathUtils.damp(this.speed, targetSpeed, 2.4, dt);
     this.speedMultiplier = this.speed / diffCfg.baseSpeed;
     this.peakSpeedMultiplier = Math.max(this.peakSpeedMultiplier, this.speedMultiplier);
@@ -2422,6 +2846,14 @@ export class SkyboundEngine {
         24,
         'jump',
         1.65,
+      );
+      this.overdriveTrail.triggerThresholdPulse(
+        this.playerX,
+        this.playerY,
+        this.playerZ,
+        this.groundHeightAt(this.playerX, this.playerZ),
+        1.0,
+        this.activeSkinId === CARNIVAL_RUNNER_SKIN.id,
       );
       this.showBanner('MACH 3.0 · SOUND BARRIER');
     }
@@ -2488,6 +2920,8 @@ export class SkyboundEngine {
     );
     const timeScale = 1 - 0.52 * this.chronosStrength;
     const worldAnimScale = 1 - 0.58 * this.chronosStrength;
+    const effectiveForwardSpeed = this.speed * timeScale;
+    this.currentForwardSpeed = effectiveForwardSpeed;
     this.simTime += dt * worldAnimScale;
 
     this.chronosOverlayMesh.visible = this.chronosStrength > 0.008;
@@ -2625,6 +3059,11 @@ export class SkyboundEngine {
       this.heatShimmerStrength = 0;
     }
 
+    this.targetLandmarkAccent.set(LANDMARK_ACCENT_HEX[this.currentLandmarkKind] ?? '#f97316');
+    this.smoothedLandmarkAccent.lerp(this.targetLandmarkAccent, 1 - Math.exp(-3.5 * dt));
+    this.velocityBlurClock =
+      (this.velocityBlurClock + dt * (2.2 + tierSpeed * 2.4) * timeScale) % 1000;
+
     this.speedLines.update(
       dt,
       tierSpeed,
@@ -2632,6 +3071,8 @@ export class SkyboundEngine {
       this.sonicBreakIntensity,
       this.currentNightFactor,
       timeScale,
+      effectiveForwardSpeed,
+      this.smoothedLandmarkAccent,
     );
 
     if (this.powerupSurge > 0) this.powerupSurge = Math.max(0, this.powerupSurge - dt * 2.6);
@@ -2654,7 +3095,7 @@ export class SkyboundEngine {
       if (this.voiceoverTimer <= 0) this.voiceoverCallout = null;
     }
     if (this.comboDecayTimer > 0) {
-      this.comboDecayTimer -= dt;
+      this.comboDecayTimer -= dt * this.activeLandmarkModifier.comboDecayRateMul;
       if (this.comboDecayTimer <= 0) {
         const hadCombo = this.combo > 1 || this.comboStreak > 0;
         this.combo = 1;
@@ -2668,17 +3109,18 @@ export class SkyboundEngine {
     if (this.hitFlash > 0) this.hitFlash = Math.max(0, this.hitFlash - dt * 5);
 
     // Forward advance & speed-scaled pace bonus points (Chronos slows forward speed smoothly)
-    const effectiveForwardSpeed = this.speed * timeScale;
     this.playerZ -= effectiveForwardSpeed * dt;
     const stepDist = Math.max(0, prevZ - this.playerZ);
     if (this.speedMultiplier > 1.02) {
-      this.bonusScore += stepDist * (this.speedMultiplier - 1) * 5;
+      this.bonusScore +=
+        stepDist * (this.speedMultiplier - 1) * 5 * this.activeLandmarkModifier.scoreMul;
     }
 
-    // Lateral lane damping scales with speed so high-pace dodges stay snappy
+    // Lateral lane damping scales with speed + landmark weather handling modifier
     const targetX = LANE_X[this.laneIndex];
     const laneStepPrevX = this.playerX;
-    const laneResponsiveness = 17.5 * Math.min(1.4, 0.9 + this.speedMultiplier * 0.18);
+    const laneResponsiveness =
+      17.5 * Math.min(1.4, 0.9 + this.speedMultiplier * 0.18) * this.smoothedLaneSnapMul;
     this.playerX = THREE.MathUtils.damp(this.playerX, targetX, laneResponsiveness, dt);
     this.laneVelX = (this.playerX - laneStepPrevX) / Math.max(0.0001, dt);
 
@@ -2686,7 +3128,7 @@ export class SkyboundEngine {
     if (this.jumpBufferTimer > 0) this.jumpBufferTimer -= dt;
     if (this.slideBufferTimer > 0) this.slideBufferTimer -= dt;
     if (this.isGrounded) {
-      this.coyoteTimer = 0.125;
+      this.coyoteTimer = 0.125 * this.smoothedCoyoteMul;
     } else if (this.coyoteTimer > 0) {
       this.coyoteTimer -= dt;
     }
@@ -2694,7 +3136,7 @@ export class SkyboundEngine {
     // Execute buffered Jump
     if (this.jumpBufferTimer > 0 && this.coyoteTimer > 0) {
       const wasSliding = this.isSliding;
-      this.vy = JUMP_VELOCITY;
+      this.vy = JUMP_VELOCITY * this.smoothedJumpVelMul;
       this.isGrounded = false;
       this.coyoteTimer = 0;
       this.jumpBufferTimer = 0;
@@ -2704,6 +3146,7 @@ export class SkyboundEngine {
       }
       this.fastFallQueued = false;
       this.jumpedInAir = true;
+      this.airbornePeakY = this.playerY;
       this.squashY = 1.24;
       this.runJumps++;
       this.audio.playJump();
@@ -2728,7 +3171,10 @@ export class SkyboundEngine {
     // Vertical physics & swept anti-tunneling surface landing
     let groundY = this.groundHeightAt(this.playerX, this.playerZ);
     if (!this.isGrounded || this.playerY > groundY + 0.05) {
-      this.vy -= GRAVITY * dt;
+      if (this.isGrounded) {
+        this.airbornePeakY = this.playerY;
+      }
+      this.vy -= GRAVITY * this.smoothedGravityMul * dt;
       const nextY = this.playerY + this.vy * dt;
       let landedGroundY = groundY;
       let didSweepLand =
@@ -2753,7 +3199,14 @@ export class SkyboundEngine {
       if (didSweepLand) {
         // Landed cleanly
         const wasJump = this.jumpedInAir;
+        const landingJumpHeight = Math.max(0, this.airbornePeakY - landedGroundY);
+        const landingShake = computeLandingShakeIntensity(landingJumpHeight, wasJump);
+        if (landingShake > 0) {
+          this.shakeIntensity = Math.max(this.shakeIntensity, landingShake);
+          this.landingShakeDip = Math.max(this.landingShakeDip, landingShake * 0.45);
+        }
         this.playerY = landedGroundY;
+        this.airbornePeakY = landedGroundY;
         this.vy = 0;
         this.isGrounded = true;
         this.jumpedInAir = false;
@@ -2769,15 +3222,18 @@ export class SkyboundEngine {
         }
       } else {
         this.playerY = nextY;
+        this.airbornePeakY = Math.max(this.airbornePeakY, nextY);
         this.isGrounded = false;
       }
       groundY = landedGroundY;
     } else {
       // Running along surface
       if (groundY < -10) {
+        this.airbornePeakY = this.playerY;
         this.isGrounded = false;
       } else {
         this.playerY = THREE.MathUtils.damp(this.playerY, groundY, 26, dt);
+        this.airbornePeakY = this.playerY;
         this.vy = 0;
         this.isGrounded = true;
       }
@@ -2794,7 +3250,7 @@ export class SkyboundEngine {
     // Squash recovery, run cycle & rhythmic biome-aware footstep micro-taps
     this.squashY = THREE.MathUtils.damp(this.squashY, 1, 14, dt);
     const prevStepPhase = Math.floor(this.runCycle / Math.PI);
-    const strideRate = Math.min(28.5, Math.max(12.5, effectiveForwardSpeed * 1.28));
+    const strideRate = Math.min(17.8, Math.max(10.8, 7.6 + effectiveForwardSpeed * 0.34));
     this.runCycle += dt * strideRate;
     const nextStepPhase = Math.floor(this.runCycle / Math.PI);
     if (this.isGrounded && !this.isSliding && nextStepPhase > prevStepPhase) {
@@ -3012,6 +3468,19 @@ export class SkyboundEngine {
     );
 
     this.particles.update(dt * timeScale);
+    this.overdriveTrail.update(dt * timeScale, {
+      playerX: this.playerX,
+      playerY: this.playerY,
+      playerZ: this.playerZ,
+      groundY,
+      speedMultiplier: this.smoothedTierSpeed,
+      speedBoostTimer: this.speedBoostTimer,
+      chronosTimer: this.chronosTimer,
+      laneVelX: this.laneVelX,
+      isGrounded: this.isGrounded,
+      isSliding: this.isSliding,
+      isCarnivalSkin: isCarnivalSkin,
+    });
     this.powerupVfx.update(dt, this.playerX, this.playerY, this.playerZ);
     this.weatherSystem.update(
       dt * timeScale,
@@ -3022,6 +3491,7 @@ export class SkyboundEngine {
       this.simTime,
       this.currentBiome,
       this.smoothedTierSpeed,
+      this.currentLandmarkKind,
     );
     const maxMultForOverlay = DIFFICULTY_CONFIGS[this.difficultyMode].maxMultiplier;
     const overlaySpeedRatio = THREE.MathUtils.clamp(
@@ -3055,7 +3525,7 @@ export class SkyboundEngine {
 
   private startSlide(fromSlam = false): void {
     this.isSliding = true;
-    this.slideTimer = SLIDE_DURATION;
+    this.slideTimer = SLIDE_DURATION * this.smoothedSlideDurMul;
     this.slideBufferTimer = 0;
     this.squashY = 0.85;
     this.runSlides++;
@@ -3066,14 +3536,19 @@ export class SkyboundEngine {
   }
 
   private updateSpeedBurstPalette(mode: 'jump' | 'slide'): void {
-    const isOverdrive = this.speedMultiplier > 2.0 || this.speedBoostTimer > 0;
+    const isOverdrive =
+      this.speedMultiplier >= OVERDRIVE_SPEED_THRESHOLD || this.speedBoostTimer > 0;
     const isCarnivalSkin = this.activeSkinId === CARNIVAL_RUNNER_SKIN.id;
     const intensity = isOverdrive
       ? 1.42
       : THREE.MathUtils.lerp(
           0.95,
           1.25,
-          THREE.MathUtils.clamp((this.speedMultiplier - 1.45) / 0.55, 0, 1),
+          THREE.MathUtils.clamp(
+            (this.speedMultiplier - 1.45) / Math.max(0.1, OVERDRIVE_SPEED_THRESHOLD - 1.45),
+            0,
+            1,
+          ),
         );
 
     this.speedBurstStyle.intensity = intensity;
@@ -3094,7 +3569,8 @@ export class SkyboundEngine {
     const isHighSpeed = this.speedMultiplier >= 1.45 || this.speedBoostTimer > 0;
     if (!isHighSpeed) return;
 
-    const isOverdrive = this.speedMultiplier > 2.0 || this.speedBoostTimer > 0;
+    const isOverdrive =
+      this.speedMultiplier >= OVERDRIVE_SPEED_THRESHOLD || this.speedBoostTimer > 0;
     this.updateSpeedBurstPalette(mode);
     const initialCount = (isOverdrive ? 16 : 11) + (fromSlam ? 4 : 0);
 
@@ -3202,6 +3678,9 @@ export class SkyboundEngine {
           )
         ) {
           pad.triggered = true;
+          this.airbornePeakY = this.isGrounded
+            ? this.playerY
+            : Math.max(this.airbornePeakY, this.playerY);
           this.vy = SPRING_VELOCITY;
           this.isGrounded = false;
           this.isSliding = false;
@@ -3254,6 +3733,14 @@ export class SkyboundEngine {
             'slide',
             1.45,
           );
+          this.overdriveTrail.triggerThresholdPulse(
+            this.playerX,
+            this.playerY,
+            this.playerZ,
+            boostPad.y,
+            Math.max(0.75, computeOverdriveIntensity(this.smoothedTierSpeed, this.speedBoostTimer, this.chronosTimer)),
+            this.activeSkinId === CARNIVAL_RUNNER_SKIN.id,
+          );
           this.bonusScore += 60 * mult;
           this.advanceComboSequence('TURBO PAD');
           this.showBanner('TURBO BOOST · FLOW SURGE!');
@@ -3261,7 +3748,10 @@ export class SkyboundEngine {
         }
       }
 
-      // Swept Gems (with Magnet attraction!)
+      // Swept Gems (with Magnet powerup or Bazaar passive thermal attraction!)
+      const activeMagnetRadius =
+        this.magnetTimer > 0 ? 8.0 : this.activeLandmarkModifier.passiveMagnetRadius;
+      const activeMagnetDistSq = activeMagnetRadius * activeMagnetRadius;
       for (const gem of chunk.gems) {
         if (gem.collected) continue;
         const dx = this.playerX - gem.x;
@@ -3269,8 +3759,9 @@ export class SkyboundEngine {
         const dz = this.playerZ - gem.z;
         const distSq = dx * dx + dy * dy + dz * dz;
 
-        if (this.magnetTimer > 0 && distSq < 64) {
-          const pull = 1 - Math.exp(-16 * dt);
+        if (activeMagnetRadius > 0 && distSq < activeMagnetDistSq) {
+          const pullRate = this.magnetTimer > 0 ? 16 : 9.5;
+          const pull = 1 - Math.exp(-pullRate * dt);
           gem.x = THREE.MathUtils.lerp(gem.x, this.playerX, pull);
           gem.y = THREE.MathUtils.lerp(gem.y, this.playerY + 0.85, pull);
           gem.z = THREE.MathUtils.lerp(gem.z, this.playerZ, pull);
@@ -3296,7 +3787,8 @@ export class SkyboundEngine {
           gem.mesh.visible = false;
           const gemGain = gem.value * (this.multiplierTimer > 0 ? 2 : 1);
           this.runGems += gemGain;
-          this.bonusScore += 25 * gemGain * this.combo;
+          this.bonusScore +=
+            Math.round(25 * this.activeLandmarkModifier.scoreMul) * gemGain * this.combo;
           this.audio.playGem();
           this.particles.spawnBurst(
             gem.x,
@@ -3455,10 +3947,13 @@ export class SkyboundEngine {
 
   private awardStyleBonus(label: string, actionLabel: string): void {
     this.advanceComboSequence(actionLabel);
-    this.bonusScore += 30 * this.combo;
+    const baseStylePts = Math.round(
+      30 * this.activeLandmarkModifier.nearMissBonusMul * this.activeLandmarkModifier.scoreMul,
+    );
+    this.bonusScore += baseStylePts * this.combo;
     this.runStyleBonuses++;
     this.audio.playNearMiss();
-    this.showBanner(`${label} ×${this.combo}`);
+    this.showBanner(`${label.replace('+30', `+${baseStylePts}`)} ×${this.combo}`);
   }
 
   private activatePowerup(type: PowerupType): void {
@@ -3508,7 +4003,12 @@ export class SkyboundEngine {
     this.heatShimmerStrength = 0;
     this.flowSurgeBonus = 0;
     this.smoothedTierSpeed = 1.0;
+    this.velocityBlurClock = 0;
+    this.landingShakeDip = 0;
+    this.airbornePeakY = 0;
+    this.currentForwardSpeed = DIFFICULTY_CONFIGS[this.difficultyMode].baseSpeed;
     this.speedLines.reset();
+    this.overdriveTrail.reset();
     this.audio.stopVoiceover();
     const finalScore = this.computeTotalScore();
     const journey = getJourneyProgressForDistance(this.distance);
@@ -3544,10 +4044,11 @@ export class SkyboundEngine {
   ): void {
     this.currentLandmarkKind = kind;
     this.audio.setAmbientLandmark(kind);
-    const nextWeather = pickWeatherForLandmark(kind, this.weatherSystem.getWeather());
-    this.weatherSystem.setWeather(nextWeather);
+    const trigger = getLandmarkWeatherTrigger(kind);
+    this.activeLandmarkModifier = trigger.gameplay;
+    this.weatherSystem.setWeather(trigger.condition, false, this.currentBiome, kind);
     this.ambientWeatherOverlay.setForecast(getLandmarkForecast(kind), kind);
-    this.audio.setAmbientWeather(nextWeather);
+    this.audio.setAmbientWeather(trigger.condition);
     const isNewEntry = Boolean(this.callbacks.onLandmarkEncountered?.(kind));
     this.landmarkPopupName = name;
     this.landmarkPopupSubtitle = subtitle;
@@ -3559,6 +4060,7 @@ export class SkyboundEngine {
     this.landmarkTransitionTimer = LANDMARK_TRANSITION_DURATION;
     this.landmarkTransitionPhase = 0;
     this.landmarkTransitionAccent.set(accentHex);
+    this.targetLandmarkAccent.set(LANDMARK_ACCENT_HEX[kind] ?? accentHex);
     this.audio.playCityLandmark();
 
     const accentHexNum = Number.parseInt(accentHex.slice(1), 16) || 0xfbbf24;
@@ -3585,7 +4087,7 @@ export class SkyboundEngine {
 
   private emitHud(): void {
     const journey = getJourneyProgressForDistance(this.distance);
-    const weatherMeta = this.weatherSystem.getWeatherMetadata();
+    const weatherTrigger = getLandmarkWeatherTrigger(this.currentLandmarkKind);
     const musicMeta = this.music.getDominantTrackMeta();
     const stationMeta = this.music.getStationMeta();
     this.callbacks.onHudUpdate({
@@ -3603,9 +4105,11 @@ export class SkyboundEngine {
       journeyStopName: journey.currentStop.name,
       journeySubtitle: journey.currentStop.subtitle,
       journeyAccentHex: journey.currentStop.accentHex,
-      weather: weatherMeta.id,
-      weatherLabel: weatherMeta.shortLabel,
-      weatherAccentHex: weatherMeta.accentHex,
+      weather: weatherTrigger.condition,
+      weatherLabel: weatherTrigger.weatherName,
+      weatherAccentHex: weatherTrigger.accentHex,
+      weatherModifierLabel: weatherTrigger.modifierBadge,
+      weatherModifierSummary: weatherTrigger.modifierSummary,
       ambientOverlayLabel: this.ambientWeatherOverlay.getSummary(),
       timeOfDayLabel: getTimePhaseLabel(this.dayNightState.hourDecimal),
       timeOfDayHour: Number(this.dayNightState.hourDecimal.toFixed(2)),
@@ -3661,8 +4165,16 @@ export class SkyboundEngine {
       this.camera.updateProjectionMatrix();
     }
 
+    if (this.landingShakeDip > 0.001) {
+      this.landingShakeDip = THREE.MathUtils.damp(this.landingShakeDip, 0, 14, dt);
+      if (this.landingShakeDip <= 0.001) this.landingShakeDip = 0;
+    }
     const camX = this.playerX * 0.58;
-    const camY = 3.85 + Math.max(0, this.playerY * 0.72) + (this.isSliding ? -0.35 : 0);
+    const camY =
+      3.85 +
+      Math.max(0, this.playerY * 0.72) +
+      (this.isSliding ? -0.35 : 0) -
+      this.landingShakeDip;
     const camZ =
       this.playerZ +
       6.9 -
@@ -3674,10 +4186,11 @@ export class SkyboundEngine {
     _camDesired.set(camX, camY, camZ);
     this.camera.position.lerp(_camDesired, 1 - Math.exp(-10 * dt));
 
-    if (this.shakeIntensity > 0.005) {
+    if (this.shakeIntensity > 0.004) {
       this.camera.position.x += (Math.random() - 0.5) * this.shakeIntensity;
       this.camera.position.y += (Math.random() - 0.5) * this.shakeIntensity;
       this.shakeIntensity = THREE.MathUtils.damp(this.shakeIntensity, 0, 12, dt);
+      if (this.shakeIntensity <= 0.004) this.shakeIntensity = 0;
     }
 
     _lookAtTarget.set(this.playerX * 0.35, this.playerY + 1.35, this.playerZ - 9.5);
@@ -3691,14 +4204,30 @@ export class SkyboundEngine {
     }
   }
 
+  private syncRunnerShadowCamera(): void {
+    this.character.root.updateMatrixWorld(true);
+    updateRunnerShadowCameraTransform(
+      this.runnerShadowCamera,
+      this.playerX,
+      this.playerY,
+      this.playerZ,
+      this.keyLight.position,
+      this.keyLight.target.position,
+      this.runnerShadowMatrix,
+    );
+  }
+
   private syncFollowLights(): void {
     const dn = this.dayNightState;
-    this.keyLight.position.set(
-      this.playerX + dn.keyOffsetX,
-      dn.keyOffsetY,
-      this.playerZ + dn.keyOffsetZ,
+    _lightTargetDesired.set(this.playerX, 0, this.playerZ - 12);
+    _lightOffsetVec.set(dn.keyOffsetX, dn.keyOffsetY, dn.keyOffsetZ + 12);
+    snapDirectionalShadowTarget(
+      _lightTargetDesired,
+      _lightOffsetVec,
+      KEY_SHADOW_TEXEL_SIZE,
+      this.keyLight.target.position,
+      this.keyLight.position,
     );
-    this.keyLight.target.position.set(this.playerX, 0, this.playerZ - 12);
     this.keyLight.target.updateMatrixWorld();
     this.nightGlowLight.position.set(
       this.playerX * 0.65,
@@ -3735,9 +4264,13 @@ export class SkyboundEngine {
       ? targetCarnival
       : THREE.MathUtils.damp(this.carnivalBlend, targetCarnival, 1.4, dt);
 
-    // Blend dynamic time-of-day skybox & light rig with subtle Lahore landmark & biome accents
+    // Blend dynamic distance-driven Sunset-to-Indigo-Twilight skybox with Lahore landmark & biome themes
     const nightBlend = dn.nightFactor;
     const goldenHour = dn.goldenHourFactor;
+    const twilightProgress =
+      this.lightingMode === 'auto'
+        ? computeDistanceSkyboxProgress(cycleDistance, cycleElapsed)
+        : THREE.MathUtils.clamp((nightBlend - 0.15) / 0.8, 0, 1);
     this.weatherSystem.getLightingModifiers(nightBlend, _weatherModifiers);
 
     _landmarkSky.setHex(landmarkTheme.skyHex);
@@ -3747,8 +4280,8 @@ export class SkyboundEngine {
     _landmarkNightGlow.setHex(landmarkTheme.nightGlowHex);
 
     const landmarkDayBlend = 0.34 + goldenHour * 0.14;
-    const biomeSkyInfluence = (0.24 - goldenHour * 0.08) * (1 - nightBlend * 0.72);
-    const biomeFogInfluence = (0.28 - goldenHour * 0.08) * (1 - nightBlend * 0.75);
+    const biomeSkyInfluence = (0.22 - goldenHour * 0.06) * (1 - nightBlend * 0.72);
+    const biomeFogInfluence = (0.26 - goldenHour * 0.06) * (1 - nightBlend * 0.74);
     const biomeLightInfluence = 0.25 * (1 - nightBlend * 0.7);
 
     _biomeSky.setHex(palette.sky).lerp(_landmarkSky, landmarkDayBlend);
@@ -3757,7 +4290,8 @@ export class SkyboundEngine {
     _biomeHemiGround.setHex(palette.hemiGround).lerp(_landmarkHemiGround, landmarkDayBlend);
     _biomeSun.setHex(palette.sun);
 
-    _targetZenith.copy(dn.skyZenith).lerp(_biomeSky, biomeSkyInfluence * 0.55);
+    _targetZenith.copy(dn.skyZenith).lerp(_biomeSky, biomeSkyInfluence * 0.38);
+    _targetMidSky.copy(dn.skyMid).lerp(_biomeSky, biomeSkyInfluence * 0.55);
     _targetSky.copy(dn.sky).lerp(_biomeSky, biomeSkyInfluence);
     _targetFog.copy(dn.fog).lerp(_biomeFog, biomeFogInfluence);
     _targetHemiSky.copy(dn.hemiSky).lerp(_biomeHemiSky, biomeLightInfluence);
@@ -3765,11 +4299,26 @@ export class SkyboundEngine {
     _targetSun.copy(dn.sunColor).lerp(_biomeSun, biomeLightInfluence * 0.65);
     _targetSunGlow.copy(dn.sunGlowColor);
 
+    // Synchronize the skybox horizon & mid-sky belt with the active Lahore landmark palette
+    // across the Sunset Orange -> Deep Indigo Twilight arc
+    _skyThemeAccent
+      .copy(_sunsetOrangeAnchor)
+      .lerp(_indigoTwilightAnchor, twilightProgress * 0.45)
+      .lerp(_landmarkNightGlow, 0.42 + twilightProgress * 0.36);
+
+    if (this.lightingMode === 'auto') {
+      const sunsetWarmth = Math.max(0, 1 - twilightProgress * 1.45);
+      _targetMidSky.lerp(_skyThemeAccent, 0.12 + twilightProgress * 0.1);
+      _targetSky.lerp(_sunsetOrangeAnchor, sunsetWarmth * 0.18);
+      _targetZenith.lerp(_indigoTwilightAnchor, twilightProgress * 0.24);
+    }
+
     // Soft nocturnal horizon & atmospheric glow synchronized with current landmark theme
     if (nightBlend > 0.02) {
       _targetZenith.lerp(_landmarkNightGlow, nightBlend * 0.08);
-      _targetSky.lerp(_landmarkNightGlow, nightBlend * 0.14);
-      _targetFog.lerp(_landmarkNightGlow, nightBlend * 0.22);
+      _targetMidSky.lerp(_landmarkNightGlow, nightBlend * 0.14);
+      _targetSky.lerp(_landmarkNightGlow, nightBlend * 0.16);
+      _targetFog.lerp(_landmarkNightGlow, nightBlend * 0.24);
       _targetHemiSky.lerp(_landmarkNightGlow, nightBlend * 0.24);
       _targetHemiGround.lerp(_landmarkNightGlow, nightBlend * 0.2);
     }
@@ -3779,16 +4328,19 @@ export class SkyboundEngine {
       _carnivalSky.copy(_carnivalDaySky).lerp(_carnivalNightSky, nightBlend);
       _carnivalFog.copy(_carnivalDayFog).lerp(_carnivalNightFog, nightBlend);
       _targetZenith.lerp(_carnivalSky, this.carnivalBlend * 0.45);
+      _targetMidSky.lerp(_carnivalSky, this.carnivalBlend * 0.52);
       _targetSky.lerp(_carnivalSky, this.carnivalBlend * 0.58);
       _targetFog.lerp(_carnivalFog, this.carnivalBlend * 0.54);
       _targetHemiSky.lerp(_carnivalHemiSky, this.carnivalBlend * 0.36);
       _targetHemiGround.lerp(_carnivalHemiGround, this.carnivalBlend * 0.42);
       _targetSun.lerp(_carnivalSun, this.carnivalBlend * 0.3);
       _landmarkNightGlow.lerp(_carnivalGlow, this.carnivalBlend * 0.65);
+      _skyThemeAccent.lerp(_carnivalGlow, this.carnivalBlend * 0.55);
     }
 
     if (_weatherModifiers.skyTintWeight > 0.001) {
       _targetZenith.lerp(_weatherModifiers.skyTint, _weatherModifiers.skyTintWeight * 0.8);
+      _targetMidSky.lerp(_weatherModifiers.skyTint, _weatherModifiers.skyTintWeight * 0.9);
       _targetSky.lerp(_weatherModifiers.skyTint, _weatherModifiers.skyTintWeight);
     }
     if (_weatherModifiers.fogTintWeight > 0.001) {
@@ -3796,12 +4348,14 @@ export class SkyboundEngine {
     }
 
     _targetZenith.lerp(_chronosSky, chronoBlend);
+    _targetMidSky.lerp(_chronosSky, chronoBlend);
     _targetSky.lerp(_chronosSky, chronoBlend);
     _targetFog.lerp(_chronosFog, chronoBlend);
     _targetHemiSky.lerp(_chronosHemiSky, chronoBlend);
     _targetHemiGround.lerp(_chronosHemiGround, chronoBlend);
     _targetSun.lerp(_chronosSun, chronoBlend);
     _targetSunGlow.lerp(_chronosFog, chronoBlend);
+    _skyThemeAccent.lerp(_chronosHemiSky, chronoBlend);
     _targetRim
       .copy(dn.rimColor)
       .lerp(_goldenRimColor, goldenHour * 0.45)
@@ -3811,11 +4365,18 @@ export class SkyboundEngine {
 
     // Update procedural atmospheric skybox dome & match horizon fog color
     (this.skyDomeMat.uniforms.uZenithColor.value as THREE.Color).lerp(_targetZenith, t);
+    (this.skyDomeMat.uniforms.uMidSkyColor.value as THREE.Color).lerp(_targetMidSky, t);
     (this.skyDomeMat.uniforms.uHorizonColor.value as THREE.Color).lerp(_targetFog, t);
     (this.skyDomeMat.uniforms.uSunGlowColor.value as THREE.Color).lerp(_targetSunGlow, t);
+    (this.skyDomeMat.uniforms.uThemeAccentColor.value as THREE.Color).lerp(_skyThemeAccent, t);
     this.skyDomeMat.uniforms.uSunGlowStrength.value = THREE.MathUtils.lerp(
       this.skyDomeMat.uniforms.uSunGlowStrength.value,
       dn.sunGlowStrength * (1 - chronoBlend * 0.65),
+      t,
+    );
+    this.skyDomeMat.uniforms.uTwilightProgress.value = THREE.MathUtils.lerp(
+      this.skyDomeMat.uniforms.uTwilightProgress.value,
+      twilightProgress,
       t,
     );
     _skySunDir.set(dn.sunX, dn.sunY, -134).normalize();
@@ -3887,7 +4448,11 @@ export class SkyboundEngine {
     this.currentNightFactor = THREE.MathUtils.lerp(this.currentNightFactor, nightBlend, t);
     this.worldBuilder.setNightFactor(this.currentNightFactor, _landmarkNightGlow.getHex());
 
-    const targetWetness = this.weatherSystem.getWeather() === 'light_rain' ? 1 : 0;
+    const activeTrigger = getLandmarkWeatherTrigger(this.currentLandmarkKind);
+    const targetWetness = Math.max(
+      this.weatherSystem.getWeather() === 'light_rain' ? 1 : 0,
+      activeTrigger.atmosphere.wetnessFloor,
+    );
     const nextWetness = immediate
       ? targetWetness
       : THREE.MathUtils.lerp(this.rainWetness, targetWetness, Math.min(1, dt * 0.45));
@@ -3942,12 +4507,16 @@ export class SkyboundEngine {
     this.scene.remove(this.character.debugFootIkGroup);
     this.character.dispose();
     this.particles.dispose();
+    this.overdriveTrail.dispose();
     this.powerupVfx.dispose();
     this.weatherSystem.dispose();
     this.ambientWeatherOverlay.dispose();
     this.speedLines.dispose();
     this.chronosOverlayMesh.geometry.dispose();
     this.chronosOverlayMat.dispose();
+    this.runnerShadowDepthTexture.dispose();
+    this.runnerShadowTarget.dispose();
+    this.runnerShadowDepthMat.dispose();
     this.sceneDepthTexture.dispose();
     this.transitionTarget.dispose();
     this.ssaoTarget.dispose();

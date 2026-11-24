@@ -46,6 +46,19 @@ const enum BoneId {
   RightFoot = 17,
 }
 
+const SKELETON_BONE_COUNT = 18;
+export const RUNNER_SHADOW_LAYER = 1;
+
+export interface SkinWeightNormalizationStats {
+  vertexCount: number;
+  maxBoneIndex: number;
+  repairedCount: number;
+  prunedInfluences: number;
+  duplicateBonesCollapsed: number;
+  maxWeightSumDeviationBefore: number;
+  maxWeightSumDeviationAfter: number;
+}
+
 type AnimStateName = 'idle' | 'run' | 'jump' | 'slide';
 
 interface BoneInfluence {
@@ -69,10 +82,206 @@ function makeFixedInfluence(
   b3 = 0,
   w3 = 0,
 ): BoneInfluence {
-  const sum = w0 + w1 + w2 + w3 || 1;
+  const c0 = Number.isFinite(w0) && w0 > 0 ? w0 : 0;
+  const c1 = Number.isFinite(w1) && w1 > 0 ? w1 : 0;
+  const c2 = Number.isFinite(w2) && w2 > 0 ? w2 : 0;
+  const c3 = Number.isFinite(w3) && w3 > 0 ? w3 : 0;
+  const sum = c0 + c1 + c2 + c3;
+  if (sum <= 1e-6) {
+    return {
+      idx: [b0, 0, 0, 0],
+      wt: [1, 0, 0, 0],
+    };
+  }
   return {
-    idx: [b0, b1, b2, b3],
-    wt: [w0 / sum, w1 / sum, w2 / sum, w3 / sum],
+    idx: [b0, c1 > 0 ? b1 : 0, c2 > 0 ? b2 : 0, c3 > 0 ? b3 : 0],
+    wt: [c0 / sum, c1 / sum, c2 / sum, c3 / sum],
+  };
+}
+
+/**
+ * Sanitizes, deduplicates, prunes sub-epsilon slivers, sorts descending, and
+ * enforces strict L1 unit-sum normalization on skinIndex/skinWeight attributes.
+ */
+export function normalizeGeometrySkinWeights(
+  geometry: THREE.BufferGeometry,
+  boneCount = SKELETON_BONE_COUNT,
+): SkinWeightNormalizationStats {
+  const skinIndexAttr = geometry.getAttribute('skinIndex') as THREE.BufferAttribute | undefined;
+  const skinWeightAttr = geometry.getAttribute('skinWeight') as THREE.BufferAttribute | undefined;
+  if (!skinIndexAttr || !skinWeightAttr) {
+    return {
+      vertexCount: 0,
+      maxBoneIndex: 0,
+      repairedCount: 0,
+      prunedInfluences: 0,
+      duplicateBonesCollapsed: 0,
+      maxWeightSumDeviationBefore: 0,
+      maxWeightSumDeviationAfter: 0,
+    };
+  }
+
+  const count = Math.min(skinIndexAttr.count, skinWeightAttr.count);
+  const safeMaxBone = Math.max(1, boneCount);
+  const slotIdx = [0, 0, 0, 0];
+  const slotWt = [0, 0, 0, 0];
+
+  let maxBoneIndex = 0;
+  let repairedCount = 0;
+  let prunedInfluences = 0;
+  let duplicateBonesCollapsed = 0;
+  let maxWeightSumDeviationBefore = 0;
+  let maxWeightSumDeviationAfter = 0;
+
+  for (let i = 0; i < count; i++) {
+    const rawI0 = skinIndexAttr.getX(i);
+    const rawI1 = skinIndexAttr.getY(i);
+    const rawI2 = skinIndexAttr.getZ(i);
+    const rawI3 = skinIndexAttr.getW(i);
+
+    const rawW0 = skinWeightAttr.getX(i);
+    const rawW1 = skinWeightAttr.getY(i);
+    const rawW2 = skinWeightAttr.getZ(i);
+    const rawW3 = skinWeightAttr.getW(i);
+
+    const rawSum =
+      (Number.isFinite(rawW0) ? rawW0 : 0) +
+      (Number.isFinite(rawW1) ? rawW1 : 0) +
+      (Number.isFinite(rawW2) ? rawW2 : 0) +
+      (Number.isFinite(rawW3) ? rawW3 : 0);
+    maxWeightSumDeviationBefore = Math.max(maxWeightSumDeviationBefore, Math.abs(1 - rawSum));
+
+    slotIdx[0] = rawI0;
+    slotIdx[1] = rawI1;
+    slotIdx[2] = rawI2;
+    slotIdx[3] = rawI3;
+    slotWt[0] = rawW0;
+    slotWt[1] = rawW1;
+    slotWt[2] = rawW2;
+    slotWt[3] = rawW3;
+
+    let vertexRepaired = false;
+
+    // 1. Clamp indices and zero invalid/sub-epsilon weights
+    for (let s = 0; s < 4; s++) {
+      let idx = Number.isFinite(slotIdx[s]) ? Math.round(slotIdx[s]) : 0;
+      if (idx < 0 || idx >= safeMaxBone) {
+        idx = 0;
+        vertexRepaired = true;
+      }
+      let wt = slotWt[s];
+      if (!Number.isFinite(wt) || wt < 0) {
+        wt = 0;
+        vertexRepaired = true;
+      } else if (wt > 0 && wt < 1e-4) {
+        wt = 0;
+        prunedInfluences++;
+        vertexRepaired = true;
+      }
+      slotIdx[s] = wt > 0 ? idx : 0;
+      slotWt[s] = wt;
+    }
+
+    // 2. Collapse duplicate bone entries within the 4 skinning slots
+    for (let a = 0; a < 4; a++) {
+      if (slotWt[a] <= 0) continue;
+      for (let b = a + 1; b < 4; b++) {
+        if (slotWt[b] > 0 && slotIdx[b] === slotIdx[a]) {
+          slotWt[a] += slotWt[b];
+          slotWt[b] = 0;
+          slotIdx[b] = 0;
+          duplicateBonesCollapsed++;
+          vertexRepaired = true;
+        }
+      }
+    }
+
+    // 3. Sort descending by weight so dominant bone is always slot 0
+    for (let a = 0; a < 3; a++) {
+      for (let b = a + 1; b < 4; b++) {
+        if (slotWt[b] > slotWt[a]) {
+          const tmpW = slotWt[a];
+          slotWt[a] = slotWt[b];
+          slotWt[b] = tmpW;
+          const tmpI = slotIdx[a];
+          slotIdx[a] = slotIdx[b];
+          slotIdx[b] = tmpI;
+        }
+      }
+    }
+
+    // 4. Normalize to exact unit sum (preventing zero-sum origin collapse)
+    const sum = slotWt[0] + slotWt[1] + slotWt[2] + slotWt[3];
+    if (sum <= 1e-6) {
+      slotIdx[0] = BoneId.Root;
+      slotIdx[1] = 0;
+      slotIdx[2] = 0;
+      slotIdx[3] = 0;
+      slotWt[0] = 1;
+      slotWt[1] = 0;
+      slotWt[2] = 0;
+      slotWt[3] = 0;
+      vertexRepaired = true;
+    } else {
+      const invSum = 1 / sum;
+      slotWt[0] = Math.fround(slotWt[0] * invSum);
+      slotWt[1] = Math.fround(slotWt[1] * invSum);
+      slotWt[2] = Math.fround(slotWt[2] * invSum);
+      slotWt[3] = Math.fround(slotWt[3] * invSum);
+      const residual = 1 - (slotWt[0] + slotWt[1] + slotWt[2] + slotWt[3]);
+      slotWt[0] = Math.fround(Math.max(0, slotWt[0] + residual));
+      for (let a = 0; a < 3; a++) {
+        for (let b = a + 1; b < 4; b++) {
+          if (slotWt[b] > slotWt[a]) {
+            const tmpW = slotWt[a];
+            slotWt[a] = slotWt[b];
+            slotWt[b] = tmpW;
+            const tmpI = slotIdx[a];
+            slotIdx[a] = slotIdx[b];
+            slotIdx[b] = tmpI;
+          }
+        }
+      }
+    }
+
+    for (let s = 0; s < 4; s++) {
+      if (slotWt[s] <= 0) {
+        slotWt[s] = 0;
+        slotIdx[s] = 0;
+      } else if (slotIdx[s] > maxBoneIndex) {
+        maxBoneIndex = slotIdx[s];
+      }
+    }
+
+    const afterSum = slotWt[0] + slotWt[1] + slotWt[2] + slotWt[3];
+    maxWeightSumDeviationAfter = Math.max(maxWeightSumDeviationAfter, Math.abs(1 - afterSum));
+
+    if (
+      vertexRepaired ||
+      Math.abs(1 - rawSum) > 1e-5 ||
+      slotIdx[0] !== rawI0 ||
+      slotIdx[1] !== rawI1 ||
+      slotIdx[2] !== rawI2 ||
+      slotIdx[3] !== rawI3
+    ) {
+      repairedCount++;
+    }
+
+    skinIndexAttr.setXYZW(i, slotIdx[0], slotIdx[1], slotIdx[2], slotIdx[3]);
+    skinWeightAttr.setXYZW(i, slotWt[0], slotWt[1], slotWt[2], slotWt[3]);
+  }
+
+  skinIndexAttr.needsUpdate = true;
+  skinWeightAttr.needsUpdate = true;
+
+  return {
+    vertexCount: count,
+    maxBoneIndex,
+    repairedCount,
+    prunedInfluences,
+    duplicateBonesCollapsed,
+    maxWeightSumDeviationBefore,
+    maxWeightSumDeviationAfter,
   };
 }
 
@@ -84,7 +293,8 @@ function smoothstep01(t: number): number {
 /**
  * Generates a subtle procedural woven athletic-fabric bump texture (linear data map, zero 404s).
  */
-function createFabricBumpTexture(): THREE.CanvasTexture {
+function createFabricBumpTexture(): THREE.CanvasTexture | null {
+  if (typeof document === 'undefined') return null;
   const size = 128;
   const canvas = document.createElement('canvas');
   canvas.width = size;
@@ -96,9 +306,9 @@ function createFabricBumpTexture(): THREE.CanvasTexture {
     for (let y = 0; y < size; y += 4) {
       for (let x = 0; x < size; x += 4) {
         const checker = ((x + y) >> 2) & 1;
-        ctx.fillStyle = checker ? '#989898' : '#6c6c6c';
+        ctx.fillStyle = checker ? '#969696' : '#6e6e6e';
         ctx.fillRect(x, y, 2, 3);
-        ctx.fillStyle = checker ? '#747474' : '#8e8e8e';
+        ctx.fillStyle = checker ? '#767676' : '#8c8c8c';
         ctx.fillRect(x + 2, y + 1, 2, 2);
       }
     }
@@ -200,6 +410,7 @@ function mergeSkinnedParts(parts: SkinnedPartSpec[]): THREE.BufferGeometry {
   merged.setAttribute('uv', new THREE.BufferAttribute(outUv, 2));
   merged.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(outSkinIdx, 4));
   merged.setAttribute('skinWeight', new THREE.Float32BufferAttribute(outSkinWt, 4));
+  normalizeGeometrySkinWeights(merged, SKELETON_BONE_COUNT);
   return merged;
 }
 
@@ -542,9 +753,14 @@ export class LowPolyCharacter {
 
   private readonly chestAccessoryGroup = new THREE.Group();
   private readonly headAccessoryGroup = new THREE.Group();
+  private readonly hipsAccessoryGroup = new THREE.Group();
+  private readonly leftShinAccessoryGroup = new THREE.Group();
+  private readonly rightShinAccessoryGroup = new THREE.Group();
+  private readonly hairGroup = new THREE.Group();
   private readonly chestCosmeticGroup = new THREE.Group();
   private readonly headCosmeticGroup = new THREE.Group();
   private readonly facialGroup = new THREE.Group();
+  private readonly archetypeMaterials: THREE.Material[] = [];
 
   private readonly mixer: THREE.AnimationMixer;
   private readonly idleAction: THREE.AnimationAction;
@@ -619,7 +835,7 @@ export class LowPolyCharacter {
   private readonly contactShadow: THREE.Mesh;
   private vfxTime = 0;
 
-  private readonly fabricBumpTex: THREE.CanvasTexture;
+  private readonly fabricBumpTex: THREE.CanvasTexture | null;
   private readonly primaryMat: THREE.MeshStandardMaterial;
   private readonly secondaryMat: THREE.MeshStandardMaterial;
   private readonly accentMat: THREE.MeshStandardMaterial;
@@ -627,7 +843,7 @@ export class LowPolyCharacter {
   private readonly skinMat: THREE.MeshPhysicalMaterial;
   private readonly hairMat: THREE.MeshStandardMaterial;
   private readonly soleMat: THREE.MeshStandardMaterial;
-
+  private readonly irisMat: THREE.MeshStandardMaterial;
   private currentSkin: CharacterSkin;
   private currentCosmeticId: SkinCosmeticId | null = null;
 
@@ -639,48 +855,53 @@ export class LowPolyCharacter {
 
     this.primaryMat = new THREE.MeshStandardMaterial({
       color: initialSkin.primaryColor,
-      roughness: Math.max(0.46, initialSkin.roughness),
-      metalness: Math.min(0.28, initialSkin.metalness),
+      roughness: Math.max(0.42, initialSkin.roughness),
+      metalness: Math.min(0.38, initialSkin.metalness),
       bumpMap: this.fabricBumpTex,
       bumpScale: 0.008,
     });
     this.secondaryMat = new THREE.MeshStandardMaterial({
       color: initialSkin.secondaryColor,
-      roughness: Math.min(0.88, initialSkin.roughness + 0.25),
-      metalness: Math.max(0.02, initialSkin.metalness * 0.18),
+      roughness: Math.min(0.86, initialSkin.roughness + 0.22),
+      metalness: Math.max(0.04, initialSkin.metalness * 0.24),
       bumpMap: this.fabricBumpTex,
       bumpScale: 0.006,
     });
     this.accentMat = new THREE.MeshStandardMaterial({
       color: initialSkin.accentColor,
-      roughness: 0.34,
-      metalness: 0.32,
+      roughness: 0.30,
+      metalness: 0.36,
     });
     this.visorMat = new THREE.MeshStandardMaterial({
       color: initialSkin.visorColor,
       emissive: initialSkin.visorColor,
       emissiveIntensity: initialSkin.emissiveIntensity,
-      roughness: 0.18,
-      metalness: 0.68,
+      roughness: 0.16,
+      metalness: 0.72,
     });
     this.skinMat = new THREE.MeshPhysicalMaterial({
-      color: 0xd99e76,
-      roughness: 0.54,
+      color: initialSkin.skinTone ?? 0xd99b72,
+      roughness: 0.52,
       metalness: 0.0,
-      sheen: 0.42,
-      sheenRoughness: 0.62,
+      sheen: 0.44,
+      sheenRoughness: 0.60,
       sheenColor: new THREE.Color(0xffcdb0),
       clearcoat: 0.04,
     });
     this.hairMat = new THREE.MeshStandardMaterial({
-      color: 0x1e1714,
-      roughness: 0.64,
-      metalness: 0.08,
+      color: initialSkin.hairColor ?? 0x1b1512,
+      roughness: 0.54,
+      metalness: 0.10,
     });
     this.soleMat = new THREE.MeshStandardMaterial({
       color: 0xf8fafc,
-      roughness: 0.52,
-      metalness: 0.05,
+      roughness: 0.46,
+      metalness: 0.06,
+    });
+    this.irisMat = new THREE.MeshStandardMaterial({
+      color: initialSkin.eyeColor ?? 0x3f2414,
+      roughness: 0.18,
+      metalness: 0.08,
     });
 
     // Soft contact shadow grounded beneath runner
@@ -689,7 +910,7 @@ export class LowPolyCharacter {
     const shadowMat = new THREE.MeshBasicMaterial({
       color: 0x070d18,
       transparent: true,
-      opacity: 0.46,
+      opacity: 0.28,
       depthWrite: false,
     });
     this.contactShadow = new THREE.Mesh(shadowGeo, shadowMat);
@@ -811,12 +1032,12 @@ export class LowPolyCharacter {
         {
           geometry: sleeveTube,
           weightFn: (_x, y) => {
-            if (y < 1.025) {
-              const elT = smoothstep01((1.025 - y) / 0.05) * 0.28;
+            if (y < 1.035) {
+              const elT = smoothstep01((1.035 - y) / 0.050) * 0.48;
               return makeFixedInfluence(armBone, 1 - elT, forearmBone, elT);
             }
-            if (y > 1.145) {
-              const shT = smoothstep01((y - 1.145) / 0.045) * 0.35;
+            if (y > 1.135) {
+              const shT = smoothstep01((y - 1.135) / 0.055) * 0.42;
               return makeFixedInfluence(armBone, 1 - shT, BoneId.Chest, shT);
             }
             return makeFixedInfluence(armBone, 1);
@@ -825,9 +1046,9 @@ export class LowPolyCharacter {
         {
           geometry: shoulderCap,
           weightFn: (x, y) => {
-            const chestBlend = smoothstep01((0.175 - Math.abs(x)) / 0.06) * 0.65;
-            const topBlend = smoothstep01((y - 1.175) / 0.05) * 0.35;
-            const cW = Math.min(0.82, chestBlend + topBlend);
+            const xDist = smoothstep01((0.185 - Math.abs(x)) / 0.075);
+            const yTop = smoothstep01((y - 1.175) / 0.055) * 0.35;
+            const cW = THREE.MathUtils.clamp(xDist * 0.75 + yTop, 0.08, 0.88);
             return makeFixedInfluence(armBone, 1 - cW, BoneId.Chest, cW);
           },
         },
@@ -856,9 +1077,9 @@ export class LowPolyCharacter {
       return {
         geometry: tube,
         weightFn: (_x, y) => {
-          if (y > 0.67) {
-            const hipT = smoothstep01((y - 0.67) / 0.11);
-            return makeFixedInfluence(thighBone, 1 - hipT * 0.52, BoneId.Hips, hipT * 0.52);
+          if (y > 0.675) {
+            const hipT = smoothstep01((y - 0.675) / 0.105);
+            return makeFixedInfluence(thighBone, 1 - hipT * 0.48, BoneId.Hips, hipT * 0.48);
           }
           const kneeT = smoothstep01((0.485 - y) / 0.14);
           return makeFixedInfluence(thighBone, 1 - kneeT, shinBone, kneeT);
@@ -921,17 +1142,21 @@ export class LowPolyCharacter {
       thumbGeo.rotateZ(sideSign * -0.48);
       thumbGeo.translate(wx - sideSign * 0.018, 0.756, -0.036);
 
+      const wristWeight = (y: number): BoneInfluence => {
+        const handT = smoothstep01((0.825 - y) / 0.070);
+        return makeFixedInfluence(forearmBone, 1 - handT, handBone, handT);
+      };
+
       return [
         {
           geometry: forearmGeo,
           weightFn: (_x, y) => {
-            if (y > 0.935) {
-              const elT = smoothstep01((y - 0.935) / 0.06) * 0.46;
+            if (y > 0.930) {
+              const elT = smoothstep01((y - 0.930) / 0.055) * 0.50;
               return makeFixedInfluence(forearmBone, 1 - elT, armBone, elT);
             }
-            if (y < 0.820) {
-              const wrT = smoothstep01((0.820 - y) / 0.035) * 0.28;
-              return makeFixedInfluence(forearmBone, 1 - wrT, handBone, wrT);
+            if (y < 0.825) {
+              return wristWeight(y);
             }
             return makeFixedInfluence(forearmBone, 1);
           },
@@ -939,9 +1164,8 @@ export class LowPolyCharacter {
         {
           geometry: palmGeo,
           weightFn: (_x, y) => {
-            if (y > 0.772) {
-              const wrT = smoothstep01((y - 0.772) / 0.022) * 0.35;
-              return makeFixedInfluence(handBone, 1 - wrT, forearmBone, wrT);
+            if (y > 0.755) {
+              return wristWeight(y);
             }
             return makeFixedInfluence(handBone, 1);
           },
@@ -954,132 +1178,154 @@ export class LowPolyCharacter {
       ];
     };
 
-    // --- Group A: Athletic V-Taper Runner Track Jacket / Hoodie (primaryMat) ---
+    // --- Group A: Tailored Athletic Runner Jacket / Tunic (primaryMat) ---
     const jacketTorsoGeo = createOrganicTube(
       [
-        { cx: 0, cy: 0.775, cz: 0.002, rx: 0.146, rz: 0.106 },
-        { cx: 0, cy: 0.845, cz: 0.004, rx: 0.136, rz: 0.100 },
-        { cx: 0, cy: 0.930, cz: 0.006, rx: 0.142, rz: 0.104 },
-        { cx: 0, cy: 1.045, cz: -0.006, rx: 0.164, rz: 0.116 },
+        { cx: 0, cy: 0.775, cz: 0.002, rx: 0.144, rz: 0.104 },
+        { cx: 0, cy: 0.845, cz: 0.004, rx: 0.132, rz: 0.098 },
+        { cx: 0, cy: 0.935, cz: 0.004, rx: 0.140, rz: 0.104 },
+        { cx: 0, cy: 1.045, cz: -0.006, rx: 0.166, rz: 0.118 },
         { cx: 0, cy: 1.150, cz: -0.006, rx: 0.160, rz: 0.112 },
-        { cx: 0, cy: 1.210, cz: 0.0, rx: 0.108, rz: 0.088 },
-        { cx: 0, cy: 1.240, cz: 0.002, rx: 0.068, rz: 0.066 },
+        { cx: 0, cy: 1.210, cz: 0.0, rx: 0.106, rz: 0.086 },
+        { cx: 0, cy: 1.240, cz: 0.002, rx: 0.066, rz: 0.064 },
       ],
       20,
     );
 
-    // Sculpted draped hoodie cowl on upper back (reads crisp from chase cam)
-    const hoodDrapeGeo = createOrganicTube(
-      [
-        { cx: 0, cy: 1.135, cz: 0.106, rx: 0.072, rz: 0.032, tiltX: -0.35 },
-        { cx: 0, cy: 1.185, cz: 0.095, rx: 0.096, rz: 0.042, tiltX: -0.25 },
-        { cx: 0, cy: 1.228, cz: 0.056, rx: 0.092, rz: 0.058, tiltX: 0.15 },
-      ],
-      16,
-    );
-
-    const pocketGeo = new THREE.CapsuleGeometry(0.040, 0.125, 6, 10);
-    pocketGeo.rotateZ(Math.PI / 2);
-    pocketGeo.scale(1.0, 0.92, 0.45);
-    pocketGeo.translate(0, 0.860, -0.102);
+    const chestArmorRibGeo = new THREE.CapsuleGeometry(0.022, 0.15, 4, 8);
+    chestArmorRibGeo.rotateZ(Math.PI / 2);
+    chestArmorRibGeo.scale(1.0, 0.78, 0.55);
+    chestArmorRibGeo.translate(0, 1.08, -0.106);
 
     bindSkinned(
       [
         { geometry: jacketTorsoGeo, weightFn: (_x, y) => torsoWeight(_x, y) },
-        { geometry: hoodDrapeGeo, fixedInfluence: makeFixedInfluence(BoneId.Chest, 0.72, BoneId.Neck, 0.28) },
-        { geometry: pocketGeo, fixedInfluence: makeFixedInfluence(BoneId.Spine, 0.72, BoneId.Hips, 0.28) },
+        { geometry: chestArmorRibGeo, fixedInfluence: makeFixedInfluence(BoneId.Chest, 1) },
         ...makeSleeveParts(-1),
         ...makeSleeveParts(1),
       ],
       this.primaryMat,
     );
 
-    // --- Group B: Athletic Tapered Runner Joggers & Glute/Hip Volume (secondaryMat) ---
+    // --- Group B: Athletic Tapered Runner Joggers, Waistband & Gloves (secondaryMat) ---
     const pelvisGeo = createOrganicTube(
       [
-        { cx: 0, cy: 0.705, cz: 0.006, rx: 0.146, rz: 0.106 },
+        { cx: 0, cy: 0.702, cz: 0.006, rx: 0.146, rz: 0.106 },
         { cx: 0, cy: 0.765, cz: 0.008, rx: 0.150, rz: 0.108 },
-        { cx: 0, cy: 0.810, cz: 0.004, rx: 0.142, rz: 0.102 },
+        { cx: 0, cy: 0.810, cz: 0.004, rx: 0.140, rz: 0.100 },
       ],
       18,
     );
+
+    const gloveLGeo = createOrganicTube(
+      [
+        { cx: -0.201, cy: 0.735, cz: -0.004, rx: 0.024, rz: 0.039 },
+        { cx: -0.201, cy: 0.770, cz: -0.001, rx: 0.025, rz: 0.039 },
+        { cx: -0.201, cy: 0.796, cz: 0.0, rx: 0.024, rz: 0.033 },
+      ],
+      12,
+    );
+    const gloveRGeo = createOrganicTube(
+      [
+        { cx: 0.201, cy: 0.735, cz: -0.004, rx: 0.024, rz: 0.039 },
+        { cx: 0.201, cy: 0.770, cz: -0.001, rx: 0.025, rz: 0.039 },
+        { cx: 0.201, cy: 0.796, cz: 0.0, rx: 0.024, rz: 0.033 },
+      ],
+      12,
+    );
+
+    const gloveWeight = (forearmBone: BoneId, handBone: BoneId, y: number): BoneInfluence => {
+      const handT = smoothstep01((0.825 - y) / 0.070);
+      return makeFixedInfluence(forearmBone, 1 - handT, handBone, handT);
+    };
 
     bindSkinned(
       [
         {
           geometry: pelvisGeo,
           weightFn: (x, y) => {
-            const hipBase = makeFixedInfluence(BoneId.Hips, 0.92, BoneId.Spine, 0.08);
-            if (y < 0.755 && Math.abs(x) > 0.03) {
-              const thighBone = x < 0 ? BoneId.LeftThigh : BoneId.RightThigh;
-              const legBlend = smoothstep01((0.755 - y) / 0.055) * 0.42;
-              return makeFixedInfluence(BoneId.Hips, 1 - legBlend, thighBone, legBlend);
-            }
-            return hipBase;
+            // Smooth crotch-to-hip-socket 3-bone blend (eliminates step-edge crotch tearing)
+            const spineW = y > 0.775 ? smoothstep01((y - 0.775) / 0.035) * 0.16 : 0;
+            const latT = smoothstep01((Math.abs(x) - 0.018) / 0.072);
+            const vertT = smoothstep01((0.768 - y) / 0.068);
+            const thighW = latT * vertT * 0.48;
+            const hipsW = Math.max(0.01, 1 - spineW - thighW);
+            const thighBone = x < 0 ? BoneId.LeftThigh : BoneId.RightThigh;
+            return makeFixedInfluence(BoneId.Hips, hipsW, thighBone, thighW, BoneId.Spine, spineW);
           },
         },
         makeLegTubeParts(-1),
         makeLegTubeParts(1),
+        { geometry: gloveLGeo, weightFn: (_x, y) => gloveWeight(BoneId.LeftForearm, BoneId.LeftHand, y) },
+        { geometry: gloveRGeo, weightFn: (_x, y) => gloveWeight(BoneId.RightForearm, BoneId.RightHand, y) },
       ],
       this.secondaryMat,
     );
 
-    // --- Group C: Sculpted Human Kid Head, Neck, Forearms, Hands & Ankles (skinMat) ---
+    // --- Group C: Sculpted Stylized Human Head, Neck, Forearms, Fingers & Ankles (skinMat) ---
     const neckGeo = createOrganicTube(
       [
-        { cx: 0, cy: 1.215, cz: 0.002, rx: 0.054, rz: 0.054 },
-        { cx: 0, cy: 1.275, cz: 0.002, rx: 0.048, rz: 0.049 },
-        { cx: 0, cy: 1.340, cz: -0.004, rx: 0.046, rz: 0.048 },
+        { cx: 0, cy: 1.215, cz: 0.002, rx: 0.052, rz: 0.052 },
+        { cx: 0, cy: 1.275, cz: 0.002, rx: 0.046, rz: 0.047 },
+        { cx: 0, cy: 1.338, cz: -0.004, rx: 0.045, rz: 0.047 },
       ],
       14,
     );
 
-    // Continuous anatomically sculpted 3D kid head (jaw -> soft cheeks -> brow -> cranium)
     const kidHeadGeo = createOrganicTube(
       [
-        { cx: 0, cy: 1.330, cz: -0.016, rx: 0.048, rz: 0.062 },
-        { cx: 0, cy: 1.368, cz: -0.012, rx: 0.082, rz: 0.094 },
-        { cx: 0, cy: 1.405, cz: -0.008, rx: 0.102, rz: 0.108 },
-        { cx: 0, cy: 1.445, cz: -0.004, rx: 0.110, rz: 0.115 },
-        { cx: 0, cy: 1.482, cz: 0.000, rx: 0.112, rz: 0.118 },
-        { cx: 0, cy: 1.518, cz: 0.006, rx: 0.106, rz: 0.114 },
-        { cx: 0, cy: 1.554, cz: 0.012, rx: 0.086, rz: 0.095 },
-        { cx: 0, cy: 1.578, cz: 0.015, rx: 0.046, rz: 0.054 },
+        { cx: 0, cy: 1.330, cz: -0.018, rx: 0.046, rz: 0.060 },
+        { cx: 0, cy: 1.366, cz: -0.014, rx: 0.078, rz: 0.090 },
+        { cx: 0, cy: 1.404, cz: -0.008, rx: 0.098, rz: 0.104 },
+        { cx: 0, cy: 1.445, cz: -0.004, rx: 0.106, rz: 0.112 },
+        { cx: 0, cy: 1.484, cz: 0.000, rx: 0.108, rz: 0.115 },
+        { cx: 0, cy: 1.522, cz: 0.006, rx: 0.102, rz: 0.110 },
+        { cx: 0, cy: 1.556, cz: 0.012, rx: 0.082, rz: 0.092 },
+        { cx: 0, cy: 1.578, cz: 0.015, rx: 0.042, rz: 0.050 },
       ],
-      22,
+      24,
     );
 
-    const noseBridgeGeo = new THREE.CapsuleGeometry(0.0085, 0.022, 4, 8);
-    noseBridgeGeo.rotateX(0.28);
-    noseBridgeGeo.translate(0, 1.428, -0.116);
+    const noseBridgeGeo = new THREE.CapsuleGeometry(0.0065, 0.020, 4, 8);
+    noseBridgeGeo.rotateX(0.32);
+    noseBridgeGeo.translate(0, 1.425, -0.111);
 
-    const noseTipGeo = new THREE.SphereGeometry(0.0135, 10, 8);
-    noseTipGeo.scale(1.0, 0.85, 1.05);
-    noseTipGeo.translate(0, 1.412, -0.121);
+    const noseTipGeo = new THREE.SphereGeometry(0.010, 10, 8);
+    noseTipGeo.scale(1.0, 0.78, 0.95);
+    noseTipGeo.translate(0, 1.412, -0.116);
 
-    const earLGeo = new THREE.SphereGeometry(0.025, 10, 8);
-    earLGeo.scale(0.42, 1.05, 0.72);
-    earLGeo.rotateY(0.18);
-    earLGeo.translate(-0.114, 1.442, 0.010);
+    const earLGeo = new THREE.SphereGeometry(0.022, 10, 8);
+    earLGeo.scale(0.36, 0.98, 0.68);
+    earLGeo.rotateY(0.20);
+    earLGeo.translate(-0.107, 1.438, 0.008);
 
-    const earRGeo = new THREE.SphereGeometry(0.025, 10, 8);
-    earRGeo.scale(0.42, 1.05, 0.72);
-    earRGeo.rotateY(-0.18);
-    earRGeo.translate(0.114, 1.442, 0.010);
+    const earRGeo = new THREE.SphereGeometry(0.022, 10, 8);
+    earRGeo.scale(0.36, 0.98, 0.68);
+    earRGeo.rotateY(-0.20);
+    earRGeo.translate(0.107, 1.438, 0.008);
 
-    const ankleLGeo = new THREE.CylinderGeometry(0.032, 0.030, 0.068, 12);
+    const ankleLGeo = new THREE.CylinderGeometry(0.030, 0.028, 0.068, 12);
     ankleLGeo.translate(-0.098, 0.115, 0);
 
-    const ankleRGeo = new THREE.CylinderGeometry(0.032, 0.030, 0.068, 12);
+    const ankleRGeo = new THREE.CylinderGeometry(0.030, 0.028, 0.068, 12);
     ankleRGeo.translate(0.098, 0.115, 0);
+
+    const ankleWeight = (shinBone: BoneId, footBone: BoneId, y: number): BoneInfluence => {
+      const footT = smoothstep01((0.128 - y) / 0.068);
+      return makeFixedInfluence(shinBone, 1 - footT, footBone, footT);
+    };
 
     bindSkinned(
       [
         {
           geometry: neckGeo,
           weightFn: (_x, y) => {
-            const t = smoothstep01((y - 1.24) / 0.08);
-            return makeFixedInfluence(BoneId.Neck, 1 - t, BoneId.Head, t);
+            if (y < 1.240) {
+              const chestT = smoothstep01((1.240 - y) / 0.030) * 0.45;
+              return makeFixedInfluence(BoneId.Neck, 1 - chestT, BoneId.Chest, chestT);
+            }
+            const headT = smoothstep01((y - 1.245) / 0.085);
+            return makeFixedInfluence(BoneId.Neck, 1 - headT, BoneId.Head, headT);
           },
         },
         { geometry: kidHeadGeo, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
@@ -1091,26 +1337,25 @@ export class LowPolyCharacter {
         ...makeForearmAndHandParts(1),
         {
           geometry: ankleLGeo,
-          fixedInfluence: makeFixedInfluence(BoneId.LeftShin, 0.75, BoneId.LeftFoot, 0.25),
+          weightFn: (_x, y) => ankleWeight(BoneId.LeftShin, BoneId.LeftFoot, y),
         },
         {
           geometry: ankleRGeo,
-          fixedInfluence: makeFixedInfluence(BoneId.RightShin, 0.75, BoneId.RightFoot, 0.25),
+          weightFn: (_x, y) => ankleWeight(BoneId.RightShin, BoneId.RightFoot, y),
         },
       ],
       this.skinMat,
     );
 
-    // --- Group D: Athletic Varsity Stripes, Ribbed Hem, Cuffs, Headband & Pro Sneakers (accentMat) ---
-    const collarTrimGeo = new THREE.TorusGeometry(0.072, 0.017, 8, 18);
+    // --- Group D: Collar, Belt/Hem, Cuffs, Racing Stripes & Contoured Sneaker Uppers (accentMat) ---
+    const collarTrimGeo = new THREE.TorusGeometry(0.070, 0.016, 8, 18);
     collarTrimGeo.rotateX(Math.PI / 2 - 0.12);
     collarTrimGeo.translate(0, 1.232, 0.002);
 
-    const jacketHemGeo = new THREE.CylinderGeometry(0.146, 0.148, 0.034, 18);
-    jacketHemGeo.scale(1.0, 1, 0.74);
-    jacketHemGeo.translate(0, 0.785, 0.003);
+    const jacketBeltGeo = new THREE.CylinderGeometry(0.142, 0.145, 0.036, 18);
+    jacketBeltGeo.scale(1.0, 1, 0.74);
+    jacketBeltGeo.translate(0, 0.782, 0.003);
 
-    // Back athletic shoulder yoke stripe (highly visible from chase cam!)
     const backYokeGeo = createCurvedTube(
       [
         [-0.155, 1.155, 0.068],
@@ -1119,12 +1364,11 @@ export class LowPolyCharacter {
         [0.08, 1.168, 0.104],
         [0.155, 1.155, 0.068],
       ],
-      0.014,
+      0.012,
       12,
       6,
     );
 
-    // Racing stripes running down outer thighs & shins
     const makeLegStripe = (sideSign: -1 | 1): SkinnedPartSpec => {
       const thighBone = sideSign < 0 ? BoneId.LeftThigh : BoneId.RightThigh;
       const shinBone = sideSign < 0 ? BoneId.LeftShin : BoneId.RightShin;
@@ -1136,16 +1380,16 @@ export class LowPolyCharacter {
           [sideSign * 0.155, 0.28, 0.008],
           [sideSign * 0.138, 0.15, 0.004],
         ],
-        0.0095,
+        0.0085,
         16,
         6,
       );
       return {
         geometry: stripeGeo,
         weightFn: (_x, y) => {
-          if (y > 0.67) {
-            const hipT = smoothstep01((y - 0.67) / 0.11);
-            return makeFixedInfluence(thighBone, 1 - hipT * 0.52, BoneId.Hips, hipT * 0.52);
+          if (y > 0.675) {
+            const hipT = smoothstep01((y - 0.675) / 0.105);
+            return makeFixedInfluence(thighBone, 1 - hipT * 0.48, BoneId.Hips, hipT * 0.48);
           }
           const kneeT = smoothstep01((0.485 - y) / 0.14);
           return makeFixedInfluence(thighBone, 1 - kneeT, shinBone, kneeT);
@@ -1158,23 +1402,18 @@ export class LowPolyCharacter {
     const cuffRGeo = new THREE.CylinderGeometry(0.048, 0.048, 0.026, 14);
     cuffRGeo.translate(0.197, 0.985, 0);
 
-    const wristLGeo = new THREE.CylinderGeometry(0.034, 0.034, 0.034, 14);
-    wristLGeo.translate(-0.201, 0.812, 0);
-    const wristRGeo = new THREE.CylinderGeometry(0.034, 0.034, 0.034, 14);
-    wristRGeo.translate(0.201, 0.812, 0);
+    const wristLGeo = new THREE.CylinderGeometry(0.033, 0.033, 0.036, 14);
+    wristLGeo.translate(-0.201, 0.808, 0);
+    const wristRGeo = new THREE.CylinderGeometry(0.033, 0.033, 0.036, 14);
+    wristRGeo.translate(0.201, 0.808, 0);
 
     const joggerCuffLGeo = new THREE.CylinderGeometry(0.043, 0.039, 0.030, 14);
     joggerCuffLGeo.translate(-0.098, 0.145, 0.002);
     const joggerCuffRGeo = new THREE.CylinderGeometry(0.043, 0.039, 0.030, 14);
     joggerCuffRGeo.translate(0.098, 0.145, 0.002);
 
-    const headbandGeo = new THREE.TorusGeometry(0.116, 0.015, 8, 22);
-    headbandGeo.rotateX(Math.PI / 2 + 0.24);
-    headbandGeo.scale(0.98, 1.0, 1.08);
-    headbandGeo.translate(0, 1.515, 0.006);
-
-    const makeShoeUpper = (lx: number): THREE.BufferGeometry => {
-      const upper = createOrganicTube(
+    const makeShoeUpper = (lx: number): THREE.BufferGeometry =>
+      createOrganicTube(
         [
           { cx: lx, cy: 0.028, cz: -0.042, rx: 0.047, rz: 0.114 },
           { cx: lx, cy: 0.056, cz: -0.034, rx: 0.045, rz: 0.104 },
@@ -1182,8 +1421,6 @@ export class LowPolyCharacter {
         ],
         14,
       );
-      return upper;
-    };
 
     const makeShoeCollar = (lx: number): THREE.BufferGeometry => {
       const collar = new THREE.TorusGeometry(0.040, 0.014, 8, 14);
@@ -1192,148 +1429,86 @@ export class LowPolyCharacter {
       return collar;
     };
 
+    const elbowCuffWeight = (armBone: BoneId, forearmBone: BoneId, y: number): BoneInfluence => {
+      const elT = smoothstep01((1.020 - y) / 0.070) * 0.56 + 0.20;
+      return makeFixedInfluence(armBone, 1 - elT, forearmBone, elT);
+    };
+
     bindSkinned(
       [
-        { geometry: collarTrimGeo, fixedInfluence: makeFixedInfluence(BoneId.Chest, 0.6, BoneId.Neck, 0.4) },
-        { geometry: jacketHemGeo, fixedInfluence: makeFixedInfluence(BoneId.Hips, 0.78, BoneId.Spine, 0.22) },
+        { geometry: collarTrimGeo, weightFn: (_x, y) => torsoWeight(_x, y) },
+        { geometry: jacketBeltGeo, weightFn: (_x, y) => torsoWeight(_x, y) },
         { geometry: backYokeGeo, fixedInfluence: makeFixedInfluence(BoneId.Chest, 1) },
         makeLegStripe(-1),
         makeLegStripe(1),
-        { geometry: cuffLGeo, fixedInfluence: makeFixedInfluence(BoneId.LeftArm, 0.72, BoneId.LeftForearm, 0.28) },
-        { geometry: cuffRGeo, fixedInfluence: makeFixedInfluence(BoneId.RightArm, 0.72, BoneId.RightForearm, 0.28) },
-        { geometry: wristLGeo, fixedInfluence: makeFixedInfluence(BoneId.LeftForearm, 0.82, BoneId.LeftHand, 0.18) },
-        { geometry: wristRGeo, fixedInfluence: makeFixedInfluence(BoneId.RightForearm, 0.82, BoneId.RightHand, 0.18) },
-        { geometry: joggerCuffLGeo, fixedInfluence: makeFixedInfluence(BoneId.LeftShin, 1) },
-        { geometry: joggerCuffRGeo, fixedInfluence: makeFixedInfluence(BoneId.RightShin, 1) },
-        { geometry: headbandGeo, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: makeShoeUpper(-0.098), fixedInfluence: makeFixedInfluence(BoneId.LeftFoot, 1) },
-        { geometry: makeShoeUpper(0.098), fixedInfluence: makeFixedInfluence(BoneId.RightFoot, 1) },
-        { geometry: makeShoeCollar(-0.098), fixedInfluence: makeFixedInfluence(BoneId.LeftFoot, 0.75, BoneId.LeftShin, 0.25) },
-        { geometry: makeShoeCollar(0.098), fixedInfluence: makeFixedInfluence(BoneId.RightFoot, 0.75, BoneId.RightShin, 0.25) },
+        { geometry: cuffLGeo, weightFn: (_x, y) => elbowCuffWeight(BoneId.LeftArm, BoneId.LeftForearm, y) },
+        { geometry: cuffRGeo, weightFn: (_x, y) => elbowCuffWeight(BoneId.RightArm, BoneId.RightForearm, y) },
+        { geometry: wristLGeo, weightFn: (_x, y) => gloveWeight(BoneId.LeftForearm, BoneId.LeftHand, y) },
+        { geometry: wristRGeo, weightFn: (_x, y) => gloveWeight(BoneId.RightForearm, BoneId.RightHand, y) },
+        { geometry: joggerCuffLGeo, weightFn: (_x, y) => ankleWeight(BoneId.LeftShin, BoneId.LeftFoot, y) },
+        { geometry: joggerCuffRGeo, weightFn: (_x, y) => ankleWeight(BoneId.RightShin, BoneId.RightFoot, y) },
+        { geometry: makeShoeUpper(-0.098), weightFn: (_x, y) => ankleWeight(BoneId.LeftShin, BoneId.LeftFoot, y) },
+        { geometry: makeShoeUpper(0.098), weightFn: (_x, y) => ankleWeight(BoneId.RightShin, BoneId.RightFoot, y) },
+        { geometry: makeShoeCollar(-0.098), weightFn: (_x, y) => ankleWeight(BoneId.LeftShin, BoneId.LeftFoot, y) },
+        { geometry: makeShoeCollar(0.098), weightFn: (_x, y) => ankleWeight(BoneId.RightShin, BoneId.RightFoot, y) },
       ],
       this.accentMat,
     );
 
-    // --- Group E: Sculpted Pro Sneaker Cushion Midsoles & Crisp Laces (soleMat) ---
-    const makeShoeSole = (lx: number): THREE.BufferGeometry => {
-      const sole = createOrganicTube(
+    // --- Group E: Contoured Sneaker Midsoles, Toe Bumpers & Sleek Straps (soleMat) ---
+    const makeShoeSole = (lx: number): THREE.BufferGeometry =>
+      createOrganicTube(
         [
           { cx: lx, cy: 0.002, cz: -0.044, rx: 0.052, rz: 0.126 },
-          { cx: lx, cy: 0.022, cz: -0.042, rx: 0.054, rz: 0.128 },
+          { cx: lx, cy: 0.020, cz: -0.042, rx: 0.055, rz: 0.130 },
           { cx: lx, cy: 0.034, cz: -0.036, rx: 0.050, rz: 0.118 },
         ],
-        14,
+        16,
       );
-      return sole;
-    };
 
-    const makeShoeLaces = (lx: number): THREE.BufferGeometry => {
-      const laces = new THREE.BoxGeometry(0.044, 0.012, 0.052);
-      laces.rotateX(0.32);
-      laces.translate(lx, 0.078, -0.052);
-      return laces;
+    const makeShoeStrap = (lx: number, zOff: number, yOff: number): THREE.BufferGeometry => {
+      const strap = new THREE.CapsuleGeometry(0.007, 0.038, 4, 8);
+      strap.rotateZ(Math.PI / 2);
+      strap.translate(lx, yOff, zOff);
+      return strap;
     };
 
     bindSkinned(
       [
         { geometry: makeShoeSole(-0.098), fixedInfluence: makeFixedInfluence(BoneId.LeftFoot, 1) },
         { geometry: makeShoeSole(0.098), fixedInfluence: makeFixedInfluence(BoneId.RightFoot, 1) },
-        { geometry: makeShoeLaces(-0.098), fixedInfluence: makeFixedInfluence(BoneId.LeftFoot, 1) },
-        { geometry: makeShoeLaces(0.098), fixedInfluence: makeFixedInfluence(BoneId.RightFoot, 1) },
+        { geometry: makeShoeStrap(-0.098, -0.072, 0.068), fixedInfluence: makeFixedInfluence(BoneId.LeftFoot, 1) },
+        { geometry: makeShoeStrap(-0.098, -0.048, 0.078), fixedInfluence: makeFixedInfluence(BoneId.LeftFoot, 1) },
+        { geometry: makeShoeStrap(0.098, -0.072, 0.068), fixedInfluence: makeFixedInfluence(BoneId.RightFoot, 1) },
+        { geometry: makeShoeStrap(0.098, -0.048, 0.078), fixedInfluence: makeFixedInfluence(BoneId.RightFoot, 1) },
       ],
       this.soleMat,
     );
 
-    // --- Group F: Layered Natural 3D Kid Hair (Full Crown, Back Taper & Sweeping Front Locks) ---
-    const hairCrownGeo = new THREE.SphereGeometry(0.120, 22, 14, 0, Math.PI * 2, 0, Math.PI * 0.58);
-    hairCrownGeo.scale(0.99, 0.96, 1.06);
-    hairCrownGeo.rotateX(0.46);
-    hairCrownGeo.translate(0, 1.488, 0.018);
-
-    const hairBackGeo = createOrganicTube(
-      [
-        { cx: 0, cy: 1.365, cz: 0.068, rx: 0.068, rz: 0.042 },
-        { cx: 0, cy: 1.415, cz: 0.078, rx: 0.094, rz: 0.052 },
-        { cx: 0, cy: 1.470, cz: 0.072, rx: 0.104, rz: 0.056 },
-      ],
-      16,
-    );
-
-    const sideburnLGeo = new THREE.CapsuleGeometry(0.015, 0.044, 4, 6);
-    sideburnLGeo.rotateZ(-0.12);
-    sideburnLGeo.translate(-0.106, 1.465, -0.010);
-
-    const sideburnRGeo = new THREE.CapsuleGeometry(0.015, 0.044, 4, 6);
-    sideburnRGeo.rotateZ(0.12);
-    sideburnRGeo.translate(0.106, 1.465, -0.010);
-
-    const lockCenter = createCurvedTube(
-      [
-        [0.02, 1.585, 0.02],
-        [0.01, 1.588, -0.045],
-        [-0.025, 1.562, -0.095],
-        [-0.055, 1.525, -0.108],
-      ],
-      0.025,
-    );
-    const lockRight = createCurvedTube(
-      [
-        [0.045, 1.575, 0.01],
-        [0.055, 1.572, -0.05],
-        [0.042, 1.542, -0.098],
-        [0.015, 1.515, -0.112],
-      ],
-      0.021,
-    );
-    const lockLeft = createCurvedTube(
-      [
-        [-0.035, 1.572, 0.015],
-        [-0.065, 1.558, -0.035],
-        [-0.082, 1.528, -0.075],
-        [-0.088, 1.495, -0.088],
-      ],
-      0.020,
-    );
-    const lockCrown = createCurvedTube(
-      [
-        [-0.01, 1.575, 0.055],
-        [0.015, 1.595, 0.005],
-        [0.035, 1.582, -0.060],
-        [0.058, 1.542, -0.094],
-      ],
-      0.022,
-    );
-
-    bindSkinned(
-      [
-        { geometry: hairCrownGeo, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: hairBackGeo, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: sideburnLGeo, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: sideburnRGeo, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: lockCenter, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: lockRight, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: lockLeft, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: lockCrown, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-      ],
-      this.hairMat,
-    );
-
-    // --- Group G: Signature Trim (Jacket Zipper, Back Emblem Chevron, Sneaker Heel Tabs) ---
-    const zipLineGeo = new THREE.BoxGeometry(0.014, 0.36, 0.016);
+    // --- Group G: Glowing Trim (Zipper Piping, Back Chevron, Buckle, Sneaker Heel Air-Pods) ---
+    const zipLineGeo = new THREE.CapsuleGeometry(0.006, 0.34, 4, 8);
     zipLineGeo.rotateX(-0.02);
-    zipLineGeo.translate(0, 1.015, -0.112);
+    zipLineGeo.translate(0, 1.015, -0.114);
 
-    const backStripeGeo = new THREE.BoxGeometry(0.024, 0.22, 0.014);
-    backStripeGeo.translate(0, 1.015, 0.112);
+    const backChevronL = new THREE.CapsuleGeometry(0.007, 0.12, 4, 6);
+    backChevronL.rotateZ(-0.62);
+    backChevronL.translate(-0.042, 1.03, 0.114);
 
-    const headbandBadgeGeo = new THREE.BoxGeometry(0.038, 0.016, 0.012);
-    headbandBadgeGeo.translate(0, 1.518, -0.116);
+    const backChevronR = new THREE.CapsuleGeometry(0.007, 0.12, 4, 6);
+    backChevronR.rotateZ(0.62);
+    backChevronR.translate(0.042, 1.03, 0.114);
 
-    const heelLGeo = new THREE.BoxGeometry(0.066, 0.018, 0.028);
-    heelLGeo.translate(-0.098, 0.036, 0.068);
+    const beltBuckleGeo = new THREE.OctahedronGeometry(0.022, 0);
+    beltBuckleGeo.scale(1.2, 0.9, 0.45);
+    beltBuckleGeo.translate(0, 0.782, -0.108);
 
-    const heelRGeo = new THREE.BoxGeometry(0.066, 0.018, 0.028);
-    heelRGeo.translate(0.098, 0.036, 0.068);
+    const heelPodLGeo = new THREE.CapsuleGeometry(0.011, 0.044, 4, 8);
+    heelPodLGeo.rotateZ(Math.PI / 2);
+    heelPodLGeo.translate(-0.098, 0.026, 0.072);
+
+    const heelPodRGeo = new THREE.CapsuleGeometry(0.011, 0.044, 4, 8);
+    heelPodRGeo.rotateZ(Math.PI / 2);
+    heelPodRGeo.translate(0.098, 0.026, 0.072);
 
     bindSkinned(
       [
@@ -1344,32 +1519,36 @@ export class LowPolyCharacter {
             return makeFixedInfluence(BoneId.Spine, 1 - t, BoneId.Chest, t);
           },
         },
-        {
-          geometry: backStripeGeo,
-          weightFn: (_x, y) => {
-            const t = smoothstep01((y - 0.87) / 0.16);
-            return makeFixedInfluence(BoneId.Spine, 1 - t, BoneId.Chest, t);
-          },
-        },
-        { geometry: headbandBadgeGeo, fixedInfluence: makeFixedInfluence(BoneId.Head, 1) },
-        { geometry: heelLGeo, fixedInfluence: makeFixedInfluence(BoneId.LeftFoot, 1) },
-        { geometry: heelRGeo, fixedInfluence: makeFixedInfluence(BoneId.RightFoot, 1) },
+        { geometry: backChevronL, fixedInfluence: makeFixedInfluence(BoneId.Chest, 1) },
+        { geometry: backChevronR, fixedInfluence: makeFixedInfluence(BoneId.Chest, 1) },
+        { geometry: beltBuckleGeo, weightFn: (_x, y) => torsoWeight(_x, y) },
+        { geometry: heelPodLGeo, fixedInfluence: makeFixedInfluence(BoneId.LeftFoot, 1) },
+        { geometry: heelPodRGeo, fixedInfluence: makeFixedInfluence(BoneId.RightFoot, 1) },
       ],
       this.visorMat,
       false,
     );
 
+    // Run full-rig bone-weight normalization pass over all bound SkinnedMeshes
+    this.normalizeAllSkinWeights();
+
     // -------------------------------------------------------------------------
-    // 3. Surface-Verified Expressive Human Kid Face (mounted on Head bone y=1.32)
+    // 3. Expressive Stylized Kid Face & Sculpted Tapered Hair (on Head bone y=1.32)
     // -------------------------------------------------------------------------
     this.headBone.add(this.facialGroup);
     this.buildKidFace();
 
+    this.headBone.add(this.hairGroup);
+    this.buildStylizedHair();
+
     // -------------------------------------------------------------------------
-    // 4. Bone-Attached Accessory & Cosmetic Mounts
+    // 4. Bone-Attached Archetype Outfit, Armor & Cosmetic Mounts
     // -------------------------------------------------------------------------
     this.chestBone.add(this.chestAccessoryGroup);
     this.headBone.add(this.headAccessoryGroup);
+    this.hipsBone.add(this.hipsAccessoryGroup);
+    this.leftShinBone.add(this.leftShinAccessoryGroup);
+    this.rightShinBone.add(this.rightShinAccessoryGroup);
     this.chestBone.add(this.chestCosmeticGroup);
     this.headBone.add(this.headCosmeticGroup);
     this.rebuildAccessory(initialSkin);
@@ -1519,94 +1698,136 @@ export class LowPolyCharacter {
 
     this.debugFootIkGroup.name = 'FootIKDebugGroup';
     this.debugFootIkGroup.visible = false;
+    this.syncShadowCasterHierarchy();
+  }
+
+  public syncShadowCasterHierarchy(): void {
+    this.bodyRig.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.castShadow = true;
+        obj.layers.enable(RUNNER_SHADOW_LAYER);
+      }
+    });
   }
 
   private buildKidFace(): void {
     const scleraMat = new THREE.MeshStandardMaterial({
       color: 0xfafafa,
-      roughness: 0.22,
-      metalness: 0.0,
-    });
-    const irisMat = new THREE.MeshStandardMaterial({
-      color: 0x4a2a14,
       roughness: 0.20,
-      metalness: 0.05,
+      metalness: 0.0,
     });
     const pupilMat = new THREE.MeshBasicMaterial({ color: 0x090d16 });
     const glintMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    const lashMat = new THREE.MeshStandardMaterial({ color: 0x16110e, roughness: 0.6 });
-    const blushMat = new THREE.MeshStandardMaterial({
-      color: 0xe87b72,
-      roughness: 0.72,
-      metalness: 0.0,
-    });
+    const lashMat = new THREE.MeshStandardMaterial({ color: 0x16110e, roughness: 0.55 });
     const lipMat = new THREE.MeshStandardMaterial({
-      color: 0xb0584f,
-      roughness: 0.48,
+      color: 0xa6534a,
+      roughness: 0.46,
     });
 
-    const scleraGeo = new THREE.SphereGeometry(0.021, 14, 12);
-    const irisGeo = new THREE.SphereGeometry(0.0135, 12, 10);
-    const pupilGeo = new THREE.SphereGeometry(0.0072, 10, 8);
+    const scleraGeo = new THREE.SphereGeometry(0.020, 14, 12);
+    const irisGeo = new THREE.SphereGeometry(0.0138, 12, 10);
+    const pupilGeo = new THREE.SphereGeometry(0.0074, 10, 8);
     const glintGeo = new THREE.SphereGeometry(0.0036, 8, 6);
-    const lashGeo = new THREE.TorusGeometry(0.0215, 0.0026, 6, 12, Math.PI * 0.82);
-    const browGeo = new THREE.CapsuleGeometry(0.0040, 0.024, 4, 6);
-    const cheekGeo = new THREE.SphereGeometry(0.018, 10, 8);
+    const lashGeo = new THREE.CapsuleGeometry(0.0022, 0.026, 4, 8);
+    const browGeo = new THREE.CapsuleGeometry(0.0038, 0.024, 4, 8);
 
     for (const side of [-1, 1]) {
       const eyeGroup = new THREE.Group();
-      eyeGroup.position.set(side * 0.041, 0.125, -0.107);
+      eyeGroup.position.set(side * 0.039, 0.125, -0.104);
       eyeGroup.rotation.y = side * -0.22;
 
       const sclera = new THREE.Mesh(scleraGeo, scleraMat);
-      sclera.scale.set(1.04, 0.88, 0.62);
+      sclera.scale.set(1.08, 0.78, 0.36);
       eyeGroup.add(sclera);
 
-      const iris = new THREE.Mesh(irisGeo, irisMat);
-      iris.position.set(-side * 0.001, -0.001, -0.0085);
-      iris.scale.set(1.0, 1.04, 0.60);
+      const iris = new THREE.Mesh(irisGeo, this.irisMat);
+      iris.position.set(-side * 0.001, -0.0005, -0.0045);
+      iris.scale.set(1.0, 1.02, 0.36);
       eyeGroup.add(iris);
 
       const pupil = new THREE.Mesh(pupilGeo, pupilMat);
-      pupil.position.set(-side * 0.001, -0.001, -0.013);
-      pupil.scale.set(1, 1, 0.55);
+      pupil.position.set(-side * 0.001, -0.0005, -0.0074);
+      pupil.scale.set(1, 1, 0.34);
       eyeGroup.add(pupil);
 
       const glintMain = new THREE.Mesh(glintGeo, glintMat);
-      glintMain.position.set(0.0045, 0.0045, -0.0165);
+      glintMain.position.set(0.0042, 0.0042, -0.0094);
       eyeGroup.add(glintMain);
 
       const glintSub = new THREE.Mesh(glintGeo, glintMat);
-      glintSub.scale.setScalar(0.55);
-      glintSub.position.set(-0.004, -0.004, -0.016);
+      glintSub.scale.setScalar(0.5);
+      glintSub.position.set(-0.0038, -0.0038, -0.0092);
       eyeGroup.add(glintSub);
 
       const upperLash = new THREE.Mesh(lashGeo, lashMat);
-      upperLash.rotation.z = Math.PI * 0.09;
-      upperLash.position.set(0, 0.002, -0.006);
+      upperLash.rotation.z = Math.PI / 2 + side * -0.08;
+      upperLash.position.set(0, 0.013, -0.0035);
       eyeGroup.add(upperLash);
 
       this.facialGroup.add(eyeGroup);
 
       const brow = new THREE.Mesh(browGeo, this.hairMat);
-      brow.position.set(side * 0.042, 0.155, -0.113);
-      brow.rotation.z = Math.PI / 2 + side * -0.14;
+      brow.position.set(side * 0.040, 0.151, -0.108);
+      brow.rotation.z = Math.PI / 2 + side * -0.16;
       brow.rotation.y = side * -0.22;
       this.facialGroup.add(brow);
-
-      const blush = new THREE.Mesh(cheekGeo, blushMat);
-      blush.position.set(side * 0.059, 0.088, -0.096);
-      blush.scale.set(1.05, 0.58, 0.35);
-      blush.rotation.y = side * -0.38;
-      this.facialGroup.add(blush);
     }
 
-    const smileGeo = new THREE.TorusGeometry(0.019, 0.0040, 6, 14, Math.PI * 0.78);
-    smileGeo.rotateZ(Math.PI + Math.PI * 0.11);
+    const smileCurve = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(-0.019, 0.058, -0.095),
+      new THREE.Vector3(-0.007, 0.052, -0.101),
+      new THREE.Vector3(0.008, 0.053, -0.101),
+      new THREE.Vector3(0.021, 0.060, -0.094),
+    ]);
+    const smileGeo = new THREE.TubeGeometry(smileCurve, 10, 0.0026, 6, false);
     const smile = new THREE.Mesh(smileGeo, lipMat);
-    smile.position.set(0, 0.052, -0.106);
-    smile.rotation.x = 0.20;
     this.facialGroup.add(smile);
+  }
+
+  private buildStylizedHair(): void {
+    // Sleek layered cranium cap + tapered nape + swept geometric hair tufts (Head local y=0 -> world 1.32)
+    const hairCrownGeo = new THREE.SphereGeometry(0.114, 22, 14, 0, Math.PI * 2, 0, Math.PI * 0.56);
+    hairCrownGeo.scale(0.99, 0.96, 1.06);
+    hairCrownGeo.rotateX(0.42);
+    const hairCrown = new THREE.Mesh(hairCrownGeo, this.hairMat);
+    hairCrown.position.set(0, 0.168, 0.016);
+    this.hairGroup.add(hairCrown);
+
+    const hairBackGeo = createOrganicTube(
+      [
+        { cx: 0, cy: 0.045, cz: 0.064, rx: 0.066, rz: 0.038 },
+        { cx: 0, cy: 0.095, cz: 0.075, rx: 0.092, rz: 0.048 },
+        { cx: 0, cy: 0.152, cz: 0.070, rx: 0.102, rz: 0.052 },
+      ],
+      16,
+    );
+    this.hairGroup.add(new THREE.Mesh(hairBackGeo, this.hairMat));
+
+    for (const side of [-1, 1]) {
+      const sideburn = new THREE.Mesh(new THREE.CapsuleGeometry(0.013, 0.040, 4, 6), this.hairMat);
+      sideburn.position.set(side * 0.101, 0.145, -0.010);
+      sideburn.rotation.z = side * 0.12;
+      this.hairGroup.add(sideburn);
+    }
+
+    // Swept stylized spikes / front bangs (tapered elliptical cones, zero bulky hoses)
+    const tufts: Array<{ pos: [number, number, number]; rot: [number, number, number]; r: number; len: number; sx: number }> = [
+      { pos: [-0.028, 0.258, -0.048], rot: [-1.18, -0.18, 0.24], r: 0.036, len: 0.145, sx: 1.25 },
+      { pos: [0.032, 0.262, -0.040], rot: [-1.12, 0.22, -0.28], r: 0.034, len: 0.140, sx: 1.20 },
+      { pos: [0.002, 0.275, 0.008], rot: [-0.72, 0.06, -0.10], r: 0.040, len: 0.150, sx: 1.30 },
+      { pos: [-0.064, 0.232, -0.025], rot: [-0.95, -0.35, 0.52], r: 0.028, len: 0.118, sx: 1.15 },
+      { pos: [0.066, 0.232, -0.022], rot: [-0.92, 0.38, -0.50], r: 0.028, len: 0.115, sx: 1.15 },
+      { pos: [0.0, 0.242, 0.068], rot: [0.95, 0.0, 0.08], r: 0.036, len: 0.130, sx: 1.35 },
+      { pos: [-0.045, 0.228, 0.065], rot: [0.92, -0.24, 0.25], r: 0.030, len: 0.115, sx: 1.2 },
+      { pos: [0.045, 0.228, 0.065], rot: [0.92, 0.24, -0.25], r: 0.030, len: 0.115, sx: 1.2 },
+    ];
+    for (const tSpec of tufts) {
+      const tuft = new THREE.Mesh(new THREE.ConeGeometry(tSpec.r, tSpec.len, 6), this.hairMat);
+      tuft.position.set(...tSpec.pos);
+      tuft.rotation.set(...tSpec.rot);
+      tuft.scale.set(tSpec.sx, 1, 0.72);
+      this.hairGroup.add(tuft);
+    }
   }
 
   private createIdleClip(): THREE.AnimationClip {
@@ -1742,219 +1963,105 @@ export class LowPolyCharacter {
   }
 
   private createRunClip(): THREE.AnimationClip {
-    // True grounded-to-flight 8-phase athletic sprint cycle:
-    // t=0.000 Right mid-stance compression (LOWEST hips y=0.728)
-    // t=0.125 Right toe-off push & Left high knee drive (RISING y=0.785)
-    // t=0.250 Flight apex: Left knee high, Right trail leg back (HIGHEST y=0.842)
-    // t=0.375 Left heel strike descent (y=0.772)
-    // t=0.500 Left mid-stance compression (LOWEST hips y=0.728)
-    // t=0.625 Left toe-off push & Right high knee drive (RISING y=0.785)
-    // t=0.750 Flight apex: Right knee high, Left trail leg back (HIGHEST y=0.842)
-    // t=0.875 Right heel strike descent (y=0.772)
-    const t = [0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0];
+    // 24-sample exact periodic harmonic sprint cycle:
+    // Left and Right limbs are evaluated at exact PI phase offset (theta vs theta + PI),
+    // guaranteeing 100% left-right symmetry, seamless loop wrap (u=0 === u=1), and zero sharp corners.
+    const samples = 24;
+    const t: number[] = [];
+    const hipsPos: Array<[number, number, number]> = [];
+    const hipsRot: Array<[number, number, number]> = [];
+    const spineRot: Array<[number, number, number]> = [];
+    const chestRot: Array<[number, number, number]> = [];
+    const neckRot: Array<[number, number, number]> = [];
+    const headRot: Array<[number, number, number]> = [];
+
+    const lThighRot: Array<[number, number, number]> = [];
+    const lShinRot: Array<[number, number, number]> = [];
+    const lFootRot: Array<[number, number, number]> = [];
+    const rThighRot: Array<[number, number, number]> = [];
+    const rShinRot: Array<[number, number, number]> = [];
+    const rFootRot: Array<[number, number, number]> = [];
+
+    const lArmRot: Array<[number, number, number]> = [];
+    const lForearmRot: Array<[number, number, number]> = [];
+    const lHandRot: Array<[number, number, number]> = [];
+    const rArmRot: Array<[number, number, number]> = [];
+    const rForearmRot: Array<[number, number, number]> = [];
+    const rHandRot: Array<[number, number, number]> = [];
+
+    const evalThighX = (th: number) =>
+      0.16 + 0.86 * Math.sin(th) - 0.04 * Math.cos(th) + 0.05 * Math.sin(2 * th);
+    const evalShinX = (th: number) =>
+      -0.88 - 0.46 * Math.cos(th) + 0.18 * Math.sin(th) + 0.06 * Math.cos(2 * th) + 0.14 * Math.sin(2 * th);
+    const evalFootX = (th: number) =>
+      -0.04 - 0.14 * Math.cos(th) + 0.10 * Math.sin(th);
+    const evalArmX = (th: number) =>
+      0.04 - 1.02 * Math.sin(th) - 0.06 * Math.sin(2 * th);
+    const evalForearmX = (th: number) =>
+      1.18 - 0.40 * Math.sin(th);
+    const evalHandX = (th: number) =>
+      -0.18 * Math.sin(th);
+
+    for (let i = 0; i <= samples; i++) {
+      const u = i / samples;
+      t.push(u * this.runClipDuration);
+      const th = u * Math.PI * 2;
+      const thOpp = th + Math.PI;
+      const sinTh = Math.sin(th);
+      const cosTh = Math.cos(th);
+      const cos2Th = Math.cos(2 * th);
+
+      // Pelvis dips gently during mid-stance (u=0 & u=0.5, cos2Th=+1) and floats at flight apex (u=0.25 & u=0.75)
+      hipsPos.push([0.015 * cosTh, 0.778 - 0.028 * cos2Th, 0.002 * cos2Th]);
+      hipsRot.push([-0.06, 0.14 * sinTh, 0.032 * cosTh]);
+      spineRot.push([-0.15, -0.11 * sinTh, -0.018 * cosTh]);
+      chestRot.push([-0.11, -0.17 * sinTh, 0]);
+      neckRot.push([0.11, 0.10 * sinTh, 0]);
+      headRot.push([0.14, 0.16 * sinTh, 0]);
+
+      lThighRot.push([evalThighX(th), 0, -0.028]);
+      lShinRot.push([evalShinX(th), 0, 0]);
+      lFootRot.push([evalFootX(th), 0, 0]);
+
+      rThighRot.push([evalThighX(thOpp), 0, 0.028]);
+      rShinRot.push([evalShinX(thOpp), 0, 0]);
+      rFootRot.push([evalFootX(thOpp), 0, 0]);
+
+      lArmRot.push([evalArmX(th), 0.12 * -sinTh, -0.18 - 0.04 * sinTh]);
+      lForearmRot.push([evalForearmX(th), 0, 0]);
+      lHandRot.push([evalHandX(th), -0.14 * sinTh, -0.06]);
+
+      rArmRot.push([evalArmX(thOpp), -0.12 * -sinTh, 0.18 + 0.04 * -sinTh]);
+      rForearmRot.push([evalForearmX(thOpp), 0, 0]);
+      rHandRot.push([evalHandX(thOpp), 0.14 * sinTh, 0.06]);
+    }
+
+    const hipsTrack = new THREE.VectorKeyframeTrack(
+      'Hips.position',
+      t,
+      hipsPos.flatMap((v) => v),
+    );
+    hipsTrack.setInterpolation(THREE.InterpolateLinear);
+
     return new THREE.AnimationClip('run', this.runClipDuration, [
-      buildVecTrack('Hips.position', t, [
-        [0.014, 0.758, 0.004],
-        [0.009, 0.808, 0.0],
-        [0.000, 0.858, -0.004],
-        [-0.009, 0.794, 0.0],
-        [-0.014, 0.758, 0.004],
-        [-0.009, 0.808, 0.0],
-        [0.000, 0.858, -0.004],
-        [0.009, 0.794, 0.0],
-        [0.014, 0.758, 0.004],
-      ]),
-      buildQuatTrack('Hips.quaternion', t, [
-        [-0.06, 0.02, 0.04],
-        [-0.07, 0.13, 0.02],
-        [-0.06, 0.18, -0.02],
-        [-0.06, 0.08, -0.03],
-        [-0.06, -0.02, -0.04],
-        [-0.07, -0.13, -0.02],
-        [-0.06, -0.18, 0.02],
-        [-0.06, -0.08, 0.03],
-        [-0.06, 0.02, 0.04],
-      ]),
-      buildQuatTrack('Spine.quaternion', t, [
-        [-0.17, -0.03, -0.02],
-        [-0.18, -0.12, -0.01],
-        [-0.19, -0.16, 0.01],
-        [-0.18, -0.08, 0.02],
-        [-0.17, 0.03, 0.02],
-        [-0.18, 0.12, 0.01],
-        [-0.19, 0.16, -0.01],
-        [-0.18, 0.08, -0.02],
-        [-0.17, -0.03, -0.02],
-      ]),
-      buildQuatTrack('Chest.quaternion', t, [
-        [-0.12, -0.04, 0],
-        [-0.13, -0.15, 0],
-        [-0.14, -0.22, 0],
-        [-0.13, -0.10, 0],
-        [-0.12, 0.04, 0],
-        [-0.13, 0.15, 0],
-        [-0.14, 0.22, 0],
-        [-0.13, 0.10, 0],
-        [-0.12, -0.04, 0],
-      ]),
-      buildQuatTrack('Neck.quaternion', t, [
-        [0.13, 0.02, 0],
-        [0.14, 0.09, 0],
-        [0.15, 0.13, 0],
-        [0.14, 0.05, 0],
-        [0.13, -0.02, 0],
-        [0.14, -0.09, 0],
-        [0.15, -0.13, 0],
-        [0.14, -0.05, 0],
-        [0.13, 0.02, 0],
-      ]),
-      buildQuatTrack('Head.quaternion', t, [
-        [0.16, 0.04, 0],
-        [0.17, 0.15, 0],
-        [0.18, 0.21, 0],
-        [0.17, 0.09, 0],
-        [0.16, -0.04, 0],
-        [0.17, -0.15, 0],
-        [0.18, -0.21, 0],
-        [0.17, -0.09, 0],
-        [0.16, 0.04, 0],
-      ]),
-      // Left leg: swing through mid-stance (t=0) -> high knee drive (t=0.25) -> contact (t=0.375..0.5) -> toe-off (t=0.625) -> trail back (t=0.75)
-      buildQuatTrack('LeftThigh.quaternion', t, [
-        [0.24, 0, -0.03],
-        [1.12, 0, -0.03],
-        [1.24, 0, -0.03],
-        [0.72, 0, -0.03],
-        [0.18, 0, -0.03],
-        [-0.64, 0, -0.03],
-        [-0.92, 0, -0.03],
-        [-0.38, 0, -0.03],
-        [0.24, 0, -0.03],
-      ]),
-      buildQuatTrack('LeftShin.quaternion', t, [
-        [-1.72, 0, 0],
-        [-1.32, 0, 0],
-        [-0.78, 0, 0],
-        [-0.26, 0, 0],
-        [-0.38, 0, 0],
-        [-0.22, 0, 0],
-        [-1.38, 0, 0],
-        [-1.82, 0, 0],
-        [-1.72, 0, 0],
-      ]),
-      buildQuatTrack('LeftFoot.quaternion', t, [
-        [-0.22, 0, 0],
-        [0.18, 0, 0],
-        [0.24, 0, 0],
-        [0.14, 0, 0],
-        [0.18, 0, 0],
-        [-0.48, 0, 0],
-        [-0.36, 0, 0],
-        [-0.24, 0, 0],
-        [-0.22, 0, 0],
-      ]),
-      // Right leg (exact half-cycle offset from Left)
-      buildQuatTrack('RightThigh.quaternion', t, [
-        [0.18, 0, 0.03],
-        [-0.64, 0, 0.03],
-        [-0.92, 0, 0.03],
-        [-0.38, 0, 0.03],
-        [0.24, 0, 0.03],
-        [1.12, 0, 0.03],
-        [1.24, 0, 0.03],
-        [0.72, 0, 0.03],
-        [0.18, 0, 0.03],
-      ]),
-      buildQuatTrack('RightShin.quaternion', t, [
-        [-0.38, 0, 0],
-        [-0.22, 0, 0],
-        [-1.38, 0, 0],
-        [-1.82, 0, 0],
-        [-1.72, 0, 0],
-        [-1.32, 0, 0],
-        [-0.78, 0, 0],
-        [-0.26, 0, 0],
-        [-0.38, 0, 0],
-      ]),
-      buildQuatTrack('RightFoot.quaternion', t, [
-        [0.18, 0, 0],
-        [-0.48, 0, 0],
-        [-0.36, 0, 0],
-        [-0.24, 0, 0],
-        [-0.22, 0, 0],
-        [0.18, 0, 0],
-        [0.24, 0, 0],
-        [0.14, 0, 0],
-        [0.18, 0, 0],
-      ]),
-      // Left arm (opposes Left thigh: sweeps deep back at t=0.25, drives high forward at t=0.75)
-      buildQuatTrack('LeftArm.quaternion', t, [
-        [-0.12, 0.02, -0.18],
-        [-0.84, -0.06, -0.24],
-        [-1.14, -0.10, -0.26],
-        [-0.52, -0.04, -0.22],
-        [0.16, 0.06, -0.18],
-        [0.86, 0.14, -0.16],
-        [1.18, 0.18, -0.15],
-        [0.58, 0.10, -0.17],
-        [-0.12, 0.02, -0.18],
-      ]),
-      buildQuatTrack('LeftForearm.quaternion', t, [
-        [1.02, 0, 0],
-        [0.78, 0, 0],
-        [0.68, 0, 0],
-        [0.92, 0, 0],
-        [1.22, 0, 0],
-        [1.54, 0, 0],
-        [1.68, 0, 0],
-        [1.38, 0, 0],
-        [1.02, 0, 0],
-      ]),
-      buildQuatTrack('LeftHand.quaternion', t, [
-        [0.06, 0.04, -0.08],
-        [-0.20, -0.10, -0.16],
-        [-0.30, -0.16, -0.18],
-        [-0.08, -0.04, -0.10],
-        [0.14, 0.12, -0.04],
-        [0.28, 0.18, 0.06],
-        [0.34, 0.22, 0.10],
-        [0.18, 0.12, 0.02],
-        [0.06, 0.04, -0.08],
-      ]),
-      // Right arm (opposes Right thigh: drives high forward at t=0.25, sweeps deep back at t=0.75)
-      buildQuatTrack('RightArm.quaternion', t, [
-        [0.16, -0.06, 0.18],
-        [0.86, -0.14, 0.16],
-        [1.18, -0.18, 0.15],
-        [0.58, -0.10, 0.17],
-        [-0.12, -0.02, 0.18],
-        [-0.84, 0.06, 0.24],
-        [-1.14, 0.10, 0.26],
-        [-0.52, 0.04, 0.22],
-        [0.16, -0.06, 0.18],
-      ]),
-      buildQuatTrack('RightForearm.quaternion', t, [
-        [1.22, 0, 0],
-        [1.54, 0, 0],
-        [1.68, 0, 0],
-        [1.38, 0, 0],
-        [1.02, 0, 0],
-        [0.78, 0, 0],
-        [0.68, 0, 0],
-        [0.92, 0, 0],
-        [1.22, 0, 0],
-      ]),
-      buildQuatTrack('RightHand.quaternion', t, [
-        [0.14, -0.12, 0.04],
-        [0.28, -0.18, -0.06],
-        [0.34, -0.22, -0.10],
-        [0.18, -0.12, -0.02],
-        [0.06, -0.04, 0.08],
-        [-0.20, 0.10, 0.16],
-        [-0.30, 0.16, 0.18],
-        [-0.08, 0.04, 0.10],
-        [0.14, -0.12, 0.04],
-      ]),
+      hipsTrack,
+      buildQuatTrack('Hips.quaternion', t, hipsRot),
+      buildQuatTrack('Spine.quaternion', t, spineRot),
+      buildQuatTrack('Chest.quaternion', t, chestRot),
+      buildQuatTrack('Neck.quaternion', t, neckRot),
+      buildQuatTrack('Head.quaternion', t, headRot),
+      buildQuatTrack('LeftThigh.quaternion', t, lThighRot),
+      buildQuatTrack('LeftShin.quaternion', t, lShinRot),
+      buildQuatTrack('LeftFoot.quaternion', t, lFootRot),
+      buildQuatTrack('RightThigh.quaternion', t, rThighRot),
+      buildQuatTrack('RightShin.quaternion', t, rShinRot),
+      buildQuatTrack('RightFoot.quaternion', t, rFootRot),
+      buildQuatTrack('LeftArm.quaternion', t, lArmRot),
+      buildQuatTrack('LeftForearm.quaternion', t, lForearmRot),
+      buildQuatTrack('LeftHand.quaternion', t, lHandRot),
+      buildQuatTrack('RightArm.quaternion', t, rArmRot),
+      buildQuatTrack('RightForearm.quaternion', t, rForearmRot),
+      buildQuatTrack('RightHand.quaternion', t, rHandRot),
     ]);
   }
 
@@ -1963,81 +2070,81 @@ export class LowPolyCharacter {
     return new THREE.AnimationClip('jump', 0.65, [
       buildVecTrack('Hips.position', t, [
         [0, 0.78, 0],
-        [0, 0.85, 0],
         [0, 0.83, 0],
-        [0, 0.78, 0],
+        [0, 0.81, 0],
+        [0, 0.77, 0],
       ]),
       buildQuatTrack('Hips.quaternion', t, [
-        [-0.10, -0.06, 0],
-        [-0.08, -0.12, 0],
-        [-0.05, -0.08, 0],
-        [-0.08, -0.04, 0],
+        [-0.08, -0.05, 0],
+        [-0.07, -0.10, 0],
+        [-0.05, -0.07, 0],
+        [-0.07, -0.03, 0],
       ]),
       buildQuatTrack('Spine.quaternion', t, [
-        [-0.16, 0.04, 0],
-        [-0.08, -0.06, 0],
-        [-0.04, -0.04, 0],
+        [-0.14, 0.04, 0],
+        [-0.08, -0.05, 0],
+        [-0.04, -0.03, 0],
         [-0.12, 0.0, 0],
       ]),
       buildQuatTrack('Chest.quaternion', t, [
-        [-0.10, 0.06, 0],
-        [0.02, -0.10, 0],
-        [0.04, -0.08, 0],
+        [-0.10, 0.05, 0],
+        [0.02, -0.08, 0],
+        [0.03, -0.06, 0],
         [-0.08, 0.0, 0],
       ]),
       buildQuatTrack('Neck.quaternion', t, [
-        [0.12, 0, 0],
-        [0.04, 0.05, 0],
-        [0.02, 0.04, 0],
         [0.10, 0, 0],
+        [0.04, 0.04, 0],
+        [0.02, 0.03, 0],
+        [0.09, 0, 0],
       ]),
       buildQuatTrack('Head.quaternion', t, [
-        [0.14, -0.04, 0],
-        [0.05, 0.08, 0],
-        [0.02, 0.06, 0],
-        [0.12, 0, 0],
+        [0.12, -0.03, 0],
+        [0.05, 0.06, 0],
+        [0.02, 0.05, 0],
+        [0.10, 0, 0],
       ]),
       buildQuatTrack('LeftThigh.quaternion', t, [
-        [0.82, 0, -0.04],
-        [1.18, 0, -0.05],
-        [0.92, 0, -0.04],
-        [0.44, 0, -0.04],
+        [0.78, 0, -0.03],
+        [1.06, 0, -0.04],
+        [0.82, 0, -0.03],
+        [0.40, 0, -0.03],
       ]),
       buildQuatTrack('LeftShin.quaternion', t, [
-        [-1.16, 0, 0],
-        [-1.42, 0, 0],
-        [-1.22, 0, 0],
-        [-0.64, 0, 0],
+        [-1.08, 0, 0],
+        [-1.32, 0, 0],
+        [-1.06, 0, 0],
+        [-0.56, 0, 0],
       ]),
       buildQuatTrack('LeftFoot.quaternion', t, [
-        [0.16, 0, 0],
-        [0.24, 0, 0],
-        [0.18, 0, 0],
-        [0.12, 0, 0],
+        [0.14, 0, 0],
+        [0.20, 0, 0],
+        [0.14, 0, 0],
+        [0.10, 0, 0],
       ]),
       buildQuatTrack('RightThigh.quaternion', t, [
-        [-0.50, 0, 0.04],
-        [-0.44, 0, 0.05],
-        [-0.22, 0, 0.04],
-        [0.20, 0, 0.04],
+        [-0.44, 0, 0.03],
+        [-0.38, 0, 0.04],
+        [-0.16, 0, 0.03],
+        [0.18, 0, 0.03],
       ]),
       buildQuatTrack('RightShin.quaternion', t, [
+        [-0.78, 0, 0],
+        [-1.02, 0, 0],
         [-0.82, 0, 0],
-        [-1.14, 0, 0],
-        [-0.96, 0, 0],
-        [-0.48, 0, 0],
+        [-0.42, 0, 0],
       ]),
       buildQuatTrack('RightFoot.quaternion', t, [
-        [-0.34, 0, 0],
-        [-0.28, 0, 0],
-        [-0.14, 0, 0],
+        [-0.24, 0, 0],
+        [-0.20, 0, 0],
+        [-0.10, 0, 0],
         [0.06, 0, 0],
       ]),
       buildQuatTrack('LeftArm.quaternion', t, [
-        [-0.48, 0, -0.28],
-        [-0.86, -0.08, -0.44],
-        [-0.58, -0.06, -0.36],
-        [-0.22, 0, -0.24],
+        [-0.48, 0, -0.26],
+        [-0.84, -0.08, -0.40],
+        [-0.56, -0.06, -0.32],
+        [-0.20, 0, -0.22],
       ]),
       buildQuatTrack('LeftForearm.quaternion', t, [
         [0.88, 0, 0],
@@ -2047,15 +2154,15 @@ export class LowPolyCharacter {
       ]),
       buildQuatTrack('LeftHand.quaternion', t, [
         [-0.16, -0.08, -0.14],
-        [-0.26, -0.14, -0.22],
+        [-0.24, -0.12, -0.20],
         [-0.18, -0.10, -0.16],
         [0.08, 0, -0.08],
       ]),
       buildQuatTrack('RightArm.quaternion', t, [
-        [1.08, 0, 0.22],
-        [1.46, -0.10, 0.34],
-        [1.18, -0.08, 0.28],
-        [0.60, 0, 0.22],
+        [1.04, 0, 0.22],
+        [1.38, -0.10, 0.32],
+        [1.12, -0.08, 0.26],
+        [0.58, 0, 0.22],
       ]),
       buildQuatTrack('RightForearm.quaternion', t, [
         [1.02, 0, 0],
@@ -2065,7 +2172,7 @@ export class LowPolyCharacter {
       ]),
       buildQuatTrack('RightHand.quaternion', t, [
         [0.18, 0.08, 0.14],
-        [0.28, 0.16, 0.20],
+        [0.26, 0.14, 0.18],
         [0.20, 0.10, 0.14],
         [0.06, 0, 0.08],
       ]),
@@ -2171,19 +2278,73 @@ export class LowPolyCharacter {
   public applySkin(skin: CharacterSkin): void {
     this.currentSkin = skin;
     this.primaryMat.color.setHex(skin.primaryColor);
-    this.primaryMat.roughness = Math.max(0.46, skin.roughness);
-    this.primaryMat.metalness = Math.min(0.28, skin.metalness);
+    this.primaryMat.roughness = Math.max(0.42, skin.roughness);
+    this.primaryMat.metalness = Math.min(0.38, skin.metalness);
 
     this.secondaryMat.color.setHex(skin.secondaryColor);
-    this.secondaryMat.roughness = Math.min(0.88, skin.roughness + 0.25);
-    this.secondaryMat.metalness = Math.max(0.02, skin.metalness * 0.18);
+    this.secondaryMat.roughness = Math.min(0.86, skin.roughness + 0.22);
+    this.secondaryMat.metalness = Math.max(0.04, skin.metalness * 0.24);
 
     this.accentMat.color.setHex(skin.accentColor);
     this.visorMat.color.setHex(skin.visorColor);
     this.visorMat.emissive.setHex(skin.visorColor);
     this.visorMat.emissiveIntensity = skin.emissiveIntensity;
 
+    this.skinMat.color.setHex(skin.skinTone ?? 0xd99b72);
+    this.hairMat.color.setHex(skin.hairColor ?? 0x1b1512);
+    this.irisMat.color.setHex(skin.eyeColor ?? 0x3f2414);
+
     this.rebuildAccessory(skin);
+    this.normalizeAllSkinWeights();
+  }
+
+  /**
+   * Executes a bone-weight sanitization & normalization pass across all SkinnedMeshes
+   * on the active character rig, guaranteeing clean skinning weights for every skin.
+   */
+  public normalizeAllSkinWeights(): SkinWeightNormalizationStats {
+    const visited = new Set<THREE.SkinnedMesh>();
+    const total: SkinWeightNormalizationStats = {
+      vertexCount: 0,
+      maxBoneIndex: 0,
+      repairedCount: 0,
+      prunedInfluences: 0,
+      duplicateBonesCollapsed: 0,
+      maxWeightSumDeviationBefore: 0,
+      maxWeightSumDeviationAfter: 0,
+    };
+
+    const processSkinnedMesh = (mesh: THREE.SkinnedMesh) => {
+      if (visited.has(mesh)) return;
+      visited.add(mesh);
+      const boneCount = mesh.skeleton?.bones.length ?? this.skeleton.bones.length;
+      const stats = normalizeGeometrySkinWeights(mesh.geometry, boneCount);
+      mesh.normalizeSkinWeights();
+      total.vertexCount += stats.vertexCount;
+      total.maxBoneIndex = Math.max(total.maxBoneIndex, stats.maxBoneIndex);
+      total.repairedCount += stats.repairedCount;
+      total.prunedInfluences += stats.prunedInfluences;
+      total.duplicateBonesCollapsed += stats.duplicateBonesCollapsed;
+      total.maxWeightSumDeviationBefore = Math.max(
+        total.maxWeightSumDeviationBefore,
+        stats.maxWeightSumDeviationBefore,
+      );
+      total.maxWeightSumDeviationAfter = Math.max(
+        total.maxWeightSumDeviationAfter,
+        stats.maxWeightSumDeviationAfter,
+      );
+    };
+
+    for (const mesh of this.skinnedMeshes) {
+      processSkinnedMesh(mesh);
+    }
+    this.root.traverse((obj) => {
+      if (obj instanceof THREE.SkinnedMesh) {
+        processSkinnedMesh(obj);
+      }
+    });
+
+    return total;
   }
 
   public applyCosmetic(cosmeticId: SkinCosmeticId | null): void {
@@ -2539,98 +2700,457 @@ export class LowPolyCharacter {
 
       this.chestCosmeticGroup.add(chakkarPivot);
     }
+    this.syncShadowCasterHierarchy();
+  }
+
+  private makeArchetypeMat(params: THREE.MeshStandardMaterialParameters): THREE.MeshStandardMaterial {
+    const mat = new THREE.MeshStandardMaterial(params);
+    this.archetypeMaterials.push(mat);
+    return mat;
   }
 
   private rebuildAccessory(skin: CharacterSkin): void {
     this.disposeGroupChildren(this.chestAccessoryGroup, false);
     this.disposeGroupChildren(this.headAccessoryGroup, false);
+    this.disposeGroupChildren(this.hipsAccessoryGroup, false);
+    this.disposeGroupChildren(this.leftShinAccessoryGroup, false);
+    this.disposeGroupChildren(this.rightShinAccessoryGroup, false);
+    for (const mat of this.archetypeMaterials) {
+      mat.dispose();
+    }
+    this.archetypeMaterials.length = 0;
+
+    // Hide stylized hair crown when character wears a full helmet, turban, or ranger hood
+    const hidesHair =
+      skin.accessory === 'crest' ||
+      skin.accessory === 'shahi' ||
+      skin.accessory === 'fins' ||
+      skin.accessory === 'hood' ||
+      skin.accessory === 'halo';
+    this.hairGroup.visible = !hidesHair;
+
+    const addShinGuards = (mat: THREE.Material, accentTrim: THREE.Material) => {
+      const guardGeo = new THREE.CylinderGeometry(0.056, 0.044, 0.16, 10, 1, false, -Math.PI * 0.45, Math.PI * 0.9);
+      for (const grp of [this.leftShinAccessoryGroup, this.rightShinAccessoryGroup]) {
+        const guard = new THREE.Mesh(guardGeo, mat);
+        guard.position.set(0, -0.145, -0.022);
+        guard.rotation.y = Math.PI;
+        grp.add(guard);
+
+        const trim = new THREE.Mesh(new THREE.TorusGeometry(0.052, 0.008, 6, 12), accentTrim);
+        trim.rotation.x = Math.PI / 2;
+        trim.position.set(0, -0.08, 0);
+        grp.add(trim);
+      }
+    };
 
     if (skin.accessory === 'pack') {
-      const packGeo = new THREE.BoxGeometry(0.22, 0.27, 0.12);
-      const pack = new THREE.Mesh(packGeo, this.accentMat);
+      // Trailblazer: Athletic headband + trailing ribbons + courier parkour pack + draped hood
+      const band = new THREE.Mesh(new THREE.TorusGeometry(0.114, 0.015, 8, 22), this.accentMat);
+      band.rotation.x = Math.PI / 2 + 0.22;
+      band.scale.set(0.98, 1, 1.08);
+      band.position.set(0, 0.195, 0.006);
+      this.headAccessoryGroup.add(band);
+
+      const knot = new THREE.Mesh(new THREE.OctahedronGeometry(0.022, 0), this.visorMat);
+      knot.position.set(0, 0.175, 0.118);
+      this.headAccessoryGroup.add(knot);
+
+      for (const side of [-1, 1]) {
+        const tail = new THREE.Mesh(new THREE.ConeGeometry(0.018, 0.12, 4), this.accentMat);
+        tail.position.set(side * 0.032, 0.135, 0.155);
+        tail.rotation.set(-0.95, side * 0.25, side * -0.2);
+        this.headAccessoryGroup.add(tail);
+      }
+
+      const pack = new THREE.Mesh(new THREE.CapsuleGeometry(0.092, 0.14, 6, 12), this.accentMat);
+      pack.scale.set(1.1, 1.0, 0.62);
       pack.position.set(0, -0.02, 0.155);
       pack.castShadow = true;
       this.chestAccessoryGroup.add(pack);
 
-      const rollGeo = new THREE.CylinderGeometry(0.044, 0.044, 0.24, 10);
-      rollGeo.rotateZ(Math.PI / 2);
-      const roll = new THREE.Mesh(rollGeo, this.visorMat);
-      roll.position.set(0, 0.13, 0.155);
+      const roll = new THREE.Mesh(new THREE.CylinderGeometry(0.038, 0.038, 0.22, 12), this.secondaryMat);
+      roll.rotation.z = Math.PI / 2;
+      roll.position.set(0, 0.11, 0.155);
       this.chestAccessoryGroup.add(roll);
+
+      const beacon = new THREE.Mesh(new THREE.OctahedronGeometry(0.028, 0), this.visorMat);
+      beacon.position.set(0, 0.02, 0.215);
+      this.chestAccessoryGroup.add(beacon);
+
+      addShinGuards(this.secondaryMat, this.accentMat);
+    } else if (skin.accessory === 'basant') {
+      // Basant Flyer: Brass rooftop aviator goggles + Diamond Basant kite-glider + Charkhi string spool
+      const brassMat = this.makeArchetypeMat({ color: 0xfbbf24, roughness: 0.25, metalness: 0.82 });
+      const strap = new THREE.Mesh(new THREE.TorusGeometry(0.114, 0.013, 8, 22), this.secondaryMat);
+      strap.rotation.x = Math.PI / 2 + 0.18;
+      strap.position.set(0, 0.188, 0.005);
+      this.headAccessoryGroup.add(strap);
+
+      for (const side of [-1, 1]) {
+        const rim = new THREE.Mesh(new THREE.TorusGeometry(0.030, 0.007, 8, 14), brassMat);
+        rim.position.set(side * 0.042, 0.195, -0.106);
+        rim.rotation.y = side * -0.20;
+        this.headAccessoryGroup.add(rim);
+
+        const lens = new THREE.Mesh(new THREE.CircleGeometry(0.026, 12), this.visorMat);
+        lens.position.set(side * 0.042, 0.195, -0.110);
+        lens.rotation.y = Math.PI + side * -0.20;
+        this.headAccessoryGroup.add(lens);
+      }
+
+      // Charkhi kite-spool strapped on upper back
+      const spool = new THREE.Mesh(new THREE.CylinderGeometry(0.068, 0.068, 0.16, 14), brassMat);
+      spool.rotation.z = Math.PI / 2;
+      spool.position.set(0, 0.02, 0.16);
+      this.chestAccessoryGroup.add(spool);
+
+      const spoolThread = new THREE.Mesh(new THREE.CylinderGeometry(0.056, 0.056, 0.11, 12), this.visorMat);
+      spoolThread.rotation.z = Math.PI / 2;
+      spoolThread.position.set(0, 0.02, 0.16);
+      this.chestAccessoryGroup.add(spoolThread);
+
+      // Diamond Patang kite-wings
+      const kiteWingGeo = new THREE.OctahedronGeometry(0.18, 0);
+      kiteWingGeo.scale(1.25, 0.72, 0.10);
+      for (const side of [-1, 1]) {
+        const kite = new THREE.Mesh(kiteWingGeo, side < 0 ? this.primaryMat : this.secondaryMat);
+        kite.position.set(side * 0.24, 0.09, 0.155);
+        kite.rotation.set(0.22, side * -0.35, side * 0.28);
+        this.chestAccessoryGroup.add(kite);
+
+        const rib = new THREE.Mesh(new THREE.OctahedronGeometry(0.038, 0), this.visorMat);
+        rib.position.set(side * 0.38, 0.15, 0.21);
+        this.chestAccessoryGroup.add(rib);
+      }
+
+      // Flowing kite sash tails on hips
+      for (const side of [-1, 1]) {
+        const tail = new THREE.Mesh(new THREE.ConeGeometry(0.042, 0.26, 4), this.accentMat);
+        tail.position.set(side * 0.09, -0.10, 0.125);
+        tail.rotation.set(Math.PI * 0.72, 0, side * -0.18);
+        this.hipsAccessoryGroup.add(tail);
+      }
+      addShinGuards(this.secondaryMat, this.visorMat);
     } else if (skin.accessory === 'crest') {
-      const crystalGeo = new THREE.ConeGeometry(0.056, 0.21, 6);
-      const leftCrystal = new THREE.Mesh(crystalGeo, this.visorMat);
-      leftCrystal.position.set(-0.16, 0.17, 0.105);
-      leftCrystal.rotation.set(-0.35, 0, 0.45);
-      this.chestAccessoryGroup.add(leftCrystal);
+      // Glacier Scout: Aerodynamic Cryo-Helmet + Glowing Panoramic Visor + Ice Shoulder Crests
+      const helmGeo = new THREE.SphereGeometry(0.126, 20, 16);
+      helmGeo.scale(1.0, 1.06, 1.08);
+      const helm = new THREE.Mesh(helmGeo, this.primaryMat);
+      helm.position.set(0, 0.158, 0.005);
+      this.headAccessoryGroup.add(helm);
 
-      const rightCrystal = new THREE.Mesh(crystalGeo.clone(), this.visorMat);
-      rightCrystal.position.set(0.16, 0.17, 0.105);
-      rightCrystal.rotation.set(-0.35, 0, -0.45);
-      this.chestAccessoryGroup.add(rightCrystal);
+      const aeroFin = new THREE.Mesh(new THREE.ConeGeometry(0.036, 0.20, 5), this.accentMat);
+      aeroFin.position.set(0, 0.295, 0.03);
+      aeroFin.rotation.x = -0.65;
+      this.headAccessoryGroup.add(aeroFin);
 
-      const scarfGeo = new THREE.BoxGeometry(0.14, 0.065, 0.26);
-      const scarf = new THREE.Mesh(scarfGeo, this.primaryMat);
-      scarf.position.set(0, 0.13, 0.14);
-      scarf.rotation.x = 0.32;
-      this.chestAccessoryGroup.add(scarf);
+      const visor = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.124, 0.124, 0.068, 18, 1, true, Math.PI * 0.65, Math.PI * 0.70),
+        this.visorMat,
+      );
+      visor.position.set(0, 0.145, -0.008);
+      this.headAccessoryGroup.add(visor);
+
+      const crystalGeo = new THREE.ConeGeometry(0.054, 0.20, 6);
+      for (const side of [-1, 1]) {
+        const crystal = new THREE.Mesh(crystalGeo, this.visorMat);
+        crystal.position.set(side * 0.18, 0.15, 0.08);
+        crystal.rotation.set(-0.32, 0, side * -0.48);
+        this.chestAccessoryGroup.add(crystal);
+      }
+
+      const cryoPack = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.065, 0.24, 8), this.secondaryMat);
+      cryoPack.position.set(0, 0.02, 0.155);
+      this.chestAccessoryGroup.add(cryoPack);
+
+      addShinGuards(this.primaryMat, this.visorMat);
+    } else if (skin.accessory === 'shahi') {
+      // Shahi Falconer: Royal Badshahi Pagri Turban + Gold Kalgi Plume + Flowing Sherwani Coat Tails + Gold Bracers
+      const velvetMat = this.makeArchetypeMat({ color: 0x881337, roughness: 0.45, metalness: 0.22 });
+      const goldMat = this.makeArchetypeMat({
+        color: 0xfbbf24,
+        emissive: 0xd97706,
+        emissiveIntensity: 0.25,
+        roughness: 0.22,
+        metalness: 0.88,
+      });
+
+      const turbanBase = new THREE.Mesh(new THREE.TorusGeometry(0.112, 0.048, 10, 22), this.primaryMat);
+      turbanBase.rotation.x = Math.PI / 2 - 0.14;
+      turbanBase.position.set(0, 0.215, 0.010);
+      this.headAccessoryGroup.add(turbanBase);
+
+      const turbanFoldL = new THREE.Mesh(new THREE.TorusGeometry(0.098, 0.036, 8, 18), velvetMat);
+      turbanFoldL.rotation.set(Math.PI / 2 - 0.25, 0.25, 0.22);
+      turbanFoldL.position.set(-0.015, 0.245, 0.012);
+      this.headAccessoryGroup.add(turbanFoldL);
+
+      const turbanTop = new THREE.Mesh(new THREE.SphereGeometry(0.105, 16, 12), this.primaryMat);
+      turbanTop.scale.set(1.02, 0.72, 1.05);
+      turbanTop.position.set(0, 0.245, 0.012);
+      this.headAccessoryGroup.add(turbanTop);
+
+      const sarpech = new THREE.Mesh(new THREE.OctahedronGeometry(0.034, 0), goldMat);
+      sarpech.scale.set(0.85, 1.25, 0.45);
+      sarpech.position.set(0, 0.240, -0.132);
+      this.headAccessoryGroup.add(sarpech);
+
+      const jewel = new THREE.Mesh(new THREE.OctahedronGeometry(0.018, 0), this.visorMat);
+      jewel.position.set(0, 0.240, -0.146);
+      this.headAccessoryGroup.add(jewel);
+
+      const kalgiPlume = new THREE.Mesh(new THREE.ConeGeometry(0.028, 0.15, 5), this.accentMat);
+      kalgiPlume.position.set(0, 0.34, -0.095);
+      kalgiPlume.rotation.x = -0.35;
+      this.headAccessoryGroup.add(kalgiPlume);
+
+      for (const side of [-1, 1]) {
+        const epaulet = new THREE.Mesh(new THREE.CapsuleGeometry(0.032, 0.075, 4, 8), goldMat);
+        epaulet.rotation.z = side * 0.35;
+        epaulet.position.set(side * 0.17, 0.135, 0);
+        this.chestAccessoryGroup.add(epaulet);
+
+        // Flowing split royal coat tails (flared backward away from stride swing)
+        const coatTail = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.32, 0.024), this.primaryMat);
+        coatTail.position.set(side * 0.088, -0.14, 0.145);
+        coatTail.rotation.set(-0.26, side * 0.12, side * -0.08);
+        this.hipsAccessoryGroup.add(coatTail);
+
+        const tailTrim = new THREE.Mesh(new THREE.BoxGeometry(0.134, 0.030, 0.028), goldMat);
+        tailTrim.position.set(side * 0.088, -0.285, 0.184);
+        tailTrim.rotation.set(-0.26, side * 0.12, side * -0.08);
+        this.hipsAccessoryGroup.add(tailTrim);
+      }
+
+      const backMedallion = new THREE.Mesh(new THREE.TorusGeometry(0.068, 0.012, 6, 14), goldMat);
+      backMedallion.position.set(0, 0.03, 0.126);
+      this.chestAccessoryGroup.add(backMedallion);
+
+      addShinGuards(goldMat, velvetMat);
     } else if (skin.accessory === 'fins') {
-      const finGeo = new THREE.ConeGeometry(0.068, 0.30, 5);
-      const leftFin = new THREE.Mesh(finGeo, this.accentMat);
-      leftFin.position.set(-0.12, 0.02, 0.15);
-      leftFin.rotation.set(-0.55, 0, 0.24);
-      this.chestAccessoryGroup.add(leftFin);
+      // Solar Flare: Sunforged Aero-Helmet + Glowing Wrap Visor + Twin Turbine Jetpack
+      const darkAlloy = this.makeArchetypeMat({ color: 0x1e2230, roughness: 0.24, metalness: 0.82 });
+      const helm = new THREE.Mesh(new THREE.SphereGeometry(0.125, 20, 14), darkAlloy);
+      helm.scale.set(1.0, 1.04, 1.12);
+      helm.position.set(0, 0.158, 0.008);
+      this.headAccessoryGroup.add(helm);
 
-      const rightFin = new THREE.Mesh(finGeo.clone(), this.accentMat);
-      rightFin.position.set(0.12, 0.02, 0.15);
-      rightFin.rotation.set(-0.55, 0, -0.24);
-      this.chestAccessoryGroup.add(rightFin);
+      const visor = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.124, 0.122, 0.064, 18, 1, true, Math.PI * 0.62, Math.PI * 0.76),
+        this.visorMat,
+      );
+      visor.position.set(0, 0.142, -0.008);
+      this.headAccessoryGroup.add(visor);
 
-      const flameGeo = new THREE.OctahedronGeometry(0.050, 0);
-      const flameL = new THREE.Mesh(flameGeo, this.visorMat);
-      flameL.position.set(-0.12, -0.10, 0.22);
-      this.chestAccessoryGroup.add(flameL);
-      const flameR = new THREE.Mesh(flameGeo.clone(), this.visorMat);
-      flameR.position.set(0.12, -0.10, 0.22);
-      this.chestAccessoryGroup.add(flameR);
+      for (const side of [-1, 1]) {
+        const horn = new THREE.Mesh(new THREE.ConeGeometry(0.022, 0.12, 5), this.primaryMat);
+        horn.position.set(side * 0.095, 0.25, 0.02);
+        horn.rotation.set(-0.55, 0, side * -0.24);
+        this.headAccessoryGroup.add(horn);
+
+        const thrusterPod = new THREE.Mesh(new THREE.CylinderGeometry(0.052, 0.068, 0.24, 10), darkAlloy);
+        thrusterPod.position.set(side * 0.105, 0.02, 0.155);
+        thrusterPod.rotation.set(-0.28, 0, side * -0.14);
+        this.chestAccessoryGroup.add(thrusterPod);
+
+        const wingFin = new THREE.Mesh(new THREE.ConeGeometry(0.055, 0.24, 4), this.primaryMat);
+        wingFin.position.set(side * 0.19, 0.08, 0.16);
+        wingFin.rotation.set(-0.35, 0, side * -0.68);
+        this.chestAccessoryGroup.add(wingFin);
+
+        const plasma = new THREE.Mesh(new THREE.ConeGeometry(0.044, 0.14, 8), this.visorMat);
+        plasma.position.set(side * 0.115, -0.13, 0.20);
+        plasma.rotation.set(Math.PI - 0.28, 0, side * -0.14);
+        this.chestAccessoryGroup.add(plasma);
+      }
+      addShinGuards(darkAlloy, this.primaryMat);
     } else if (skin.accessory === 'hood') {
-      const hoodGeo = new THREE.ConeGeometry(0.14, 0.22, 8);
-      const hood = new THREE.Mesh(hoodGeo, this.primaryMat);
-      hood.position.set(0, 0.24, 0.08);
-      hood.rotation.x = -0.68;
-      this.headAccessoryGroup.add(hood);
+      // Moss Warden: Pointed Shalimar Ranger Cowl + Leaf Mantle + Flowing Forest Cape
+      const cowl = new THREE.Mesh(
+        new THREE.SphereGeometry(0.130, 18, 14, 0, Math.PI * 2, 0, Math.PI * 0.72),
+        this.primaryMat,
+      );
+      cowl.rotation.x = 0.55;
+      cowl.position.set(0, 0.165, 0.015);
+      this.headAccessoryGroup.add(cowl);
 
-      const capeGeo = new THREE.BoxGeometry(0.28, 0.38, 0.032);
-      const cape = new THREE.Mesh(capeGeo, this.secondaryMat);
-      cape.position.set(0, -0.05, 0.145);
-      cape.rotation.x = 0.24;
+      const hoodTip = new THREE.Mesh(new THREE.ConeGeometry(0.115, 0.20, 8), this.primaryMat);
+      hoodTip.position.set(0, 0.22, 0.095);
+      hoodTip.rotation.x = -0.85;
+      this.headAccessoryGroup.add(hoodTip);
+
+      const collar = new THREE.Mesh(new THREE.TorusGeometry(0.125, 0.032, 8, 16), this.secondaryMat);
+      collar.rotation.x = Math.PI / 2;
+      collar.position.set(0, 0.13, 0.02);
+      this.chestAccessoryGroup.add(collar);
+
+      for (const side of [-1, 1]) {
+        const leaf = new THREE.Mesh(new THREE.ConeGeometry(0.058, 0.16, 4), this.accentMat);
+        leaf.scale.set(1.2, 1.0, 0.35);
+        leaf.position.set(side * 0.175, 0.12, 0.02);
+        leaf.rotation.set(0, 0, side * -1.15);
+        this.chestAccessoryGroup.add(leaf);
+      }
+
+      const cape = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.42, 0.024), this.secondaryMat);
+      cape.position.set(0, -0.06, 0.185);
+      cape.rotation.x = -0.26;
       this.chestAccessoryGroup.add(cape);
-    } else if (skin.accessory === 'wings') {
-      const wingGeo = new THREE.BoxGeometry(0.36, 0.10, 0.034);
-      const wingL = new THREE.Mesh(wingGeo, this.visorMat);
-      wingL.position.set(-0.25, 0.06, 0.145);
-      wingL.rotation.set(0.2, -0.35, 0.32);
-      this.chestAccessoryGroup.add(wingL);
 
-      const wingR = new THREE.Mesh(wingGeo.clone(), this.visorMat);
-      wingR.position.set(0.25, 0.06, 0.145);
-      wingR.rotation.set(0.2, 0.35, -0.32);
-      this.chestAccessoryGroup.add(wingR);
+      const capeGem = new THREE.Mesh(new THREE.OctahedronGeometry(0.042, 0), this.visorMat);
+      capeGem.position.set(0, 0.09, 0.152);
+      this.chestAccessoryGroup.add(capeGem);
+
+      addShinGuards(this.secondaryMat, this.primaryMat);
+    } else if (skin.accessory === 'qawwal') {
+      // Cyber Qawwal: Neon AR Shades + Halo Headphones + Equalizer Spine Array
+      const goldMat = this.makeArchetypeMat({ color: 0xfbbf24, roughness: 0.22, metalness: 0.85 });
+
+      const visor = new THREE.Mesh(new THREE.BoxGeometry(0.155, 0.036, 0.032), this.visorMat);
+      visor.position.set(0, 0.126, -0.106);
+      this.headAccessoryGroup.add(visor);
+
+      const headband = new THREE.Mesh(
+        new THREE.TorusGeometry(0.128, 0.014, 8, 18, Math.PI),
+        goldMat,
+      );
+      headband.position.set(0, 0.155, 0.005);
+      this.headAccessoryGroup.add(headband);
+
+      for (const side of [-1, 1]) {
+        const earcup = new THREE.Mesh(new THREE.CylinderGeometry(0.044, 0.044, 0.028, 14), this.secondaryMat);
+        earcup.rotation.z = Math.PI / 2;
+        earcup.position.set(side * 0.126, 0.135, 0.005);
+        this.headAccessoryGroup.add(earcup);
+
+        const glowRing = new THREE.Mesh(new THREE.TorusGeometry(0.032, 0.007, 6, 14), this.visorMat);
+        glowRing.rotation.y = Math.PI / 2;
+        glowRing.position.set(side * 0.141, 0.135, 0.005);
+        this.headAccessoryGroup.add(glowRing);
+
+        const emitter = new THREE.Mesh(new THREE.OctahedronGeometry(0.048, 0), goldMat);
+        emitter.position.set(side * 0.19, 0.13, 0.02);
+        this.chestAccessoryGroup.add(emitter);
+      }
+
+      // Stepped glowing equalizer bars on back
+      for (let i = -2; i <= 2; i++) {
+        const h = 0.22 - Math.abs(i) * 0.042;
+        const bar = new THREE.Mesh(new THREE.CapsuleGeometry(0.014, h, 4, 8), i % 2 === 0 ? this.visorMat : goldMat);
+        bar.position.set(i * 0.044, 0.01, 0.145);
+        this.chestAccessoryGroup.add(bar);
+      }
+
+      addShinGuards(this.secondaryMat, this.visorMat);
+    } else if (skin.accessory === 'wings') {
+      // Neon Striker: Carbon Stealth Half-Mask + Glowing Optic Visor + Swept Energy Blade Wings
+      const mask = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.098, 0.072, 0.078, 14, 1, false, Math.PI * 0.62, Math.PI * 0.76),
+        this.secondaryMat,
+      );
+      mask.position.set(0, 0.068, -0.025);
+      this.headAccessoryGroup.add(mask);
+
+      const opticVisor = new THREE.Mesh(new THREE.BoxGeometry(0.145, 0.032, 0.026), this.visorMat);
+      opticVisor.position.set(0, 0.126, -0.106);
+      this.headAccessoryGroup.add(opticVisor);
+
+      for (const side of [-1, 1]) {
+        const wingBlade = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.088, 0.022), this.visorMat);
+        wingBlade.position.set(side * 0.25, 0.07, 0.145);
+        wingBlade.rotation.set(0.22, side * -0.35, side * 0.34);
+        this.chestAccessoryGroup.add(wingBlade);
+
+        const subBlade = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.056, 0.022), this.accentMat);
+        subBlade.position.set(side * 0.21, -0.03, 0.155);
+        subBlade.rotation.set(0.20, side * -0.28, side * 0.18);
+        this.chestAccessoryGroup.add(subBlade);
+      }
+      addShinGuards(this.secondaryMat, this.visorMat);
+    } else if (skin.accessory === 'stormrider') {
+      // Ravi Stormrider: High Storm Collar + Lightning Visor + Twin Tesla Shoulder Coils + Coat Tails
+      const stormVisor = new THREE.Mesh(new THREE.BoxGeometry(0.152, 0.034, 0.030), this.visorMat);
+      stormVisor.position.set(0, 0.126, -0.106);
+      this.headAccessoryGroup.add(stormVisor);
+
+      const boltCrest = new THREE.Mesh(new THREE.ConeGeometry(0.024, 0.11, 4), this.accentMat);
+      boltCrest.position.set(0, 0.22, -0.11);
+      boltCrest.rotation.x = -0.35;
+      this.headAccessoryGroup.add(boltCrest);
+
+      const highCollar = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.125, 0.115, 0.095, 16, 1, true, -Math.PI * 0.72, Math.PI * 1.44),
+        this.primaryMat,
+      );
+      highCollar.position.set(0, 0.145, 0.015);
+      this.chestAccessoryGroup.add(highCollar);
+
+      for (const side of [-1, 1]) {
+        const coil = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.042, 0.14, 10), this.secondaryMat);
+        coil.position.set(side * 0.18, 0.16, 0.06);
+        coil.rotation.set(-0.28, 0, side * -0.25);
+        this.chestAccessoryGroup.add(coil);
+
+        const arcRing = new THREE.Mesh(new THREE.TorusGeometry(0.052, 0.010, 6, 14), this.accentMat);
+        arcRing.position.set(side * 0.20, 0.21, 0.075);
+        arcRing.rotation.x = Math.PI / 2 - 0.28;
+        this.chestAccessoryGroup.add(arcRing);
+
+        const stormTail = new THREE.Mesh(new THREE.BoxGeometry(0.125, 0.30, 0.022), this.secondaryMat);
+        stormTail.position.set(side * 0.085, -0.13, 0.150);
+        stormTail.rotation.set(-0.28, side * 0.14, side * -0.08);
+        this.hipsAccessoryGroup.add(stormTail);
+      }
+      addShinGuards(this.secondaryMat, this.accentMat);
     } else if (skin.accessory === 'halo') {
-      const haloGeo = new THREE.TorusGeometry(0.175, 0.022, 8, 18);
-      haloGeo.rotateX(Math.PI / 2);
-      const halo = new THREE.Mesh(haloGeo, this.visorMat);
-      halo.position.set(0, 0.32, 0.01);
+      // Aether Knight: Winged Paladin Helm + Floating Solar Halo + Armored Pauldrons + Seraph Wings
+      const goldMat = this.makeArchetypeMat({
+        color: 0xfbbf24,
+        emissive: 0xf59e0b,
+        emissiveIntensity: 0.35,
+        roughness: 0.20,
+        metalness: 0.88,
+      });
+
+      const helm = new THREE.Mesh(new THREE.SphereGeometry(0.125, 20, 14), this.primaryMat);
+      helm.scale.set(1.0, 1.08, 1.08);
+      helm.position.set(0, 0.160, 0.006);
+      this.headAccessoryGroup.add(helm);
+
+      const slit = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.028, 0.028), this.visorMat);
+      slit.position.set(0, 0.135, -0.112);
+      this.headAccessoryGroup.add(slit);
+
+      const halo = new THREE.Mesh(new THREE.TorusGeometry(0.178, 0.020, 8, 20), goldMat);
+      halo.rotation.x = Math.PI / 2;
+      halo.position.set(0, 0.33, 0.01);
       this.headAccessoryGroup.add(halo);
 
-      const pauldronsGeo = new THREE.OctahedronGeometry(0.072, 0);
-      const pL = new THREE.Mesh(pauldronsGeo, this.accentMat);
-      pL.position.set(-0.20, 0.14, 0);
-      this.chestAccessoryGroup.add(pL);
-      const pR = new THREE.Mesh(pauldronsGeo.clone(), this.accentMat);
-      pR.position.set(0.20, 0.14, 0);
-      this.chestAccessoryGroup.add(pR);
+      for (const side of [-1, 1]) {
+        const helmWing = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.14, 0.08), goldMat);
+        helmWing.position.set(side * 0.132, 0.18, 0.01);
+        helmWing.rotation.set(-0.35, 0, side * -0.25);
+        this.headAccessoryGroup.add(helmWing);
+
+        const pauldron = new THREE.Mesh(new THREE.SphereGeometry(0.072, 12, 10), goldMat);
+        pauldron.scale.set(1.1, 0.72, 1.05);
+        pauldron.position.set(side * 0.195, 0.13, 0);
+        this.chestAccessoryGroup.add(pauldron);
+
+        const seraphUpper = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.095, 0.024), this.visorMat);
+        seraphUpper.position.set(side * 0.28, 0.09, 0.145);
+        seraphUpper.rotation.set(0.20, side * -0.32, side * 0.34);
+        this.chestAccessoryGroup.add(seraphUpper);
+
+        const seraphLower = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.068, 0.024), goldMat);
+        seraphLower.position.set(side * 0.22, -0.02, 0.155);
+        seraphLower.rotation.set(0.18, side * -0.24, side * 0.16);
+        this.chestAccessoryGroup.add(seraphLower);
+      }
+      addShinGuards(this.primaryMat, goldMat);
     } else if (skin.accessory === 'carnival') {
+      // Carnival Runner: Peacock Plume Crown + Truck-Art Pennants + Bazaar Lantern Gem
       const centerPlume = new THREE.Mesh(new THREE.ConeGeometry(0.046, 0.20, 5), this.visorMat);
       centerPlume.position.set(0, 0.30, -0.01);
       centerPlume.rotation.x = -0.18;
@@ -2655,7 +3175,9 @@ export class LowPolyCharacter {
       const lanternGem = new THREE.Mesh(new THREE.OctahedronGeometry(0.080, 0), this.visorMat);
       lanternGem.position.set(0, 0.05, 0.165);
       this.chestAccessoryGroup.add(lanternGem);
+      addShinGuards(this.secondaryMat, this.visorMat);
     }
+    this.syncShadowCasterHierarchy();
   }
 
   public updatePose(pose: RunnerPoseState, dt: number, groundHeightBelow: number): void {
@@ -2664,7 +3186,7 @@ export class LowPolyCharacter {
     const shadowScale = THREE.MathUtils.clamp(1 - heightAboveGround * 0.14, 0.35, 1.05);
     this.contactShadow.scale.setScalar(pose.isSliding ? shadowScale * 1.15 : shadowScale);
     (this.contactShadow.material as THREE.MeshBasicMaterial).opacity =
-      groundHeightBelow < -5 ? 0 : THREE.MathUtils.clamp(0.46 - heightAboveGround * 0.08, 0.1, 0.46);
+      groundHeightBelow < -5 ? 0 : THREE.MathUtils.clamp(0.28 - heightAboveGround * 0.05, 0.06, 0.28);
 
     this.vfxTime += dt;
 
@@ -3205,9 +3727,14 @@ export class LowPolyCharacter {
         state.smoothedNormal.copy(sample.normal);
         state.hasGroundSample = true;
       } else {
-        const yRate = pose.isGrounded ? 36 : 24;
-        state.smoothedGroundY = THREE.MathUtils.damp(state.smoothedGroundY, sample.groundY, yRate, dt);
-        const nAlpha = 1 - Math.exp(-18 * dt);
+        // Track continuous ramps/decks immediately (zero lag); only smooth sharp deck-edge step drops
+        const deltaY = sample.groundY - state.smoothedGroundY;
+        if (Math.abs(deltaY) < 0.18 || !pose.isGrounded) {
+          state.smoothedGroundY = sample.groundY;
+        } else {
+          state.smoothedGroundY = THREE.MathUtils.damp(state.smoothedGroundY, sample.groundY, 48, dt);
+        }
+        const nAlpha = 1 - Math.exp(-26 * dt);
         state.smoothedNormal.lerp(sample.normal, nAlpha).normalize();
       }
     } else {
@@ -3215,9 +3742,8 @@ export class LowPolyCharacter {
       state.smoothedNormal.set(0, 1, 0);
     }
 
-    // Account for natural heel-strike / toe-off sole pitch clearance when not flat-aligned
     _legEulerScratch.setFromQuaternion(footRigQuatFk, 'XYZ');
-    const rawPitchMargin = Math.min(0.032, Math.sin(Math.min(1.1, Math.abs(_legEulerScratch.x))) * 0.038);
+    const rawPitchMargin = Math.min(0.022, Math.sin(Math.min(0.9, Math.abs(_legEulerScratch.x))) * 0.026);
     const pitchMargin = rawPitchMargin * (1 - state.alignWeight * 0.85);
     const worldSoleHeight = (this.footSoleOffset + pitchMargin) * scaleY;
     const groundedAnkleWorldY = state.smoothedGroundY + worldSoleHeight;
@@ -3229,7 +3755,7 @@ export class LowPolyCharacter {
     let targetAlign = 0;
 
     if (pose.showcaseMode) {
-      // Idle showcase: lock both soles flush onto podium/ground with anti-slide pinning
+      // Stationary showcase podium: anti-slide XZ pin + flush floor lock
       if (valid) {
         if (!state.pinned) {
           state.pinned = true;
@@ -3246,118 +3772,74 @@ export class LowPolyCharacter {
       }
     } else if (pose.isSliding) {
       state.pinned = false;
-      state.pinWeight = THREE.MathUtils.damp(state.pinWeight, 0, 24, dt);
-      if (valid && clearance < 0.12) {
+      state.pinWeight = 0;
+      if (valid && clearance < 0.14) {
         const minSlideAnkleY = state.smoothedGroundY + (this.footSoleOffset + 0.015) * scaleY;
         if (ankleFkWorld.y < minSlideAnkleY) {
           outTargetWorld.y = minSlideAnkleY;
           targetIk = 1.0;
         } else {
-          targetIk = smoothstep01((0.12 - clearance) / 0.12) * 0.45;
+          targetIk = smoothstep01((0.14 - clearance) / 0.14) * 0.45;
         }
-        targetAlign = smoothstep01((0.12 - clearance) / 0.12) * 0.65;
+        targetAlign = smoothstep01((0.14 - clearance) / 0.14) * 0.65;
       }
     } else if (!pose.isGrounded) {
-      // Airborne jump / fall: prevent deck clipping + pre-landing reach & slope alignment
+      // Airborne jump / fall: prevent terrain clipping + gentle pre-landing anticipation
       state.pinned = false;
-      state.pinWeight = THREE.MathUtils.damp(state.pinWeight, 0, 20, dt);
+      state.pinWeight = 0;
       if (valid) {
-        if (clearance < 0.015) {
-          // Anti-clipping floor/ramp clamp even while ascending or crossing elevated edge
+        if (clearance < 0.01) {
           outTargetWorld.y = groundedAnkleWorldY;
           targetIk = 1.0;
-          targetAlign = 0.92;
-        } else if (pose.vy <= 1.5 && clearance < 0.78) {
-          // Pre-landing anticipation: extend toward terrain surface and align sole to slope
-          const approach = smoothstep01((0.78 - clearance) / 0.70);
-          const descBias = THREE.MathUtils.clamp((1.5 - pose.vy) / 8.0, 0.3, 1.0);
+          targetAlign = 0.88;
+        } else if (pose.vy <= 1.0 && clearance < 0.68) {
+          const approach = smoothstep01((0.68 - clearance) / 0.60);
+          const descBias = THREE.MathUtils.clamp((1.0 - pose.vy) / 8.0, 0.25, 1.0);
           const reach = approach * descBias;
-          outTargetWorld.y = THREE.MathUtils.lerp(
-            ankleFkWorld.y,
-            groundedAnkleWorldY + clearance * 0.25,
-            reach * 0.72,
+          outTargetWorld.y = Math.max(
+            groundedAnkleWorldY,
+            THREE.MathUtils.lerp(ankleFkWorld.y, groundedAnkleWorldY + clearance * 0.22, reach * 0.65),
           );
-          if (outTargetWorld.y < groundedAnkleWorldY) {
-            outTargetWorld.y = groundedAnkleWorldY;
-          }
-          targetIk = Math.min(1.0, reach * 0.95);
-          targetAlign = Math.min(1.0, reach);
+          targetIk = Math.min(0.92, reach * 0.88);
+          targetAlign = Math.min(0.95, reach);
         }
       }
     } else {
-      // Grounded running & landing compression
+      // Active high-speed running: preserve exact FK stride XZ (zero world-Z drag!)
+      // and smoothly snap/clamp vertical contact & terrain slope alignment.
+      state.pinned = false;
+      state.pinWeight = 0;
       if (valid) {
-        let stance = 1 - smoothstep01((clearance - 0.014) / 0.14);
-
-        // Immediately engage ground plant on touchdown / squash absorption so legs never float in jump pose
+        const stance = 1 - smoothstep01(clearance / 0.20);
         const landingBoost = Math.max(
-          this.footLandingTimer > 0 ? this.footLandingTimer / 0.26 : 0,
-          THREE.MathUtils.clamp((0.97 - pose.squashY) * 8.0, 0, 1),
+          this.footLandingTimer > 0 ? (this.footLandingTimer / 0.22) * 0.65 : 0,
+          THREE.MathUtils.clamp((0.97 - pose.squashY) * 6.0, 0, 0.7),
         );
-        if (landingBoost > 0.02) {
-          stance = Math.max(stance, landingBoost);
-        }
+        const effectiveStance = Math.min(1.0, Math.max(stance, landingBoost * (1 - smoothstep01(clearance / 0.32))));
 
-        // World-space contact pinning during stance to eliminate lateral/fore-aft sliding
-        if (stance > 0.52) {
-          if (!state.pinned) {
-            state.pinned = true;
-            state.pinWorldX = ankleFkWorld.x;
-            state.pinWorldZ = ankleFkWorld.z;
-          } else {
-            // Keep pin within natural stride reach around moving runner hip
-            const dx = state.pinWorldX - this.root.position.x;
-            const dz = state.pinWorldZ - this.root.position.z;
-            const maxLat = 0.28;
-            const maxForeAft = 0.48;
-            if (Math.abs(dx) > maxLat) {
-              state.pinWorldX = this.root.position.x + Math.sign(dx) * maxLat;
-            }
-            if (dz > maxForeAft) {
-              state.pinWorldZ = this.root.position.z + maxForeAft;
-            } else if (dz < -maxForeAft) {
-              state.pinWorldZ = this.root.position.z - maxForeAft;
-            }
-          }
-          state.pinWeight = THREE.MathUtils.damp(state.pinWeight, stance * 0.78, 22, dt);
-        } else {
-          if (stance < 0.24) {
-            state.pinned = false;
-          }
-          state.pinWeight = THREE.MathUtils.damp(state.pinWeight, 0, 26, dt);
-        }
+        outTargetWorld.y = Math.max(
+          groundedAnkleWorldY,
+          THREE.MathUtils.lerp(ankleFkWorld.y, groundedAnkleWorldY, effectiveStance),
+        );
 
-        if (state.pinWeight > 0.01) {
-          outTargetWorld.x = THREE.MathUtils.lerp(ankleFkWorld.x, state.pinWorldX, state.pinWeight);
-          outTargetWorld.z = THREE.MathUtils.lerp(ankleFkWorld.z, state.pinWorldZ, state.pinWeight);
-        }
-
-        outTargetWorld.y = THREE.MathUtils.lerp(ankleFkWorld.y, groundedAnkleWorldY, stance);
-        if (outTargetWorld.y < groundedAnkleWorldY) {
-          outTargetWorld.y = groundedAnkleWorldY;
-        }
-
-        targetIk = Math.max(stance, clearance < 0.03 ? 1.0 : 0);
-        targetAlign = Math.max(stance * 0.94, landingBoost);
-      } else {
-        state.pinned = false;
-        state.pinWeight = THREE.MathUtils.damp(state.pinWeight, 0, 22, dt);
+        // If ankle would penetrate terrain (e.g., steep uphill ramp), enforce full contact blend smoothly
+        const penetrationBlend = clearance < 0 ? THREE.MathUtils.clamp(-clearance / 0.04, 0, 1) : 0;
+        targetIk = Math.max(effectiveStance, penetrationBlend);
+        targetAlign = Math.max(stance * 0.94, landingBoost * 0.85);
       }
     }
 
-    const justLanded = pose.isGrounded && this.footLandingTimer > 0.20;
-    const ikDamp = targetIk > state.ikWeight ? 34 : 18;
-    const alignDamp = targetAlign > state.alignWeight ? 30 : 16;
-    state.ikWeight =
-      targetIk >= 0.98 || (justLanded && targetIk >= 0.85)
-        ? targetIk
-        : THREE.MathUtils.damp(state.ikWeight, targetIk, ikDamp, dt);
-    state.alignWeight =
-      justLanded && targetAlign >= 0.85
-        ? targetAlign
-        : THREE.MathUtils.damp(state.alignWeight, targetAlign, alignDamp, dt);
+    const ikDamp = targetIk > state.ikWeight ? 42 : 22;
+    const alignDamp = targetAlign > state.alignWeight ? 34 : 18;
+    state.ikWeight = THREE.MathUtils.damp(state.ikWeight, targetIk, ikDamp, dt);
+    state.alignWeight = THREE.MathUtils.damp(state.alignWeight, targetAlign, alignDamp, dt);
 
-    // Estimate target ankle rig Y before pelvis adjustment
+    // Guarantee anti-penetration floor lock continuously without discontinuous pops
+    if (valid && !pose.isSliding && clearance < 0) {
+      const requiredWeight = smoothstep01(-clearance / 0.025);
+      state.ikWeight = Math.max(state.ikWeight, requiredWeight);
+    }
+
     const rigTargetY = (outTargetWorld.y - this.root.position.y) / Math.max(0.5, scaleY);
     const desiredAnkleRigY = THREE.MathUtils.lerp(ankleFkRig.y, rigTargetY, state.ikWeight);
     void hipRig;
@@ -3372,17 +3854,13 @@ export class LowPolyCharacter {
   private applyFootIKSystem(pose: RunnerPoseState, dt: number, groundHeightBelow: number): void {
     // Detect jump touchdown or teleport/reset
     if (!this.footIkWasGrounded && pose.isGrounded) {
-      this.footLandingTimer = 0.26;
-      this.leftFootIkState.pinned = false;
-      this.rightFootIkState.pinned = false;
-      this.leftFootIkState.pinWeight = 0;
-      this.rightFootIkState.pinWeight = 0;
+      this.footLandingTimer = 0.22;
     } else if (this.footLandingTimer > 0) {
       this.footLandingTimer = Math.max(0, this.footLandingTimer - dt);
     }
     this.footIkWasGrounded = pose.isGrounded;
 
-    if (Math.abs(this.root.position.z - this.lastFootIkRootZ) > 1.5) {
+    if (Math.abs(this.root.position.z - this.lastFootIkRootZ) > 2.5) {
       this.leftFootIkState.pinned = false;
       this.rightFootIkState.pinned = false;
       this.leftFootIkState.pinWeight = 0;
@@ -3456,52 +3934,38 @@ export class LowPolyCharacter {
       _legTargetWorldR,
     );
 
-    // Transform world foot targets into bodyRig space
     _legTargetRigL.copy(_legTargetWorldL).applyMatrix4(_legInvRig);
     _legTargetRigR.copy(_legTargetWorldR).applyMatrix4(_legInvRig);
 
-    // Pelvis (Hips) grounding compensation: drop hips when a stance foot sits lower
-    // (e.g., downhill ramp / landing absorption) so knees never lock straight or float
+    // Smooth pelvis grounding compensation on slopes/landings so stance knees never lock straight
     let targetPelvisDelta = 0;
-    let hardAntiFloatDrop = 0;
     if (!pose.isSliding) {
-      const maxReachL = (this.leftThighLen + this.leftShinLen) * 0.982;
-      const maxReachR = (this.rightThighLen + this.rightShinLen) * 0.982;
+      const maxReachL = (this.leftThighLen + this.leftShinLen) * 0.985;
+      const maxReachR = (this.rightThighLen + this.rightShinLen) * 0.985;
       let neededDrop = 0;
 
-      if (resL.ikWeight > 0.25) {
+      if (resL.ikWeight > 0.2) {
         const dL = _legHipRigL.distanceTo(_legTargetRigL);
         if (dL > maxReachL) {
-          const dropL = dL - maxReachL;
-          neededDrop = Math.max(neededDrop, dropL);
-          if (resL.ikWeight > 0.7) hardAntiFloatDrop = Math.max(hardAntiFloatDrop, dropL);
+          neededDrop = Math.max(neededDrop, (dL - maxReachL) * resL.ikWeight);
         }
       }
-      if (resR.ikWeight > 0.25) {
+      if (resR.ikWeight > 0.2) {
         const dR = _legHipRigR.distanceTo(_legTargetRigR);
         if (dR > maxReachR) {
-          const dropR = dR - maxReachR;
-          neededDrop = Math.max(neededDrop, dropR);
-          if (resR.ikWeight > 0.7) hardAntiFloatDrop = Math.max(hardAntiFloatDrop, dropR);
+          neededDrop = Math.max(neededDrop, (dR - maxReachR) * resR.ikWeight);
         }
       }
 
-      if (pose.isGrounded && !pose.showcaseMode) {
-        const impactDrop =
-          this.footLandingTimer > 0
-            ? (this.footLandingTimer / 0.26) * 0.055
-            : 0;
+      if (pose.isGrounded && !pose.showcaseMode && this.footLandingTimer > 0) {
+        const impactDrop = (this.footLandingTimer / 0.22) * 0.048;
         neededDrop = Math.max(neededDrop, impactDrop);
       }
 
-      targetPelvisDelta = -THREE.MathUtils.clamp(neededDrop, 0, 0.22);
+      targetPelvisDelta = -THREE.MathUtils.clamp(neededDrop, 0, 0.18);
     }
 
-    const dampedPelvis = THREE.MathUtils.damp(this.ikPelvisDeltaY, targetPelvisDelta, 24, dt);
-    this.ikPelvisDeltaY =
-      pose.isGrounded && hardAntiFloatDrop > 0
-        ? Math.min(dampedPelvis, -THREE.MathUtils.clamp(hardAntiFloatDrop, 0, 0.22))
-        : dampedPelvis;
+    this.ikPelvisDeltaY = THREE.MathUtils.damp(this.ikPelvisDeltaY, targetPelvisDelta, 28, dt);
     if (Math.abs(this.ikPelvisDeltaY) > 1e-4) {
       this.hipsBone.position.y += this.ikPelvisDeltaY;
       this.bodyRig.updateMatrixWorld(true);
@@ -3511,12 +3975,9 @@ export class LowPolyCharacter {
     const hasRightSolve = resR.ikWeight > 0.004 || resR.alignWeight > 0.004;
 
     if (hasLeftSolve || hasRightSolve) {
-      // Read updated Hips orientation in bodyRig space (parents LeftThigh & RightThigh)
       _legRigBoneMat.multiplyMatrices(_legInvRig, this.hipsBone.matrixWorld);
       _legRigBoneMat.decompose(_legHipsPosRig, _legHipsRigQ, _legHipsScaleRig);
       _legHipsRigQInv.copy(_legHipsRigQ).invert();
-
-      // Precompute normal matrix from world -> bodyRig space
       _legNormalMat3.setFromMatrix4(_legInvRig);
 
       if (hasLeftSolve) {
@@ -3722,16 +4183,13 @@ export class LowPolyCharacter {
     footBone.getWorldPosition(_dbgSolvedAnkleWorld);
     footBone.getWorldQuaternion(_dbgFootWorldQuat);
 
-    // 1. Wireframe octahedron at exact IK target point
     dbg.targetMarker.position.copy(targetWorld);
     const activePulse = 0.85 + ikWeight * 0.35;
     dbg.targetMarker.scale.setScalar(activePulse);
 
-    // 2. Wireframe box at solved world ankle position
     dbg.solvedAnkleBox.position.copy(_dbgSolvedAnkleWorld);
     dbg.solvedAnkleBox.quaternion.copy(_dbgFootWorldQuat);
 
-    // 3. Orient wireframe sole cage & ground reticle to sampled terrain slope normal
     const norm = state.hasGroundSample ? state.smoothedNormal : sample.normal;
     _dbgBasisY.copy(norm).normalize();
     if (_dbgBasisY.y < 0.2) _dbgBasisY.set(0, 1, 0);
@@ -3765,7 +4223,6 @@ export class LowPolyCharacter {
       dbg.groundRing.visible = false;
     }
 
-    // 4. World-space stance contact pin marker (shows anti-slide lock)
     if (state.pinned && state.pinWeight > 0.08 && sample.valid) {
       dbg.pinStake.visible = true;
       dbg.pinStake.position.set(state.pinWorldX, state.smoothedGroundY + 0.036, state.pinWorldZ);
@@ -3773,7 +4230,6 @@ export class LowPolyCharacter {
       dbg.pinStake.visible = false;
     }
 
-    // 5. Dynamic wireframe lines: FK->Target, Target->Ground, and Terrain Normal tick
     const lp = dbg.linePositions;
     lp[0] = ankleFkWorld.x;
     lp[1] = ankleFkWorld.y;
@@ -3831,7 +4287,6 @@ export class LowPolyCharacter {
     const L1 = isLeft ? this.leftThighLen : this.rightThighLen;
     const L2 = isLeft ? this.leftShinLen : this.rightShinLen;
 
-    // Blend ankle target smoothly between FK and terrain-locked target
     _legWorldPos.copy(ankleFkRig).lerp(targetRig, ikWeight);
 
     _legDirHA.subVectors(_legWorldPos, hipRig);
@@ -3859,13 +4314,13 @@ export class LowPolyCharacter {
     );
     const sinAngle = Math.sqrt(Math.max(0, 1 - cosAngle * cosAngle));
 
-    // Knee pole always biases forward (-Z) so the knee never hyperextends backward
-    _legPoleDir.subVectors(kneeFkRig, hipRig);
-    _legPoleDir.z -= 0.12;
-    _legPoleDir.x += sideSign * 0.025;
+    // Deterministic forward (-Z) knee pole blend so knees NEVER flip or twist backward
+    _legPoleDir.subVectors(kneeFkRig, hipRig).normalize();
+    _legPoleDir.z -= 0.72;
+    _legPoleDir.x += sideSign * 0.05;
     _legOrthoP.copy(_legPoleDir).addScaledVector(_legDirHA, -_legPoleDir.dot(_legDirHA));
-    if (_legOrthoP.lengthSq() < 1e-5) {
-      _legFallbackPole.set(sideSign * 0.08, 0, -1).normalize();
+    if (_legOrthoP.lengthSq() < 1e-5 || _legOrthoP.z > -0.10) {
+      _legFallbackPole.set(sideSign * 0.06, 0.22, -1).normalize();
       _legOrthoP.copy(_legFallbackPole).addScaledVector(_legDirHA, -_legFallbackPole.dot(_legDirHA));
     }
     _legOrthoP.normalize();
@@ -3896,9 +4351,6 @@ export class LowPolyCharacter {
     _legD2Local.copy(_legD2).applyQuaternion(_legQThighRigInv).normalize();
     _legQShinLocalIk.setFromUnitVectors(_legDownAxis, _legD2Local);
 
-    _legQShinRigIk.multiplyQuaternions(_legQThighRig, _legQShinLocalIk);
-    _legQShinRigIkInv.copy(_legQShinRigIk).invert();
-
     thighBone.quaternion.slerp(_legQThighLocalIk, ikWeight);
     shinBone.quaternion.slerp(_legQShinLocalIk, ikWeight);
 
@@ -3922,7 +4374,6 @@ export class LowPolyCharacter {
     _legQFootRigAligned.setFromRotationMatrix(_legBasisMat);
 
     _legQFootRigTarget.copy(footRigQuatFk).slerp(_legQFootRigAligned, alignWeight);
-    // Compute effective shin world/rig orientation after thigh+shin slerp so foot stays decoupled
     _legQThighRig.multiplyQuaternions(_legHipsRigQ, thighBone.quaternion);
     _legQShinRigIk.multiplyQuaternions(_legQThighRig, shinBone.quaternion);
     _legQShinRigIkInv.copy(_legQShinRigIk).invert();
@@ -3936,6 +4387,14 @@ export class LowPolyCharacter {
     this.disposeGroupChildren(this.headCosmeticGroup, true);
     this.disposeGroupChildren(this.chestAccessoryGroup, false);
     this.disposeGroupChildren(this.headAccessoryGroup, false);
+    this.disposeGroupChildren(this.hipsAccessoryGroup, false);
+    this.disposeGroupChildren(this.leftShinAccessoryGroup, false);
+    this.disposeGroupChildren(this.rightShinAccessoryGroup, false);
+    this.disposeGroupChildren(this.hairGroup, false);
+    for (const mat of this.archetypeMaterials) {
+      mat.dispose();
+    }
+    this.archetypeMaterials.length = 0;
 
     this.facialGroup.traverse((obj) => {
       if (obj instanceof THREE.Mesh) {
@@ -3947,7 +4406,8 @@ export class LowPolyCharacter {
           mat !== this.primaryMat &&
           mat !== this.secondaryMat &&
           mat !== this.accentMat &&
-          mat !== this.visorMat
+          mat !== this.visorMat &&
+          mat !== this.irisMat
         ) {
           if (Array.isArray(mat)) {
             mat.forEach((m) => m.dispose());
@@ -3969,7 +4429,7 @@ export class LowPolyCharacter {
       }
     });
 
-    this.fabricBumpTex.dispose();
+    this.fabricBumpTex?.dispose();
     this.primaryMat.dispose();
     this.secondaryMat.dispose();
     this.accentMat.dispose();
@@ -3977,6 +4437,7 @@ export class LowPolyCharacter {
     this.skinMat.dispose();
     this.hairMat.dispose();
     this.soleMat.dispose();
+    this.irisMat.dispose();
     (this.shieldBubble.material as THREE.Material).dispose();
     (this.shieldInnerShell.material as THREE.Material).dispose();
     (this.magnetRingA.material as THREE.Material).dispose();

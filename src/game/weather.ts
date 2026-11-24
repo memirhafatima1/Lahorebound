@@ -75,80 +75,328 @@ export const WEATHER_META: Record<WeatherCondition, WeatherMetadata> = {
   },
 };
 
+export interface LandmarkAtmosphereModifiers {
+  fogCompressionMul: number;
+  fogFarMul: number;
+  rainIntensityMul: number;
+  mistIntensityMul: number;
+  hazeIntensityMul: number;
+  wetnessFloor: number;
+  skyTintHex?: number;
+  fogTintHex?: number;
+  tintWeight: number;
+}
+
+export interface LandmarkGameplayModifiers {
+  speedMul: number;
+  jumpVelMul: number;
+  gravityMul: number;
+  slideDurationMul: number;
+  coyoteMul: number;
+  comboDecayRateMul: number;
+  scoreMul: number;
+  nearMissBonusMul: number;
+  passiveMagnetRadius: number;
+  laneSnapMul: number;
+}
+
+export interface LandmarkWeatherTrigger {
+  landmark: LahoreLandmarkKind;
+  condition: WeatherCondition;
+  weatherName: string;
+  modifierBadge: string;
+  modifierSummary: string;
+  accentHex: string;
+  atmosphere: LandmarkAtmosphereModifiers;
+  gameplay: LandmarkGameplayModifiers;
+}
+
+export const LANDMARK_WEATHER_TRIGGERS: Record<LahoreLandmarkKind, LandmarkWeatherTrigger> = {
+  gate: {
+    landmark: 'gate',
+    condition: 'sunny_haze',
+    weatherName: 'Sandstone Haze',
+    modifierBadge: 'TAILWIND · +10% PTS',
+    modifierSummary: 'Golden courtyard breeze grants +10% score & 15% longer combo hold',
+    accentHex: '#fbbf24',
+    atmosphere: {
+      fogCompressionMul: 1.08,
+      fogFarMul: 0.94,
+      rainIntensityMul: 1.0,
+      mistIntensityMul: 1.0,
+      hazeIntensityMul: 1.24,
+      wetnessFloor: 0,
+      skyTintHex: 0xf4a261,
+      fogTintHex: 0xf6c278,
+      tintWeight: 0.22,
+    },
+    gameplay: {
+      speedMul: 1.0,
+      jumpVelMul: 1.0,
+      gravityMul: 1.0,
+      slideDurationMul: 1.0,
+      coyoteMul: 1.0,
+      comboDecayRateMul: 0.85,
+      scoreMul: 1.1,
+      nearMissBonusMul: 1.0,
+      passiveMagnetRadius: 0,
+      laneSnapMul: 1.0,
+    },
+  },
+  bazaar: {
+    landmark: 'bazaar',
+    condition: 'sunny_haze',
+    weatherName: 'Lantern Heat',
+    modifierBadge: 'BAZAAR PULL · 3.6m MAGNET',
+    modifierSummary: 'Warm thermal drafts pull nearby gems (3.6m) & boost score +15%',
+    accentHex: '#f59e0b',
+    atmosphere: {
+      fogCompressionMul: 1.14,
+      fogFarMul: 0.9,
+      rainIntensityMul: 1.0,
+      mistIntensityMul: 1.0,
+      hazeIntensityMul: 1.38,
+      wetnessFloor: 0,
+      skyTintHex: 0xf59e0b,
+      fogTintHex: 0xfde08d,
+      tintWeight: 0.28,
+    },
+    gameplay: {
+      speedMul: 1.0,
+      jumpVelMul: 1.0,
+      gravityMul: 1.0,
+      slideDurationMul: 1.0,
+      coyoteMul: 1.0,
+      comboDecayRateMul: 0.92,
+      scoreMul: 1.15,
+      nearMissBonusMul: 1.1,
+      passiveMagnetRadius: 3.6,
+      laneSnapMul: 1.05,
+    },
+  },
+  mosque: {
+    landmark: 'mosque',
+    condition: 'mist',
+    weatherName: 'Fortress Fog',
+    modifierBadge: 'FORT FOG · +50% STYLE',
+    modifierSummary:
+      'Dense Lahore Fort fog calms pace (-10%), extends coyote time & awards +50% style bonus',
+    accentHex: '#cbd5e1',
+    atmosphere: {
+      fogCompressionMul: 1.56,
+      fogFarMul: 0.54,
+      rainIntensityMul: 1.0,
+      mistIntensityMul: 1.65,
+      hazeIntensityMul: 0.55,
+      wetnessFloor: 0.22,
+      skyTintHex: 0x94a3b8,
+      fogTintHex: 0xcbd5e1,
+      tintWeight: 0.42,
+    },
+    gameplay: {
+      speedMul: 0.9,
+      jumpVelMul: 1.0,
+      gravityMul: 1.0,
+      slideDurationMul: 1.0,
+      coyoteMul: 1.35,
+      comboDecayRateMul: 0.9,
+      scoreMul: 1.1,
+      nearMissBonusMul: 1.5,
+      passiveMagnetRadius: 0,
+      laneSnapMul: 1.0,
+    },
+  },
+  minar: {
+    landmark: 'minar',
+    condition: 'clear',
+    weatherName: 'Park Updraft',
+    modifierBadge: 'UPDRAFT · +8% JUMP LIFT',
+    modifierSummary: 'Clear Iqbal Park thermals lift jumps +8% higher with lighter hang-time',
+    accentHex: '#38bdf8',
+    atmosphere: {
+      fogCompressionMul: 0.86,
+      fogFarMul: 1.16,
+      rainIntensityMul: 0.85,
+      mistIntensityMul: 0.72,
+      hazeIntensityMul: 0.8,
+      wetnessFloor: 0,
+      skyTintHex: 0x38bdf8,
+      fogTintHex: 0xbaf2ef,
+      tintWeight: 0.16,
+    },
+    gameplay: {
+      speedMul: 1.02,
+      jumpVelMul: 1.08,
+      gravityMul: 0.9,
+      slideDurationMul: 1.0,
+      coyoteMul: 1.12,
+      comboDecayRateMul: 1.0,
+      scoreMul: 1.05,
+      nearMissBonusMul: 1.15,
+      passiveMagnetRadius: 0,
+      laneSnapMul: 1.05,
+    },
+  },
+  gardens: {
+    landmark: 'gardens',
+    condition: 'light_rain',
+    weatherName: 'Shalimar Rain',
+    modifierBadge: 'MONSOON SLICK · +35% SLIDE',
+    modifierSummary: 'Monsoon rain slicks Shalimar marble: +35% longer slides & +25% score yield',
+    accentHex: '#34d399',
+    atmosphere: {
+      fogCompressionMul: 1.28,
+      fogFarMul: 0.78,
+      rainIntensityMul: 1.48,
+      mistIntensityMul: 1.25,
+      hazeIntensityMul: 0.45,
+      wetnessFloor: 1.0,
+      skyTintHex: 0x3b82f6,
+      fogTintHex: 0x6ee7b7,
+      tintWeight: 0.34,
+    },
+    gameplay: {
+      speedMul: 1.0,
+      jumpVelMul: 1.0,
+      gravityMul: 1.0,
+      slideDurationMul: 1.35,
+      coyoteMul: 1.05,
+      comboDecayRateMul: 0.9,
+      scoreMul: 1.25,
+      nearMissBonusMul: 1.25,
+      passiveMagnetRadius: 0,
+      laneSnapMul: 1.08,
+    },
+  },
+  canal: {
+    landmark: 'canal',
+    condition: 'light_rain',
+    weatherName: 'Canal Shower',
+    modifierBadge: 'HYDRO SURGE · +8% PACE',
+    modifierSummary: 'Wet canal flyover boosts pace +8% & sharpens lane steering +18%',
+    accentHex: '#06b6d4',
+    atmosphere: {
+      fogCompressionMul: 1.2,
+      fogFarMul: 0.84,
+      rainIntensityMul: 1.32,
+      mistIntensityMul: 1.2,
+      hazeIntensityMul: 0.65,
+      wetnessFloor: 0.92,
+      skyTintHex: 0x0284c7,
+      fogTintHex: 0x38bdf8,
+      tintWeight: 0.3,
+    },
+    gameplay: {
+      speedMul: 1.08,
+      jumpVelMul: 1.0,
+      gravityMul: 1.0,
+      slideDurationMul: 1.15,
+      coyoteMul: 1.0,
+      comboDecayRateMul: 0.95,
+      scoreMul: 1.15,
+      nearMissBonusMul: 1.15,
+      passiveMagnetRadius: 0,
+      laneSnapMul: 1.18,
+    },
+  },
+  liberty: {
+    landmark: 'liberty',
+    condition: 'mist',
+    weatherName: 'Neon Mist',
+    modifierBadge: 'NEON MIST · +25% COMBO',
+    modifierSummary: 'Boulevard mist slows combo decay 30% & boosts combo/gem points +25%',
+    accentHex: '#f472b6',
+    atmosphere: {
+      fogCompressionMul: 1.24,
+      fogFarMul: 0.8,
+      rainIntensityMul: 1.0,
+      mistIntensityMul: 1.38,
+      hazeIntensityMul: 1.1,
+      wetnessFloor: 0.38,
+      skyTintHex: 0xa855f7,
+      fogTintHex: 0xf472b6,
+      tintWeight: 0.32,
+    },
+    gameplay: {
+      speedMul: 1.03,
+      jumpVelMul: 1.0,
+      gravityMul: 1.0,
+      slideDurationMul: 1.0,
+      coyoteMul: 1.1,
+      comboDecayRateMul: 0.7,
+      scoreMul: 1.25,
+      nearMissBonusMul: 1.2,
+      passiveMagnetRadius: 0,
+      laneSnapMul: 1.1,
+    },
+  },
+};
+
+export function getLandmarkWeatherTrigger(landmark: LahoreLandmarkKind): LandmarkWeatherTrigger {
+  return LANDMARK_WEATHER_TRIGGERS[landmark] ?? LANDMARK_WEATHER_TRIGGERS.gate;
+}
+
 interface WeightedWeatherOption {
   condition: WeatherCondition;
   weight: number;
 }
 
-// Weighted weather probabilities tailored to each Lahore landmark's micro-climate
+// Weighted weather probabilities synchronized with each landmark's signature trigger
 const LANDMARK_WEATHER_WEIGHTS: Record<LahoreLandmarkKind, WeightedWeatherOption[]> = {
   gate: [
-    { condition: 'sunny_haze', weight: 46 },
-    { condition: 'mist', weight: 28 },
-    { condition: 'light_rain', weight: 16 },
-    { condition: 'clear', weight: 10 },
+    { condition: 'sunny_haze', weight: 74 },
+    { condition: 'mist', weight: 14 },
+    { condition: 'light_rain', weight: 8 },
+    { condition: 'clear', weight: 4 },
   ],
   bazaar: [
-    { condition: 'sunny_haze', weight: 40 },
-    { condition: 'light_rain', weight: 32 },
-    { condition: 'mist', weight: 22 },
-    { condition: 'clear', weight: 6 },
+    { condition: 'sunny_haze', weight: 72 },
+    { condition: 'mist', weight: 14 },
+    { condition: 'light_rain', weight: 10 },
+    { condition: 'clear', weight: 4 },
   ],
   mosque: [
-    { condition: 'sunny_haze', weight: 42 },
-    { condition: 'mist', weight: 34 },
-    { condition: 'light_rain', weight: 16 },
-    { condition: 'clear', weight: 8 },
+    { condition: 'mist', weight: 78 },
+    { condition: 'sunny_haze', weight: 12 },
+    { condition: 'light_rain', weight: 6 },
+    { condition: 'clear', weight: 4 },
   ],
   minar: [
-    { condition: 'light_rain', weight: 38 },
-    { condition: 'mist', weight: 28 },
-    { condition: 'sunny_haze', weight: 22 },
-    { condition: 'clear', weight: 12 },
+    { condition: 'clear', weight: 72 },
+    { condition: 'mist', weight: 14 },
+    { condition: 'light_rain', weight: 8 },
+    { condition: 'sunny_haze', weight: 6 },
   ],
   gardens: [
-    { condition: 'mist', weight: 44 },
-    { condition: 'light_rain', weight: 34 },
-    { condition: 'sunny_haze', weight: 16 },
-    { condition: 'clear', weight: 6 },
+    { condition: 'light_rain', weight: 78 },
+    { condition: 'mist', weight: 14 },
+    { condition: 'clear', weight: 4 },
+    { condition: 'sunny_haze', weight: 4 },
   ],
   canal: [
-    { condition: 'light_rain', weight: 42 },
-    { condition: 'mist', weight: 40 },
-    { condition: 'sunny_haze', weight: 12 },
+    { condition: 'light_rain', weight: 74 },
+    { condition: 'mist', weight: 16 },
     { condition: 'clear', weight: 6 },
+    { condition: 'sunny_haze', weight: 4 },
   ],
   liberty: [
-    { condition: 'light_rain', weight: 36 },
-    { condition: 'sunny_haze', weight: 34 },
-    { condition: 'mist', weight: 22 },
-    { condition: 'clear', weight: 8 },
+    { condition: 'mist', weight: 74 },
+    { condition: 'light_rain', weight: 14 },
+    { condition: 'sunny_haze', weight: 8 },
+    { condition: 'clear', weight: 4 },
   ],
 };
 
 export function pickWeatherForLandmark(
   landmark: LahoreLandmarkKind,
-  previous?: WeatherCondition,
+  _previous?: WeatherCondition,
   avoidClear = false,
 ): WeatherCondition {
-  const baseOptions = LANDMARK_WEATHER_WEIGHTS[landmark] ?? LANDMARK_WEATHER_WEIGHTS.gate;
-  const options = baseOptions
-    .filter((opt) => !(avoidClear && opt.condition === 'clear'))
-    .map((opt) => ({
-      condition: opt.condition,
-      // Slightly reduce chance of repeating the exact previous weather so each landmark feels distinct
-      weight: previous && opt.condition === previous ? opt.weight * 0.35 : opt.weight,
-    }));
-
-  let totalWeight = 0;
-  for (const opt of options) totalWeight += opt.weight;
-
-  let roll = Math.random() * Math.max(0.001, totalWeight);
-  for (const opt of options) {
-    roll -= opt.weight;
-    if (roll <= 0) return opt.condition;
+  const trigger = getLandmarkWeatherTrigger(landmark);
+  if (avoidClear && trigger.condition === 'clear') {
+    return 'mist';
   }
-  return options[0]?.condition ?? 'sunny_haze';
+  return trigger.condition;
 }
 
 export interface LandmarkForecast {
@@ -158,27 +406,34 @@ export interface LandmarkForecast {
   shortLabel: string;
   accentHex: string;
   likelihoodPct: number;
+  triggerName: string;
+  modifierBadge: string;
+  modifierSummary: string;
 }
 
 export function getLandmarkForecast(landmark: LahoreLandmarkKind): LandmarkForecast {
+  const trigger = getLandmarkWeatherTrigger(landmark);
   const options = LANDMARK_WEATHER_WEIGHTS[landmark] ?? LANDMARK_WEATHER_WEIGHTS.gate;
   let totalWeight = 0;
-  let top = options[0];
+  let matchWeight = 0;
   for (const opt of options) {
     totalWeight += opt.weight;
-    if (opt.weight > top.weight) {
-      top = opt;
+    if (opt.condition === trigger.condition) {
+      matchWeight = opt.weight;
     }
   }
-  const meta = WEATHER_META[top.condition];
-  const likelihoodPct = Math.round((top.weight / Math.max(1, totalWeight)) * 100);
+  const meta = WEATHER_META[trigger.condition];
+  const likelihoodPct = Math.round((Math.max(1, matchWeight) / Math.max(1, totalWeight)) * 100);
   return {
     landmark,
-    condition: top.condition,
-    label: meta.label,
+    condition: trigger.condition,
+    label: trigger.weatherName,
     shortLabel: meta.shortLabel,
-    accentHex: meta.accentHex,
+    accentHex: trigger.accentHex,
     likelihoodPct,
+    triggerName: trigger.weatherName,
+    modifierBadge: trigger.modifierBadge,
+    modifierSummary: trigger.modifierSummary,
   };
 }
 
@@ -223,6 +478,8 @@ const _nightHazeFog = new THREE.Color(0x523124);
 
 const _tmpSkyTint = new THREE.Color();
 const _tmpFogTint = new THREE.Color();
+const _landmarkSkyColor = new THREE.Color(0xf4a261);
+const _landmarkFogColor = new THREE.Color(0xf6c278);
 
 function createSoftRadialTexture(
   innerRgba: string,
@@ -286,17 +543,26 @@ export class WeatherSystem {
   public readonly group = new THREE.Group();
 
   private activeCondition: WeatherCondition = 'sunny_haze';
+  private activeLandmark: LahoreLandmarkKind = 'gate';
   private rainStrength = 0;
   private mistStrength = 0;
   private hazeStrength = 0;
 
-  // Smoothed biome & velocity scaling state
+  // Smoothed biome, landmark atmosphere & velocity scaling state
   private biomeFogCompression = BIOME_WEATHER_PROFILES.canyon.fogCompression;
   private biomeFogTintBoost = BIOME_WEATHER_PROFILES.canyon.fogTintBoost;
   private biomeRainSpeedMul = BIOME_WEATHER_PROFILES.canyon.rainSpeedMul;
   private biomeRainDensityMul = BIOME_WEATHER_PROFILES.canyon.rainDensityMul;
   private biomeMistScaleMul = BIOME_WEATHER_PROFILES.canyon.mistScaleMul;
   private biomeHazeShimmerMul = BIOME_WEATHER_PROFILES.canyon.hazeShimmerMul;
+  private landmarkFogCompressMul = 1.08;
+  private landmarkFogFarMul = 0.94;
+  private landmarkRainMul = 1.0;
+  private landmarkMistMul = 1.0;
+  private landmarkHazeMul = 1.24;
+  private landmarkTintWeight = 0.22;
+  private readonly smoothedLandmarkSkyTint = new THREE.Color(0xf4a261);
+  private readonly smoothedLandmarkFogTint = new THREE.Color(0xf6c278);
   private speedIntensity = 0;
 
   // 1. Light Rain streaks + ground splashes
@@ -494,8 +760,16 @@ export class WeatherSystem {
     this.group.add(this.hazeGlowMesh);
   }
 
-  public setWeather(condition: WeatherCondition, immediate = false, biome?: BiomeId): void {
+  public setWeather(
+    condition: WeatherCondition,
+    immediate = false,
+    biome?: BiomeId,
+    landmark?: LahoreLandmarkKind,
+  ): void {
     this.activeCondition = condition;
+    if (landmark) {
+      this.activeLandmark = landmark;
+    }
     if (immediate) {
       this.rainStrength = condition === 'light_rain' ? 1 : 0;
       this.mistStrength = condition === 'mist' ? 1 : 0;
@@ -509,11 +783,28 @@ export class WeatherSystem {
         this.biomeMistScaleMul = bp.mistScaleMul;
         this.biomeHazeShimmerMul = bp.hazeShimmerMul;
       }
+      const trigger = getLandmarkWeatherTrigger(this.activeLandmark);
+      this.landmarkFogCompressMul = trigger.atmosphere.fogCompressionMul;
+      this.landmarkFogFarMul = trigger.atmosphere.fogFarMul;
+      this.landmarkRainMul = trigger.atmosphere.rainIntensityMul;
+      this.landmarkMistMul = trigger.atmosphere.mistIntensityMul;
+      this.landmarkHazeMul = trigger.atmosphere.hazeIntensityMul;
+      this.landmarkTintWeight = trigger.atmosphere.tintWeight;
+      if (trigger.atmosphere.skyTintHex !== undefined) {
+        this.smoothedLandmarkSkyTint.setHex(trigger.atmosphere.skyTintHex);
+      }
+      if (trigger.atmosphere.fogTintHex !== undefined) {
+        this.smoothedLandmarkFogTint.setHex(trigger.atmosphere.fogTintHex);
+      }
     }
   }
 
   public getWeather(): WeatherCondition {
     return this.activeCondition;
+  }
+
+  public getActiveLandmark(): LahoreLandmarkKind {
+    return this.activeLandmark;
   }
 
   public getWeatherMetadata(): WeatherMetadata {
@@ -544,7 +835,11 @@ export class WeatherSystem {
     simTime: number,
     biome: BiomeId = 'canyon',
     speedMultiplier = 1.0,
+    landmark?: LahoreLandmarkKind,
   ): void {
+    if (landmark) {
+      this.activeLandmark = landmark;
+    }
     const targetRain = this.activeCondition === 'light_rain' ? 1 : 0;
     const targetMist = this.activeCondition === 'mist' ? 1 : 0;
     const targetHaze = this.activeCondition === 'sunny_haze' ? 1 : 0;
@@ -561,26 +856,44 @@ export class WeatherSystem {
     this.biomeMistScaleMul = THREE.MathUtils.damp(this.biomeMistScaleMul, bp.mistScaleMul, 1.8, dt);
     this.biomeHazeShimmerMul = THREE.MathUtils.damp(this.biomeHazeShimmerMul, bp.hazeShimmerMul, 1.8, dt);
 
+    const trigger = getLandmarkWeatherTrigger(this.activeLandmark);
+    const atm = trigger.atmosphere;
+    this.landmarkFogCompressMul = THREE.MathUtils.damp(this.landmarkFogCompressMul, atm.fogCompressionMul, 1.9, dt);
+    this.landmarkFogFarMul = THREE.MathUtils.damp(this.landmarkFogFarMul, atm.fogFarMul, 1.9, dt);
+    this.landmarkRainMul = THREE.MathUtils.damp(this.landmarkRainMul, atm.rainIntensityMul, 1.9, dt);
+    this.landmarkMistMul = THREE.MathUtils.damp(this.landmarkMistMul, atm.mistIntensityMul, 1.9, dt);
+    this.landmarkHazeMul = THREE.MathUtils.damp(this.landmarkHazeMul, atm.hazeIntensityMul, 1.9, dt);
+    this.landmarkTintWeight = THREE.MathUtils.damp(this.landmarkTintWeight, atm.tintWeight, 1.9, dt);
+    const tintLerp = 1 - Math.exp(-2.1 * dt);
+    if (atm.skyTintHex !== undefined) {
+      _landmarkSkyColor.setHex(atm.skyTintHex);
+      this.smoothedLandmarkSkyTint.lerp(_landmarkSkyColor, tintLerp);
+    }
+    if (atm.fogTintHex !== undefined) {
+      _landmarkFogColor.setHex(atm.fogTintHex);
+      this.smoothedLandmarkFogTint.lerp(_landmarkFogColor, tintLerp);
+    }
+
     const targetSpeedIntensity = THREE.MathUtils.clamp((speedMultiplier - 1.0) / 2.0, 0, 1.35);
     this.speedIntensity = THREE.MathUtils.damp(this.speedIntensity, targetSpeedIntensity, 4.2, dt);
     const s = this.speedIntensity;
 
-    // 1. Update Light Rain Streaks & Ground Splashes (scaled by biome & velocity)
+    // 1. Update Light Rain Streaks & Ground Splashes (scaled by biome, landmark trigger & velocity)
     if (this.rainStrength > 0.015) {
       this.rainLines.visible = true;
       this.splashPoints.visible = true;
-      const rainSpeedFactor = this.biomeRainSpeedMul * (1 + s * 0.48);
-      const rainDensityFactor = this.biomeRainDensityMul;
+      const rainSpeedFactor = this.biomeRainSpeedMul * (0.9 + 0.14 * this.landmarkRainMul) * (1 + s * 0.48);
+      const rainDensityFactor = this.biomeRainDensityMul * this.landmarkRainMul;
       const windTiltX = 0.09 + s * 0.09 * rainDensityFactor;
       const windTiltZ = 0.04 + s * (0.28 + 0.16 * this.biomeRainSpeedMul);
       const streakStretch = 1 + s * 0.56 * this.biomeRainSpeedMul;
 
       this.rainMat.opacity = Math.min(
-        0.74,
+        0.82,
         this.rainStrength * rainDensityFactor * (0.44 + s * 0.18 - nightFactor * 0.06),
       );
       this.splashMat.opacity = Math.min(
-        0.65,
+        0.74,
         this.rainStrength * rainDensityFactor * (0.4 + s * 0.16),
       );
       this.splashMat.size = 0.55 + s * 0.12 * rainDensityFactor;
@@ -644,14 +957,14 @@ export class WeatherSystem {
       this.splashPoints.visible = false;
     }
 
-    // 2. Update Drifting Mist Wisps (scaled by biome humidity & forward velocity rush)
+    // 2. Update Drifting Mist Wisps (scaled by biome humidity, landmark fog & forward velocity rush)
     if (this.mistStrength > 0.015) {
       this.mistPoints.visible = true;
-      const mistMul = this.biomeMistScaleMul;
+      const mistMul = this.biomeMistScaleMul * this.landmarkMistMul;
       this.mistMat.size = 7.4 * (0.88 + 0.14 * mistMul + s * 0.16);
       this.mistMat.opacity = Math.min(
-        0.4,
-        this.mistStrength * mistMul * (nightFactor > 0.5 ? 0.19 : 0.27) * (1 + s * 0.24),
+        0.54,
+        this.mistStrength * mistMul * (nightFactor > 0.5 ? 0.22 : 0.3) * (1 + s * 0.24),
       );
       this.mistMat.color.setHex(nightFactor > 0.5 ? 0x64748b : 0xe2e8f0);
 
@@ -694,7 +1007,7 @@ export class WeatherSystem {
     if (this.hazeStrength > 0.015) {
       this.hazePoints.visible = true;
       this.hazeGlowMesh.visible = true;
-      const hazeMul = this.biomeHazeShimmerMul;
+      const hazeMul = this.biomeHazeShimmerMul * this.landmarkHazeMul;
       const sunWarmth = THREE.MathUtils.lerp(1.0, 0.42, nightFactor);
       this.hazeMat.size = 0.62 * (0.9 + 0.18 * hazeMul + s * 0.16);
       this.hazeMat.opacity = Math.min(
@@ -766,13 +1079,13 @@ export class WeatherSystem {
       this.mistStrength * 82 +
       this.hazeStrength * 116;
 
-    // Biome + speed dynamically compress fog slightly for richer regional atmosphere while preserving obstacle readability
+    // Biome + landmark trigger + speed dynamically shape atmospheric fog while preserving obstacle readability
     const biomeCompress = 1 + (this.biomeFogCompression - 1) * 0.65;
     const speedCompress = 1 + this.speedIntensity * (0.14 * this.biomeFogCompression);
-    const totalFogScale = 1 / Math.max(0.85, biomeCompress * speedCompress);
+    const totalFogScale = 1 / Math.max(0.75, biomeCompress * speedCompress * this.landmarkFogCompressMul);
 
-    out.fogNear = Math.max(13.5, baseFogNear * totalFogScale);
-    out.fogFar = Math.max(out.fogNear + 44, baseFogFar * totalFogScale);
+    out.fogNear = Math.max(9.5, baseFogNear * totalFogScale);
+    out.fogFar = Math.max(out.fogNear + 34, baseFogFar * totalFogScale * this.landmarkFogFarMul);
 
     // Combined sky/fog atmospheric tint
     out.skyTint.setRGB(0, 0, 0);
@@ -794,7 +1107,7 @@ export class WeatherSystem {
     if (this.mistStrength > 0.005) {
       _tmpSkyTint.copy(_dayMistSky).lerp(_nightMistSky, nightFactor);
       _tmpFogTint.copy(_dayMistFog).lerp(_nightMistFog, nightFactor);
-      const w = this.mistStrength * 0.52;
+      const w = this.mistStrength * (0.48 + 0.14 * this.landmarkMistMul);
       out.skyTint.r += _tmpSkyTint.r * w;
       out.skyTint.g += _tmpSkyTint.g * w;
       out.skyTint.b += _tmpSkyTint.b * w;
@@ -815,14 +1128,24 @@ export class WeatherSystem {
       out.fogTint.b += _tmpFogTint.b * w;
       totalTint += w;
     }
+    if (this.landmarkTintWeight > 0.005) {
+      const w = this.landmarkTintWeight * THREE.MathUtils.lerp(1.0, 0.55, nightFactor);
+      out.skyTint.r += this.smoothedLandmarkSkyTint.r * w;
+      out.skyTint.g += this.smoothedLandmarkSkyTint.g * w;
+      out.skyTint.b += this.smoothedLandmarkSkyTint.b * w;
+      out.fogTint.r += this.smoothedLandmarkFogTint.r * w;
+      out.fogTint.g += this.smoothedLandmarkFogTint.g * w;
+      out.fogTint.b += this.smoothedLandmarkFogTint.b * w;
+      totalTint += w;
+    }
 
     if (totalTint > 0.001) {
       out.skyTint.multiplyScalar(1 / totalTint);
       out.fogTint.multiplyScalar(1 / totalTint);
     }
     const tintScale = this.biomeFogTintBoost * (1 + this.speedIntensity * 0.14);
-    out.skyTintWeight = Math.min(0.72, totalTint * tintScale);
-    out.fogTintWeight = Math.min(0.82, totalTint * 1.15 * tintScale);
+    out.skyTintWeight = Math.min(0.76, totalTint * tintScale);
+    out.fogTintWeight = Math.min(0.86, totalTint * 1.15 * tintScale);
 
     out.sunIntensityMul =
       clearWeight * 1.0 +

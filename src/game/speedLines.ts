@@ -1,6 +1,38 @@
 import * as THREE from 'three';
 
-const SPEED_LINE_COUNT = 96;
+const SPEED_LINE_COUNT = 108;
+
+/**
+ * Computes continuous [0..1.15] peripheral speed-line intensity scaled smoothly
+ * from brisk cruising speeds (1.12x) through high-velocity Overdrive (3.0x+).
+ */
+export function computeSpeedLineIntensity(
+  speedMultiplier: number,
+  forwardSpeed: number,
+  chronosStrength: number,
+  sonicBreakIntensity = 0,
+): number {
+  const chronosDamp = THREE.MathUtils.clamp(1 - chronosStrength, 0, 1);
+  if (chronosDamp <= 0.001) return 0;
+
+  const effectiveMult = Math.max(speedMultiplier, forwardSpeed / 11.2);
+  if (effectiveMult < 1.12 && sonicBreakIntensity <= 0.004) return 0;
+
+  let rawIntensity = 0;
+  if (effectiveMult >= 1.12 && effectiveMult < 1.85) {
+    rawIntensity = THREE.MathUtils.lerp(0, 0.24, (effectiveMult - 1.12) / 0.73);
+  } else if (effectiveMult >= 1.85 && effectiveMult < 2.5) {
+    rawIntensity = THREE.MathUtils.lerp(0.24, 0.62, (effectiveMult - 1.85) / 0.65);
+  } else if (effectiveMult >= 2.5) {
+    rawIntensity = THREE.MathUtils.lerp(
+      0.62,
+      1.0,
+      THREE.MathUtils.clamp((effectiveMult - 2.5) / 0.85, 0, 1),
+    );
+  }
+  rawIntensity = Math.min(1.15, rawIntensity + sonicBreakIntensity * 0.22);
+  return rawIntensity * chronosDamp;
+}
 
 export class SpeedLinesEffect {
   public readonly mesh: THREE.Mesh;
@@ -54,8 +86,8 @@ export class SpeedLinesEffect {
       speeds[i] = 0.8 + Math.round(Math.random() * 13) * 0.05;
 
       // (length, NDC thickness)
-      scales[i * 2] = 0.24 + Math.random() * 0.26;
-      scales[i * 2 + 1] = 0.0065 + Math.random() * 0.0085;
+      scales[i * 2] = 0.24 + Math.random() * 0.28;
+      scales[i * 2 + 1] = 0.006 + Math.random() * 0.009;
 
       // (colorMix, radiusJitter)
       seeds[i * 2] = Math.random();
@@ -75,6 +107,7 @@ export class SpeedLinesEffect {
         uOverdrive: { value: 0 },
         uAspect: { value: Math.max(0.5, initialAspect) },
         uNight: { value: 0 },
+        uLandmarkColor: { value: new THREE.Color(0xf97316) },
       },
       vertexShader: `
         attribute float aAngle;
@@ -110,18 +143,18 @@ export class SpeedLinesEffect {
           float edgeDist = min(tx, ty);
 
           float rStart = min(edgeDist * 0.74, safeRadius + aSeed.y);
-          float rEnd = edgeDist + 0.36;
+          float rEnd = edgeDist + 0.38;
 
           float radialT = pow(life, 1.45);
           float tailR = mix(rStart, rEnd, radialT);
-          float streakLen = aScale.x * (0.38 + 1.15 * radialT) * (0.68 + 0.52 * uIntensity);
+          float streakLen = aScale.x * (0.42 + 1.25 * radialT) * (0.65 + 0.65 * uIntensity);
           float tipR = tailR + streakLen;
 
           // Aspect-corrected perpendicular vector so streaks keep uniform pixel thickness around 360 deg
           vec2 visDir = normalize(vec2(rayDir.x * uAspect, rayDir.y));
           vec2 perpNdc = vec2(-visDir.y / uAspect, visDir.x);
 
-          float width = aScale.y * (0.65 + 0.6 * radialT) * (0.78 + 0.34 * uIntensity);
+          float width = aScale.y * (0.65 + 0.68 * radialT) * (0.72 + 0.42 * uIntensity);
           vec2 ndcPos =
             centerNdc +
             rayDir * mix(tailR, tipR, position.x) +
@@ -134,37 +167,41 @@ export class SpeedLinesEffect {
         uniform float uIntensity;
         uniform float uOverdrive;
         uniform float uNight;
+        uniform vec3 uLandmarkColor;
 
         varying vec2 vUv;
         varying float vLife;
         varying float vColorMix;
 
         void main() {
-          // Aerodynamic needle profile: sharp leading tip, softly feathered trailing wake
-          float axialShape = smoothstep(0.0, 0.32, vUv.x) * (1.0 - smoothstep(0.68, 1.0, vUv.x));
+          // Motion-blur needle profile: bright fast-moving leading head + smeared exponential trailing wash
+          float leadingHead = smoothstep(0.0, 0.22, vUv.x) * (1.0 - smoothstep(0.62, 1.0, vUv.x));
+          float trailingBlur = exp(-max(0.0, 0.72 - vUv.x) * 3.4) * smoothstep(0.0, 0.08, vUv.x);
+          float axialShape = max(leadingHead, trailingBlur * 0.62);
+
           float distFromAxis = abs(vUv.y - 0.5) * 2.0;
-          float halfWidth = max(0.06, axialShape);
+          float halfWidth = max(0.07, axialShape);
           float crossProfile = 1.0 - smoothstep(0.0, halfWidth, distFromAxis);
           if (crossProfile <= 0.004) discard;
 
-          float core = pow(crossProfile, 2.5);
+          float core = pow(crossProfile, 2.35);
           float lifeFade = smoothstep(0.0, 0.16, vLife) * (1.0 - smoothstep(0.76, 1.0, vLife));
-          float alpha = (crossProfile * 0.48 + core * 0.52) * lifeFade * clamp(uIntensity, 0.0, 1.15) * 0.62;
-          alpha *= mix(0.9, 1.08, uNight);
+          float alpha = (crossProfile * 0.44 + core * 0.56) * lifeFade * clamp(uIntensity, 0.0, 1.15) * 0.64;
+          alpha *= mix(0.88, 1.1, uNight);
           if (alpha <= 0.003) discard;
 
-          // 2.5x-2.99x warm golden-cyan velocity streaks -> 3.0x+ supersonic violet-white streaks
-          vec3 cruiseA = vec3(1.0, 0.84, 0.38);
-          vec3 cruiseB = vec3(0.45, 0.90, 1.0);
-          vec3 superA = vec3(0.76, 0.38, 1.0);
-          vec3 superB = vec3(0.98, 0.52, 0.94);
+          // Blend active Lahore landmark accent with warm atmospheric gold-cyan -> 3.0x supersonic violet-white
+          vec3 cruiseA = mix(vec3(1.0, 0.86, 0.46), uLandmarkColor, 0.55);
+          vec3 cruiseB = mix(vec3(0.45, 0.90, 1.0), uLandmarkColor, 0.35);
+          vec3 superA = mix(vec3(0.76, 0.38, 1.0), uLandmarkColor, 0.28);
+          vec3 superB = vec3(0.98, 0.56, 0.96);
 
           vec3 baseColor = mix(
             mix(cruiseA, cruiseB, vColorMix),
             mix(superA, superB, vColorMix),
             uOverdrive
           );
-          vec3 streakColor = mix(baseColor, vec3(0.98, 0.99, 1.0), core * (0.48 + 0.28 * uOverdrive));
+          vec3 streakColor = mix(baseColor, vec3(0.98, 0.99, 1.0), core * (0.45 + 0.30 * uOverdrive));
 
           gl_FragColor = vec4(streakColor, alpha);
         }
@@ -193,23 +230,16 @@ export class SpeedLinesEffect {
     sonicBreakIntensity: number,
     nightFactor: number,
     timeScale = 1,
+    forwardSpeed = speedMultiplier * 11.2,
+    landmarkColor?: THREE.Color,
   ): void {
     const chronosDamp = THREE.MathUtils.clamp(1 - chronosStrength, 0, 1);
-
-    let rawIntensity = 0;
-    if (speedMultiplier > 2.5) {
-      if (speedMultiplier < 3.0) {
-        rawIntensity = THREE.MathUtils.lerp(0, 0.62, (speedMultiplier - 2.5) / 0.5);
-      } else {
-        rawIntensity = THREE.MathUtils.lerp(
-          0.62,
-          1.0,
-          THREE.MathUtils.clamp((speedMultiplier - 3.0) / 0.55, 0, 1),
-        );
-      }
-      rawIntensity = Math.min(1.15, rawIntensity + sonicBreakIntensity * 0.16);
-    }
-    const targetIntensity = rawIntensity * chronosDamp;
+    const targetIntensity = computeSpeedLineIntensity(
+      speedMultiplier,
+      forwardSpeed,
+      chronosStrength,
+      sonicBreakIntensity,
+    );
 
     const intensityLerpAlpha = Math.min(1, dt * (targetIntensity > this.intensity ? 5.2 : 6.8));
     this.intensity = THREE.MathUtils.lerp(this.intensity, targetIntensity, intensityLerpAlpha);
@@ -218,9 +248,9 @@ export class SpeedLinesEffect {
     }
 
     let rawOverdrive = 0;
-    if (speedMultiplier > 2.75) {
+    if (speedMultiplier > 2.05) {
       if (speedMultiplier < 3.0) {
-        rawOverdrive = THREE.MathUtils.lerp(0, 0.58, (speedMultiplier - 2.75) / 0.25);
+        rawOverdrive = THREE.MathUtils.lerp(0, 0.58, (speedMultiplier - 2.05) / 0.95);
       } else {
         rawOverdrive = THREE.MathUtils.lerp(
           0.58,
@@ -237,17 +267,25 @@ export class SpeedLinesEffect {
       Math.min(1, dt * 5.8),
     );
 
+    if (landmarkColor) {
+      (this.material.uniforms.uLandmarkColor.value as THREE.Color).copy(landmarkColor);
+    }
+
     this.mesh.visible = this.intensity > 0.004;
     if (!this.mesh.visible) return;
 
     const speedFactor =
-      1.95 + Math.max(0, speedMultiplier - 2.5) * 1.7 + this.overdrive * 0.75;
+      1.35 + Math.max(0, speedMultiplier - 1.12) * 1.45 + this.overdrive * 0.85;
     this.travel = (this.travel + dt * speedFactor * timeScale) % 1000;
 
     this.material.uniforms.uTravel.value = this.travel;
     this.material.uniforms.uIntensity.value = this.intensity;
     this.material.uniforms.uOverdrive.value = this.overdrive;
     this.material.uniforms.uNight.value = nightFactor;
+  }
+
+  public getIntensity(): number {
+    return this.intensity;
   }
 
   public reset(): void {
@@ -264,3 +302,4 @@ export class SpeedLinesEffect {
     this.material.dispose();
   }
 }
+

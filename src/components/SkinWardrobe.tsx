@@ -284,8 +284,8 @@ export const SkinWardrobe: React.FC<SkinWardrobeProps> = ({
               </div>
             </button>
 
-            {/* Horizontal Skin Swatch Strip */}
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+            {/* Runner Character Roster Grid */}
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 max-h-[28vh] overflow-y-auto pr-0.5">
               {CHARACTER_SKINS.map((skin) => {
                 const unlocked = unlockedSkinIds.includes(skin.id);
                 const selected = previewSkinId === skin.id;

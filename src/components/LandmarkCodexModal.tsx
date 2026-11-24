@@ -422,6 +422,12 @@ export const LandmarkCodexModal: React.FC<LandmarkCodexModalProps> = ({
                     />
                     <span>Ambient Overlay: {selectedAmbientProfile.summary}</span>
                   </div>
+                  <div className="text-[11px] font-semibold text-emerald-300/90 leading-snug">
+                    <span className="font-black uppercase tracking-wide text-white/95 mr-1.5">
+                      {selectedForecast.modifierBadge}
+                    </span>
+                    <span className="text-slate-300">· {selectedForecast.modifierSummary}</span>
+                  </div>
                 </>
               ) : (
                 <>
@@ -436,6 +442,12 @@ export const LandmarkCodexModal: React.FC<LandmarkCodexModalProps> = ({
                       color={selectedForecast.accentHex}
                     />
                     <span>Ambient Overlay: {selectedAmbientProfile.summary}</span>
+                  </div>
+                  <div className="text-[11px] font-semibold text-slate-400 leading-snug">
+                    <span className="font-black uppercase tracking-wide text-slate-200 mr-1.5">
+                      {selectedForecast.modifierBadge}
+                    </span>
+                    <span>· {selectedForecast.modifierSummary}</span>
                   </div>
                 </>
               )}

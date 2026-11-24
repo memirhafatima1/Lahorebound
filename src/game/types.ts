@@ -31,10 +31,14 @@ export type PowerupType = 'shield' | 'magnet' | 'multiplier' | 'chronos';
 
 export type SkinAccessory =
   | 'pack'
+  | 'basant'
   | 'crest'
+  | 'shahi'
   | 'fins'
   | 'hood'
+  | 'qawwal'
   | 'wings'
+  | 'stormrider'
   | 'halo'
   | 'carnival';
 
@@ -48,6 +52,9 @@ export interface CharacterSkin {
   secondaryColor: number;
   accentColor: number;
   visorColor: number;
+  skinTone?: number;
+  hairColor?: number;
+  eyeColor?: number;
   metalness: number;
   roughness: number;
   emissiveIntensity: number;
@@ -254,6 +261,8 @@ export interface HudSnapshot {
   weather: WeatherCondition;
   weatherLabel: string;
   weatherAccentHex: string;
+  weatherModifierLabel: string | null;
+  weatherModifierSummary: string | null;
   ambientOverlayLabel: string;
   timeOfDayLabel: string;
   timeOfDayHour: number;
