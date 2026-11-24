@@ -28,6 +28,15 @@ interface BiomeAmbientChannel {
   nodes: AudioNode[];
 }
 
+export interface AdaptiveVelocityParams {
+  phase: GamePhase;
+  speedMultiplier: number;
+  chronosStrength: number;
+  sonicBreakIntensity: number;
+  isGrounded: boolean;
+  isSliding: boolean;
+}
+
 export class GameAudio {
   private ctx: AudioContext | null = null;
   private muted = false;
@@ -40,6 +49,24 @@ export class GameAudio {
   private ambientDilationFilter: BiquadFilterNode | null = null;
   private speedBreezeGain: GainNode | null = null;
   private speedBreezeFilter: BiquadFilterNode | null = null;
+
+  // Adaptive velocity wind & mechanical whir synthesis layer
+  private velocityMasterGain: GainNode | null = null;
+  private windBodySrc: AudioBufferSourceNode | null = null;
+  private windBodyFilter: BiquadFilterNode | null = null;
+  private windBodyGain: GainNode | null = null;
+  private windShearSrc: AudioBufferSourceNode | null = null;
+  private windShearFilter: BiquadFilterNode | null = null;
+  private windShearGain: GainNode | null = null;
+  private whirMainOsc: OscillatorNode | null = null;
+  private whirHarmOsc: OscillatorNode | null = null;
+  private whirFormantFilter: BiquadFilterNode | null = null;
+  private whirLfoOsc: OscillatorNode | null = null;
+  private whirLfoDepth: GainNode | null = null;
+  private whirOutputGain: GainNode | null = null;
+  private velocitySources: AudioScheduledSourceNode[] = [];
+  private velocityNodes: AudioNode[] = [];
+
   private rainBedGain: GainNode | null = null;
   private rainBedSources: AudioScheduledSourceNode[] = [];
   private rainBedNodes: AudioNode[] = [];
@@ -51,6 +78,7 @@ export class GameAudio {
   private currentPhase: GamePhase = 'title';
   private accentCooldown = 1.6;
   private disposed = false;
+  private masterLimiter: DynamicsCompressorNode | null = null;
 
   // Dynamic voiceover state
   private preferredVoice: SpeechSynthesisVoice | null = null;
@@ -106,6 +134,12 @@ export class GameAudio {
       this.ambientMasterGain.gain.cancelScheduledValues(now);
       this.ambientMasterGain.gain.setTargetAtTime(target, now, 0.06);
     }
+    if (this.ctx && this.velocityMasterGain) {
+      const now = this.ctx.currentTime;
+      const velTarget = !muted && this.currentPhase === 'playing' ? 1.0 : 0;
+      this.velocityMasterGain.gain.cancelScheduledValues(now);
+      this.velocityMasterGain.gain.setTargetAtTime(velTarget, now, 0.06);
+    }
     if (!muted) {
       this.ensureCtx();
     }
@@ -117,6 +151,35 @@ export class GameAudio {
 
   public getContext(): AudioContext | null {
     return this.ctx;
+  }
+
+  private getOutputNode(ctx: AudioContext): AudioNode {
+    if (!this.masterLimiter) {
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -10;
+      comp.knee.value = 12;
+      comp.ratio.value = 6;
+      comp.attack.value = 0.003;
+      comp.release.value = 0.14;
+      comp.connect(ctx.destination);
+      this.masterLimiter = comp;
+    }
+    return this.masterLimiter;
+  }
+
+  public suspend(): void {
+    if (this.disposed) return;
+    this.stopVoiceover();
+    if (this.ctx && this.ctx.state === 'running') {
+      void this.ctx.suspend();
+    }
+  }
+
+  public resume(): void {
+    if (this.disposed || this.muted) return;
+    if (this.ctx && this.ctx.state === 'suspended') {
+      void this.ctx.resume();
+    }
   }
 
   private getPhaseAmbientLevel(phase: GamePhase): number {
@@ -144,8 +207,11 @@ export class GameAudio {
     if (this.ctx && this.ctx.state === 'suspended') {
       void this.ctx.resume();
     }
-    if (this.ctx && !this.ambientReady) {
-      this.initAmbientGraph(this.ctx);
+    if (this.ctx) {
+      this.getOutputNode(this.ctx);
+      if (!this.ambientReady) {
+        this.initAmbientGraph(this.ctx);
+      }
     }
     return this.ctx;
   }
@@ -244,11 +310,11 @@ export class GameAudio {
 
     if (this.muted || this.ctx.state !== 'running') return;
 
-    // Speed-responsive city wind layer (audible as pace builds during gameplay)
+    // Dynamic speed breeze routed through ambientMasterGain (kept subtle underneath dedicated velocity synth)
     if (this.speedBreezeGain && this.speedBreezeFilter) {
       const activeSpeed = phase === 'playing' ? Math.max(0, Math.min(1, speedRatio)) : 0;
-      const targetWindGain = activeSpeed > 0.08 ? activeSpeed * 0.045 : 0;
-      const targetWindFreq = 420 + activeSpeed * 980;
+      const targetWindGain = activeSpeed > 0.08 ? activeSpeed * 0.022 : 0;
+      const targetWindFreq = 420 + activeSpeed * 820;
       this.speedBreezeGain.gain.setTargetAtTime(targetWindGain, now, 0.18);
       this.speedBreezeFilter.frequency.setTargetAtTime(targetWindFreq, now, 0.18);
     }
@@ -260,6 +326,87 @@ export class GameAudio {
     if (this.accentCooldown <= 0) {
       this.triggerLandmarkAmbientClip(this.currentLandmark, false);
       this.accentCooldown = this.getLandmarkClipInterval(this.currentLandmark);
+    }
+  }
+
+  public updateAdaptiveVelocity(params: AdaptiveVelocityParams): void {
+    if (this.disposed || !this.ctx || !this.ambientReady || !this.velocityMasterGain) return;
+    const now = this.ctx.currentTime;
+
+    const isActive =
+      !this.muted && this.ctx.state === 'running' && params.phase === 'playing';
+    this.velocityMasterGain.gain.setTargetAtTime(isActive ? 1.0 : 0, now, isActive ? 0.09 : 0.14);
+    if (!isActive) return;
+
+    const speed = Math.max(1.0, params.speedMultiplier);
+    const normSpeed = Math.max(0, Math.min(1, (speed - 1.0) / 2.4)); // 1.0x -> 3.4x
+    const highSpeedCurve = Math.pow(normSpeed, 1.35);
+    const overdrivePush = Math.max(0, Math.min(1, (speed - 2.5) / 0.8)); // ramps across 2.5x -> 3.3x
+    const chronos = Math.max(0, Math.min(1, params.chronosStrength));
+    const sonic = Math.max(0, Math.min(1, params.sonicBreakIntensity));
+
+    // Chronos lowers perceived aerodynamic pitch & turbine RPM smoothly
+    const pitchTimeWarp = 1 - 0.36 * chronos;
+    const airborneBoost = params.isGrounded ? 0 : 0.16;
+    const slideAeroShift = params.isSliding ? 0.12 : 0;
+
+    // 1. Adaptive Ambient Wind Body (pitch-shifted pink-noise slipstream)
+    if (this.windBodySrc && this.windBodyFilter && this.windBodyGain) {
+      const targetRate = (0.76 + normSpeed * 1.12 + airborneBoost * 0.4) * pitchTimeWarp;
+      const targetFreq = (280 + highSpeedCurve * 1480 + sonic * 420) * (1 - 0.32 * chronos);
+      const targetQ = 0.72 + normSpeed * 0.58 + overdrivePush * 0.25;
+      const targetGain =
+        (0.012 + highSpeedCurve * 0.072 + airborneBoost * 0.018 + sonic * 0.024) *
+        (1 - 0.42 * chronos);
+
+      this.windBodySrc.playbackRate.setTargetAtTime(targetRate, now, 0.08);
+      this.windBodyFilter.frequency.setTargetAtTime(targetFreq, now, 0.08);
+      this.windBodyFilter.Q.setTargetAtTime(targetQ, now, 0.09);
+      this.windBodyGain.gain.setTargetAtTime(targetGain, now, 0.08);
+    }
+
+    // 2. High-Velocity Tunnel Shear Wind (>1.4x wake up, prominent at 2.5x–3.0x+)
+    if (this.windShearSrc && this.windShearFilter && this.windShearGain) {
+      const shearRamp = Math.max(0, Math.min(1, (speed - 1.4) / 1.8));
+      const targetShearRate = (0.95 + shearRamp * 1.2 + slideAeroShift * 0.5) * pitchTimeWarp;
+      const targetShearFreq = (1350 + shearRamp * 2850 + sonic * 750) * (1 - 0.28 * chronos);
+      const targetShearGain =
+        (Math.pow(shearRamp, 1.55) * 0.036 + overdrivePush * 0.014 + sonic * 0.022) *
+        (1 - 0.55 * chronos);
+
+      this.windShearSrc.playbackRate.setTargetAtTime(targetShearRate, now, 0.08);
+      this.windShearFilter.frequency.setTargetAtTime(targetShearFreq, now, 0.08);
+      this.windShearGain.gain.setTargetAtTime(targetShearGain, now, 0.08);
+    }
+
+    // 3. Adaptive Mechanical 'Whir' (detuned kinetic rotor + resonant formant + speed-synced RPM flutter)
+    if (
+      this.whirMainOsc &&
+      this.whirHarmOsc &&
+      this.whirFormantFilter &&
+      this.whirLfoOsc &&
+      this.whirLfoDepth &&
+      this.whirOutputGain
+    ) {
+      // Smooth continuous pitch climb from idle hum (66 Hz @ 1.0x) to supersonic turbine (315 Hz @ 3.4x)
+      const baseWhirFreq =
+        (66 + Math.pow(speed - 1.0, 1.18) * 92 + sonic * 26) * pitchTimeWarp;
+      const harmWhirFreq = baseWhirFreq * (1.504 + overdrivePush * 0.012);
+      const formantFreq = Math.min(3600, baseWhirFreq * (2.35 + normSpeed * 0.85));
+      const lfoRate = (7.2 + normSpeed * 18.5 + overdrivePush * 5.0) * pitchTimeWarp;
+      const lfoDepth = 0.16 + normSpeed * 0.18;
+
+      const whirActiveCurve = Math.max(0, Math.min(1, (speed - 1.08) / 2.1));
+      const targetWhirGain =
+        (0.003 + Math.pow(whirActiveCurve, 1.35) * 0.052 + overdrivePush * 0.012 + sonic * 0.018) *
+        (1 - 0.35 * chronos);
+
+      this.whirMainOsc.frequency.setTargetAtTime(baseWhirFreq, now, 0.075);
+      this.whirHarmOsc.frequency.setTargetAtTime(harmWhirFreq, now, 0.075);
+      this.whirFormantFilter.frequency.setTargetAtTime(formantFreq, now, 0.08);
+      this.whirLfoOsc.frequency.setTargetAtTime(lfoRate, now, 0.085);
+      this.whirLfoDepth.gain.setTargetAtTime(lfoDepth, now, 0.09);
+      this.whirOutputGain.gain.setTargetAtTime(targetWhirGain, now, 0.08);
     }
   }
 
@@ -329,7 +476,7 @@ export class GameAudio {
     dilationFilter.Q.value = 0.7;
 
     master.connect(dilationFilter);
-    dilationFilter.connect(ctx.destination);
+    dilationFilter.connect(this.getOutputNode(ctx));
     this.ambientMasterGain = master;
     this.ambientDilationFilter = dilationFilter;
 
@@ -356,6 +503,130 @@ export class GameAudio {
 
     this.speedBreezeFilter = breezeFilter;
     this.speedBreezeGain = breezeGain;
+
+    // --- Adaptive Velocity Audio Synthesis Layer (Wind + Mechanical Turbine Whir) ---
+    const velocityMaster = ctx.createGain();
+    velocityMaster.gain.setValueAtTime(0, now);
+    velocityMaster.connect(dilationFilter);
+    this.velocityMasterGain = velocityMaster;
+
+    // Wind Layer 1: Pitch-modulated aerodynamic body rush
+    const windBodySrc = ctx.createBufferSource();
+    windBodySrc.buffer = pinkBuf;
+    windBodySrc.loop = true;
+    windBodySrc.playbackRate.setValueAtTime(0.76, now);
+
+    const windBodyFilter = ctx.createBiquadFilter();
+    windBodyFilter.type = 'bandpass';
+    windBodyFilter.frequency.setValueAtTime(280, now);
+    windBodyFilter.Q.value = 0.72;
+
+    const windBodyGain = ctx.createGain();
+    windBodyGain.gain.setValueAtTime(0, now);
+
+    windBodySrc.connect(windBodyFilter);
+    windBodyFilter.connect(windBodyGain);
+    windBodyGain.connect(velocityMaster);
+    windBodySrc.start(now);
+
+    this.windBodySrc = windBodySrc;
+    this.windBodyFilter = windBodyFilter;
+    this.windBodyGain = windBodyGain;
+
+    // Wind Layer 2: High-velocity slipstream shear (emerges >1.4x, prominent in 2.5x+ tunnel vision)
+    const windShearSrc = ctx.createBufferSource();
+    windShearSrc.buffer = this.whiteNoiseBuffer;
+    windShearSrc.loop = true;
+    windShearSrc.playbackRate.setValueAtTime(0.95, now);
+
+    const windShearFilter = ctx.createBiquadFilter();
+    windShearFilter.type = 'bandpass';
+    windShearFilter.frequency.setValueAtTime(1350, now);
+    windShearFilter.Q.value = 1.65;
+
+    const windShearGain = ctx.createGain();
+    windShearGain.gain.setValueAtTime(0, now);
+
+    windShearSrc.connect(windShearFilter);
+    windShearFilter.connect(windShearGain);
+    windShearGain.connect(velocityMaster);
+    windShearSrc.start(now);
+
+    this.windShearSrc = windShearSrc;
+    this.windShearFilter = windShearFilter;
+    this.windShearGain = windShearGain;
+
+    // Mechanical 'Whir' Turbine Synth: detuned fundamental + formant-filtered harmonic + speed-synced RPM LFO
+    const whirMainOsc = ctx.createOscillator();
+    whirMainOsc.type = 'triangle';
+    whirMainOsc.frequency.setValueAtTime(66, now);
+
+    const whirMainGain = ctx.createGain();
+    whirMainGain.gain.setValueAtTime(0.56, now);
+
+    const whirHarmOsc = ctx.createOscillator();
+    whirHarmOsc.type = 'sawtooth';
+    whirHarmOsc.frequency.setValueAtTime(99, now);
+
+    const whirFormantFilter = ctx.createBiquadFilter();
+    whirFormantFilter.type = 'bandpass';
+    whirFormantFilter.frequency.setValueAtTime(160, now);
+    whirFormantFilter.Q.value = 2.6;
+
+    const whirHarmGain = ctx.createGain();
+    whirHarmGain.gain.setValueAtTime(0.44, now);
+
+    const whirBusGain = ctx.createGain();
+    whirBusGain.gain.setValueAtTime(0.85, now);
+
+    const whirLfoOsc = ctx.createOscillator();
+    whirLfoOsc.type = 'sine';
+    whirLfoOsc.frequency.setValueAtTime(7.2, now);
+
+    const whirLfoDepth = ctx.createGain();
+    whirLfoDepth.gain.setValueAtTime(0.16, now);
+
+    const whirOutputGain = ctx.createGain();
+    whirOutputGain.gain.setValueAtTime(0, now);
+
+    whirMainOsc.connect(whirMainGain);
+    whirMainGain.connect(whirBusGain);
+
+    whirHarmOsc.connect(whirFormantFilter);
+    whirFormantFilter.connect(whirHarmGain);
+    whirHarmGain.connect(whirBusGain);
+
+    whirLfoOsc.connect(whirLfoDepth);
+    whirLfoDepth.connect(whirBusGain.gain);
+
+    whirBusGain.connect(whirOutputGain);
+    whirOutputGain.connect(velocityMaster);
+
+    whirMainOsc.start(now);
+    whirHarmOsc.start(now);
+    whirLfoOsc.start(now);
+
+    this.whirMainOsc = whirMainOsc;
+    this.whirHarmOsc = whirHarmOsc;
+    this.whirFormantFilter = whirFormantFilter;
+    this.whirLfoOsc = whirLfoOsc;
+    this.whirLfoDepth = whirLfoDepth;
+    this.whirOutputGain = whirOutputGain;
+
+    this.velocitySources = [windBodySrc, windShearSrc, whirMainOsc, whirHarmOsc, whirLfoOsc];
+    this.velocityNodes = [
+      velocityMaster,
+      windBodyFilter,
+      windBodyGain,
+      windShearFilter,
+      windShearGain,
+      whirMainGain,
+      whirFormantFilter,
+      whirHarmGain,
+      whirBusGain,
+      whirLfoDepth,
+      whirOutputGain,
+    ];
 
     // 1. Androon Lahore ('canyon') — warm walled-city street murmur & alley resonance
     const canyonGain = ctx.createGain();
@@ -1041,6 +1312,36 @@ export class GameAudio {
     });
     this.rainBedNodes = [];
     this.rainBedGain = null;
+    this.velocitySources.forEach((src) => {
+      try {
+        src.stop();
+        src.disconnect();
+      } catch {
+        // already stopped
+      }
+    });
+    this.velocitySources = [];
+    this.velocityNodes.forEach((node) => {
+      try {
+        node.disconnect();
+      } catch {
+        // ignore
+      }
+    });
+    this.velocityNodes = [];
+    this.velocityMasterGain = null;
+    this.windBodySrc = null;
+    this.windBodyFilter = null;
+    this.windBodyGain = null;
+    this.windShearSrc = null;
+    this.windShearFilter = null;
+    this.windShearGain = null;
+    this.whirMainOsc = null;
+    this.whirHarmOsc = null;
+    this.whirFormantFilter = null;
+    this.whirLfoOsc = null;
+    this.whirLfoDepth = null;
+    this.whirOutputGain = null;
     this.speedBreezeGain = null;
     this.speedBreezeFilter = null;
     if (this.ambientMasterGain) {
@@ -1058,6 +1359,14 @@ export class GameAudio {
         // ignore
       }
       this.ambientDilationFilter = null;
+    }
+    if (this.masterLimiter) {
+      try {
+        this.masterLimiter.disconnect();
+      } catch {
+        // ignore
+      }
+      this.masterLimiter = null;
     }
     if (this.ctx) {
       void this.ctx.close().catch(() => {});
@@ -1082,7 +1391,7 @@ export class GameAudio {
     pushGain.gain.setValueAtTime(0.08, now);
     pushGain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
     pushOsc.connect(pushGain);
-    pushGain.connect(ctx.destination);
+    pushGain.connect(this.getOutputNode(ctx));
     pushOsc.start(now);
     pushOsc.stop(now + 0.065);
 
@@ -1097,15 +1406,56 @@ export class GameAudio {
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.155);
 
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.getOutputNode(ctx));
     osc.start(now);
     osc.stop(now + 0.165);
+  }
+
+  public playFootstep(biome: BiomeId, isWet = false): void {
+    const ctx = this.ensureCtx();
+    if (!ctx || ctx.state !== 'running') return;
+    const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    const baseFreq = biome === 'skybridge' ? 172 : biome === 'obsidian' ? 142 : 124;
+    const jitter = 0.94 + Math.random() * 0.12;
+    osc.frequency.setValueAtTime(baseFreq * jitter, now);
+    osc.frequency.exponentialRampToValueAtTime(56, now + 0.042);
+
+    gain.gain.setValueAtTime(0.026, now);
+    gain.gain.exponentialRampToValueAtTime(0.0008, now + 0.046);
+
+    osc.connect(gain);
+    gain.connect(out);
+    osc.start(now);
+    osc.stop(now + 0.05);
+
+    if (isWet && this.whiteNoiseBuffer) {
+      const splash = ctx.createBufferSource();
+      splash.buffer = this.whiteNoiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(2400 + Math.random() * 600, now);
+      bp.Q.value = 1.6;
+      const sGain = ctx.createGain();
+      sGain.gain.setValueAtTime(0.014, now);
+      sGain.gain.exponentialRampToValueAtTime(0.0008, now + 0.038);
+      splash.connect(bp);
+      bp.connect(sGain);
+      sGain.connect(out);
+      splash.start(now);
+      splash.stop(now + 0.042);
+    }
   }
 
   public playSlide(): void {
     const ctx = this.ensureCtx();
     if (!ctx) return;
     const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
 
     // Soft low crouch tuck thud
     const tuckOsc = ctx.createOscillator();
@@ -1116,7 +1466,7 @@ export class GameAudio {
     tuckGain.gain.setValueAtTime(0.075, now);
     tuckGain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
     tuckOsc.connect(tuckGain);
-    tuckGain.connect(ctx.destination);
+    tuckGain.connect(out);
     tuckOsc.start(now);
     tuckOsc.stop(now + 0.085);
 
@@ -1144,7 +1494,7 @@ export class GameAudio {
 
     noise.connect(filter);
     filter.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(out);
     noise.start(now);
     noise.stop(now + duration);
   }
@@ -1164,7 +1514,7 @@ export class GameAudio {
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
 
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.getOutputNode(ctx));
     osc.start(now);
     osc.stop(now + 0.105);
   }
@@ -1173,15 +1523,16 @@ export class GameAudio {
     const ctx = this.ensureCtx();
     if (!ctx) return;
     const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
 
     const outputNode: AudioNode = (() => {
       if (typeof ctx.createStereoPanner === 'function') {
         const panner = ctx.createStereoPanner();
         panner.pan.setValueAtTime(direction * 0.42, now);
-        panner.connect(ctx.destination);
+        panner.connect(out);
         return panner;
       }
-      return ctx.destination;
+      return out;
     })();
 
     // Crisp micro-step tone subtly pitched per left/right direction
@@ -1242,7 +1593,7 @@ export class GameAudio {
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.085);
 
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.getOutputNode(ctx));
     osc.start(now);
     osc.stop(now + 0.09);
   }
@@ -1277,7 +1628,7 @@ export class GameAudio {
 
     osc.connect(gain);
     osc2.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.getOutputNode(ctx));
     osc.start(now);
     osc2.start(now);
     osc.stop(now + 0.17);
@@ -1288,6 +1639,7 @@ export class GameAudio {
     const ctx = this.ensureCtx();
     if (!ctx) return;
     const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
 
     const freqs = [280, 420, 640];
     freqs.forEach((f, idx) => {
@@ -1300,9 +1652,37 @@ export class GameAudio {
       gain.gain.setValueAtTime(0.09, t);
       gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(out);
       osc.start(t);
       osc.stop(t + 0.19);
+    });
+  }
+
+  public playBoostPad(): void {
+    const ctx = this.ensureCtx();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
+
+    [330, 495, 740, 990].forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const t = now + idx * 0.028;
+      osc.type = idx % 2 === 0 ? 'sawtooth' : 'triangle';
+      osc.frequency.setValueAtTime(freq, t);
+      osc.frequency.exponentialRampToValueAtTime(freq * 1.38, t + 0.16);
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(2800, t);
+
+      gain.gain.setValueAtTime(0.065, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.17);
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(out);
+      osc.start(t);
+      osc.stop(t + 0.18);
     });
   }
 
@@ -1310,6 +1690,7 @@ export class GameAudio {
     const ctx = this.ensureCtx();
     if (!ctx) return;
     const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
 
     [523.25, 659.25, 783.99, 1046.5].forEach((freq, i) => {
       const osc = ctx.createOscillator();
@@ -1320,7 +1701,7 @@ export class GameAudio {
       gain.gain.setValueAtTime(0.09, t);
       gain.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(out);
       osc.start(t);
       osc.stop(t + 0.17);
     });
@@ -1341,7 +1722,7 @@ export class GameAudio {
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.032);
 
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.getOutputNode(ctx));
     osc.start(now);
     osc.stop(now + 0.036);
   }
@@ -1350,6 +1731,7 @@ export class GameAudio {
     const ctx = this.ensureCtx();
     if (!ctx) return;
     const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
 
     // Deep temporal slow-down sweep
     const bass = ctx.createOscillator();
@@ -1360,7 +1742,7 @@ export class GameAudio {
     bassGain.gain.setValueAtTime(0.16, now);
     bassGain.gain.exponentialRampToValueAtTime(0.001, now + 0.48);
     bass.connect(bassGain);
-    bassGain.connect(ctx.destination);
+    bassGain.connect(out);
     bass.start(now);
     bass.stop(now + 0.5);
 
@@ -1375,7 +1757,7 @@ export class GameAudio {
       gain.gain.setValueAtTime(0.075, t);
       gain.gain.exponentialRampToValueAtTime(0.001, t + 0.26);
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(out);
       osc.start(t);
       osc.stop(t + 0.28);
     });
@@ -1394,7 +1776,7 @@ export class GameAudio {
     gain.gain.setValueAtTime(0.06, now);
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.11);
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.getOutputNode(ctx));
     osc.start(now);
     osc.stop(now + 0.12);
   }
@@ -1411,6 +1793,7 @@ export class GameAudio {
     const ctx = this.ensureCtx();
     if (ctx) {
       const now = ctx.currentTime;
+      const out = this.getOutputNode(ctx);
       const root = 523.25 * (1 + Math.min(6, Math.max(0, combo - 2)) * 0.06);
       [root, root * 1.25, root * 1.5].forEach((freq, idx) => {
         const osc = ctx.createOscillator();
@@ -1421,7 +1804,7 @@ export class GameAudio {
         gain.gain.setValueAtTime(0.055, t);
         gain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
         osc.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(out);
         osc.start(t);
         osc.stop(t + 0.24);
       });
@@ -1445,25 +1828,79 @@ export class GameAudio {
     }
   }
 
-  public playSpeedUp(): void {
+  public playSpeedUp(speedMultiplier = 1.4): void {
     const ctx = this.ensureCtx();
     if (!ctx) return;
     const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
+    const pitchScale = 0.92 + Math.min(0.42, Math.max(0, (speedMultiplier - 1.0) * 0.16));
 
     [440, 587.33, 880].forEach((freq, idx) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sine';
       const t = now + idx * 0.04;
-      osc.frequency.setValueAtTime(freq, t);
-      osc.frequency.exponentialRampToValueAtTime(freq * 1.12, t + 0.14);
+      const scaled = freq * pitchScale;
+      osc.frequency.setValueAtTime(scaled, t);
+      osc.frequency.exponentialRampToValueAtTime(scaled * 1.12, t + 0.14);
       gain.gain.setValueAtTime(0.075, t);
       gain.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(out);
       osc.start(t);
       osc.stop(t + 0.17);
     });
+  }
+
+  public playSonicBarrierBreak(): void {
+    const ctx = this.ensureCtx();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
+
+    // Punchy sub-kinetic shockwave thump
+    const subOsc = ctx.createOscillator();
+    const subGain = ctx.createGain();
+    subOsc.type = 'sine';
+    subOsc.frequency.setValueAtTime(195, now);
+    subOsc.frequency.exponentialRampToValueAtTime(48, now + 0.34);
+    subGain.gain.setValueAtTime(0.18, now);
+    subGain.gain.exponentialRampToValueAtTime(0.001, now + 0.36);
+    subOsc.connect(subGain);
+    subGain.connect(out);
+    subOsc.start(now);
+    subOsc.stop(now + 0.38);
+
+    // Rising turbine harmonic flare + pressurized air burst
+    const flareOsc = ctx.createOscillator();
+    const flareGain = ctx.createGain();
+    flareOsc.type = 'triangle';
+    flareOsc.frequency.setValueAtTime(260, now);
+    flareOsc.frequency.exponentialRampToValueAtTime(780, now + 0.22);
+    flareGain.gain.setValueAtTime(0.085, now);
+    flareGain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+    flareOsc.connect(flareGain);
+    flareGain.connect(out);
+    flareOsc.start(now);
+    flareOsc.stop(now + 0.3);
+
+    if (this.whiteNoiseBuffer) {
+      const burstSrc = ctx.createBufferSource();
+      burstSrc.buffer = this.whiteNoiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(920, now);
+      bp.frequency.exponentialRampToValueAtTime(3400, now + 0.22);
+      bp.Q.value = 1.3;
+      const nGain = ctx.createGain();
+      nGain.gain.setValueAtTime(0.09, now);
+      nGain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+      burstSrc.connect(bp);
+      bp.connect(nGain);
+      nGain.connect(out);
+      burstSrc.start(now);
+      burstSrc.stop(now + 0.3);
+    }
   }
 
   public playShieldBreak(): void {
@@ -1487,7 +1924,7 @@ export class GameAudio {
 
     osc.connect(filter);
     filter.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.getOutputNode(ctx));
     osc.start(now);
     osc.stop(now + 0.27);
   }
@@ -1507,7 +1944,7 @@ export class GameAudio {
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.36);
 
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(this.getOutputNode(ctx));
     osc.start(now);
     osc.stop(now + 0.38);
   }
@@ -1516,6 +1953,7 @@ export class GameAudio {
     const ctx = this.ensureCtx();
     if (!ctx) return;
     const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
 
     // Warm resonant foundation chime (architectural gate arrival weight)
     const baseOsc = ctx.createOscillator();
@@ -1527,7 +1965,7 @@ export class GameAudio {
     baseGain.gain.linearRampToValueAtTime(0.11, now + 0.025);
     baseGain.gain.exponentialRampToValueAtTime(0.0008, now + 0.58);
     baseOsc.connect(baseGain);
-    baseGain.connect(ctx.destination);
+    baseGain.connect(out);
     baseOsc.start(now);
     baseOsc.stop(now + 0.6);
 
@@ -1536,7 +1974,7 @@ export class GameAudio {
     warmthFilter.type = 'lowpass';
     warmthFilter.frequency.setValueAtTime(3400, now);
     warmthFilter.Q.value = 0.7;
-    warmthFilter.connect(ctx.destination);
+    warmthFilter.connect(out);
 
     const motifNotes = [293.66, 369.99, 440.0, 554.37, 587.33];
     motifNotes.forEach((freq, idx) => {
@@ -1577,6 +2015,7 @@ export class GameAudio {
     const ctx = this.ensureCtx();
     if (!ctx) return;
     const now = ctx.currentTime;
+    const out = this.getOutputNode(ctx);
 
     [440, 554.37, 659.25, 880].forEach((freq, idx) => {
       const osc = ctx.createOscillator();
@@ -1587,7 +2026,7 @@ export class GameAudio {
       gain.gain.setValueAtTime(0.11, t);
       gain.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(out);
       osc.start(t);
       osc.stop(t + 0.3);
     });

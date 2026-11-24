@@ -290,9 +290,14 @@ export interface HudSnapshot {
 
 export interface LeaderboardEntry {
   id: string;
+  uid?: string;
+  difficulty?: DifficultyMode;
   score: number;
   distance: number;
   skinId: string;
+  badgeId?: ProfileBadgeId | null;
+  peakSpeedMultiplier?: number;
+  landmarkReachedName?: string;
   recordedAt: string;
   playerName?: string;
   isPlayer?: boolean;
@@ -345,4 +350,5 @@ export interface SaveData {
   luckyWheel: LuckyWheelState;
   pendingSpeedBoost: TemporarySpeedBoostState | null;
   leaderboard: LeaderboardEntry[];
+  runnerHandle?: string | null;
 }

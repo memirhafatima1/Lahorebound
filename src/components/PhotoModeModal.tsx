@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { LIGHTING_MODES } from '../game/dayNightCycle';
 import { DIFFICULTY_CONFIGS } from '../game/difficulty';
+import { useHudSnapshot } from '../game/hudStore';
 import {
   LAHORE_PHOTO_FILTERS,
   LAHORE_PHOTO_FILTER_MAP,
@@ -26,7 +27,7 @@ export type PhotoCameraPreset = 'current' | 'hero' | 'wide';
 
 interface PhotoModeModalProps {
   rawSnapshotUrl: string;
-  hud: HudSnapshot;
+  hud?: HudSnapshot;
   skin: CharacterSkin;
   bestDistance: number;
   dailyStreakCount: number;
@@ -40,7 +41,7 @@ interface PhotoModeModalProps {
 
 export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
   rawSnapshotUrl,
-  hud,
+  hud: propHud,
   skin,
   bestDistance,
   dailyStreakCount,
@@ -51,6 +52,8 @@ export const PhotoModeModal: React.FC<PhotoModeModalProps> = ({
   onBackToPause,
   onResumeRun,
 }) => {
+  const storeHud = useHudSnapshot();
+  const hud = propHud ?? storeHud;
   const [snapshotUrl, setSnapshotUrl] = useState(rawSnapshotUrl);
   const [processedUrl, setProcessedUrl] = useState(rawSnapshotUrl);
   const [includeStamp, setIncludeStamp] = useState(true);

@@ -27,6 +27,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { DIFFICULTY_CONFIGS } from '../game/difficulty';
+import { useHudSnapshot } from '../game/hudStore';
 import { RADIO_STATIONS, RADIO_STATION_MAP } from '../game/music';
 import { SpeedVisualization } from './SpeedVisualization';
 import type {
@@ -37,10 +38,11 @@ import type {
 } from '../game/types';
 
 interface GameHUDProps {
-  hud: HudSnapshot;
+  hud?: HudSnapshot;
   muted: boolean;
   radioStation: RadioStationId;
   showTouchButtons: boolean;
+  showOnboardingHint?: boolean;
   onToggleMute: () => void;
   onSelectRadioStation: (station: RadioStationId) => void;
   onCycleRadioStation: () => void;
@@ -51,11 +53,11 @@ interface GameHUDProps {
   onRight: () => void;
 }
 
-const FLASH_SHADOWS: Record<PowerupType, string> = {
-  shield: 'inset 0 0 80px 18px rgba(56, 189, 248, 0.55)',
-  magnet: 'inset 0 0 80px 18px rgba(16, 185, 129, 0.55)',
-  multiplier: 'inset 0 0 80px 18px rgba(244, 63, 94, 0.55)',
-  chronos: 'inset 0 0 96px 22px rgba(168, 85, 247, 0.62)',
+const FLASH_GRADIENTS: Record<PowerupType, string> = {
+  shield: 'radial-gradient(ellipse at center, transparent 58%, rgba(56, 189, 248, 0.45) 100%)',
+  magnet: 'radial-gradient(ellipse at center, transparent 58%, rgba(16, 185, 129, 0.45) 100%)',
+  multiplier: 'radial-gradient(ellipse at center, transparent 58%, rgba(244, 63, 94, 0.45) 100%)',
+  chronos: 'radial-gradient(ellipse at center, transparent 55%, rgba(168, 85, 247, 0.52) 100%)',
 };
 
 const PULSE_BAR_HEIGHTS = ['h-2', 'h-3.5', 'h-4', 'h-3', 'h-2.5'] as const;
@@ -99,11 +101,12 @@ const LahorePulseBars: React.FC<{ color: string; compact?: boolean }> = ({
   </span>
 );
 
-export const GameHUD: React.FC<GameHUDProps> = ({
-  hud,
+export const GameHUD: React.FC<GameHUDProps> = React.memo(({
+  hud: propHud,
   muted,
   radioStation,
   showTouchButtons,
+  showOnboardingHint = false,
   onToggleMute,
   onSelectRadioStation,
   onCycleRadioStation,
@@ -113,6 +116,8 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   onLeft,
   onRight,
 }) => {
+  const storeHud = useHudSnapshot();
+  const hud = propHud ?? storeHud;
   const [flashVisible, setFlashVisible] = useState(false);
   const [comboPopPulse, setComboPopPulse] = useState(false);
   const [gemPopSeq, setGemPopSeq] = useState(0);
@@ -290,15 +295,14 @@ export const GameHUD: React.FC<GameHUDProps> = ({
         </div>
       </div>
 
-      {/* High-Velocity (>2.0x) & Supersonic (>=3.0x) Peripheral Screen Glow (pure opacity/boxShadow, zero backdrop-filter) */}
+      {/* High-Velocity (>2.0x) & Supersonic (>=3.0x) Peripheral Screen Glow (pure compositor opacity radial-gradients) */}
       <div
         aria-hidden="true"
         className="fixed inset-0 pointer-events-none transition-opacity duration-300"
         style={{
-          opacity: overdriveActive && !supersonicActive ? 0.55 + overdriveIntensity * 0.45 : 0,
-          boxShadow: `inset 0 0 ${Math.round(56 + overdriveIntensity * 48)}px ${Math.round(
-            8 + overdriveIntensity * 14,
-          )}px rgba(244, 63, 94, ${(0.22 + overdriveIntensity * 0.28).toFixed(2)})`,
+          opacity: overdriveActive && !supersonicActive ? 0.48 + overdriveIntensity * 0.45 : 0,
+          backgroundImage:
+            'radial-gradient(ellipse at center, transparent 56%, rgba(244, 63, 94, 0.42) 100%)',
         }}
       />
       {supersonicActive && (
@@ -307,14 +311,16 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             aria-hidden="true"
             className="fixed inset-0 pointer-events-none animate-speed-mach-amber"
             style={{
-              boxShadow: 'inset 0 0 110px 24px rgba(251, 191, 36, 0.46)',
+              backgroundImage:
+                'radial-gradient(ellipse at center, transparent 52%, rgba(251, 191, 36, 0.42) 100%)',
             }}
           />
           <div
             aria-hidden="true"
             className="fixed inset-0 pointer-events-none animate-speed-mach-violet"
             style={{
-              boxShadow: 'inset 0 0 120px 28px rgba(168, 85, 247, 0.52)',
+              backgroundImage:
+                'radial-gradient(ellipse at center, transparent 50%, rgba(168, 85, 247, 0.46) 100%)',
             }}
           />
         </>
@@ -326,7 +332,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
           className="fixed inset-0 pointer-events-none transition-opacity duration-300"
           style={{
             opacity: flashVisible ? 1 : 0,
-            boxShadow: FLASH_SHADOWS[hud.powerupFlashType],
+            backgroundImage: FLASH_GRADIENTS[hud.powerupFlashType],
           }}
         />
       )}
@@ -341,7 +347,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
                 Distance
               </div>
               <div
-                className={`text-lg sm:text-xl font-black text-white tabular-nums leading-tight ${
+                className={`text-lg sm:text-xl font-black text-white font-mono-num leading-tight ${
                   distPopSeq === 0
                     ? ''
                     : distPopSeq % 2 === 0
@@ -358,7 +364,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               <div className="text-[10px] font-bold uppercase tracking-wider text-amber-300/80">
                 Score
               </div>
-              <div className="text-lg sm:text-xl font-black text-white tabular-nums leading-tight">
+              <div className="text-lg sm:text-xl font-black text-white font-mono-num leading-tight">
                 {hud.score.toLocaleString()}
               </div>
             </div>
@@ -373,7 +379,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               }`}
             >
               <Gem className="w-4 h-4 text-sky-400 shrink-0" />
-              <span className="text-base sm:text-lg font-black text-sky-200 tabular-nums">
+              <span className="text-base sm:text-lg font-black text-sky-200 font-mono-num">
                 {hud.runGems}
               </span>
             </div>
@@ -394,9 +400,9 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             </div>
             <div className="mt-1 h-1 w-full rounded-full bg-white/10 overflow-hidden">
               <div
-                className="h-full rounded-full transition-[width] duration-150"
+                className="h-full w-full rounded-full origin-left transition-transform duration-150"
                 style={{
-                  width: `${Math.max(4, Math.min(100, hud.journeyProgress * 100))}%`,
+                  transform: `scaleX(${Math.max(0.04, Math.min(1, hud.journeyProgress)).toFixed(4)})`,
                   backgroundColor: pulseColor,
                 }}
               />
@@ -649,7 +655,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
                     </>
                   )}
                 </div>
-                <div className="text-base sm:text-lg font-black tracking-tight text-white leading-tight">
+                <div className="text-base sm:text-lg font-display font-bold tracking-wide text-white leading-tight">
                   {hud.landmarkPopupName}
                 </div>
                 {hud.landmarkPopupSubtitle && (
@@ -699,7 +705,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               <div className="flex items-center gap-1.5 leading-none">
                 <Flame className="w-4 h-4 text-amber-300 shrink-0" />
                 <span
-                  className="font-black italic uppercase tracking-tight tabular-nums leading-none drop-shadow"
+                  className="font-display font-bold italic uppercase tracking-tight font-mono-num leading-none drop-shadow"
                   style={{ fontSize: `${comboFontSize}px` }}
                 >
                   {hud.comboStreak}× COMBO!
@@ -715,12 +721,29 @@ export const GameHUD: React.FC<GameHUDProps> = ({
               </div>
               <div className="mt-1.5 h-1 w-full rounded-full bg-white/15 overflow-hidden">
                 <div
-                  className={`h-full rounded-full transition-[width] duration-75 ${comboBarColor}`}
-                  style={{ width: `${Math.max(4, hud.comboDecayRatio * 100)}%` }}
+                  className={`h-full w-full rounded-full origin-left transition-transform duration-75 ${comboBarColor}`}
+                  style={{
+                    transform: `scaleX(${Math.max(0.04, Math.min(1, hud.comboDecayRatio)).toFixed(4)})`,
+                  }}
                 />
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* First-Run Floating Controls Onboarding Card (fades cleanly by 75m) */}
+      {showOnboardingHint && hud.distance < 75 && (
+        <div
+          aria-hidden="true"
+          className="fixed bottom-20 sm:bottom-24 left-1/2 -translate-x-1/2 pointer-events-none transition-opacity duration-500"
+          style={{ opacity: hud.distance >= 58 ? 0 : 1 }}
+        >
+          <div className="rounded-xl bg-[#0b1322]/90 border border-sky-400/35 px-4 py-2 text-center shadow-xl whitespace-nowrap">
+            <div className="text-[11px] sm:text-xs font-display font-bold tracking-wide text-sky-200 uppercase">
+              ← / → or Swipe to Steer · Space / ↑ Jump · S / ↓ Slide
+            </div>
+          </div>
         </div>
       )}
 
@@ -789,4 +812,4 @@ export const GameHUD: React.FC<GameHUDProps> = ({
       )}
     </div>
   );
-};
+});

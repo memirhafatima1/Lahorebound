@@ -22,6 +22,7 @@ import { PowerupVfxSystem } from './powerupVfx';
 import { CARNIVAL_RUNNER_SKIN, getSkinById } from './skins';
 import { SpeedLinesEffect } from './speedLines';
 import {
+  BIOME_WEATHER_PROFILES,
   WeatherSystem,
   getAllLandmarkForecasts,
   getLandmarkForecast,
@@ -111,6 +112,98 @@ const LANDMARK_TRANSITION_DURATION = 0.92;
 const SONIC_BREAK_DURATION = 0.46;
 const CARNIVAL_CONFETTI_COLORS = [0xec4899, 0xfbbf24, 0x22d3ee] as const;
 
+function segmentPointDistSq(
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number,
+  px: number,
+  py: number,
+  pz: number,
+): number {
+  const vx = bx - ax;
+  const vy = by - ay;
+  const vz = bz - az;
+  const lenSq = vx * vx + vy * vy + vz * vz;
+  const t =
+    lenSq > 1e-8
+      ? THREE.MathUtils.clamp(((px - ax) * vx + (py - ay) * vy + (pz - az) * vz) / lenSq, 0, 1)
+      : 0;
+  const dx = ax + vx * t - px;
+  const dy = ay + vy * t - py;
+  const dz = az + vz * t - pz;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+function sweptMinkowskiHit(
+  relStartX: number,
+  relDx: number,
+  halfExtentX: number,
+  startBottomY: number,
+  dy: number,
+  minBottomY: number,
+  maxBottomY: number,
+  startZ: number,
+  dz: number,
+  minZ: number,
+  maxZ: number,
+): boolean {
+  let tMin = 0;
+  let tMax = 1;
+
+  if (Math.abs(relDx) < 1e-6) {
+    if (relStartX < -halfExtentX || relStartX > halfExtentX) return false;
+  } else {
+    const inv = 1 / relDx;
+    let t1 = (-halfExtentX - relStartX) * inv;
+    let t2 = (halfExtentX - relStartX) * inv;
+    if (t1 > t2) {
+      const tmp = t1;
+      t1 = t2;
+      t2 = tmp;
+    }
+    tMin = Math.max(tMin, t1);
+    tMax = Math.min(tMax, t2);
+    if (tMin > tMax) return false;
+  }
+
+  if (Math.abs(dz) < 1e-6) {
+    if (startZ < minZ || startZ > maxZ) return false;
+  } else {
+    const inv = 1 / dz;
+    let t1 = (minZ - startZ) * inv;
+    let t2 = (maxZ - startZ) * inv;
+    if (t1 > t2) {
+      const tmp = t1;
+      t1 = t2;
+      t2 = tmp;
+    }
+    tMin = Math.max(tMin, t1);
+    tMax = Math.min(tMax, t2);
+    if (tMin > tMax) return false;
+  }
+
+  if (Math.abs(dy) < 1e-6) {
+    if (startBottomY < minBottomY || startBottomY > maxBottomY) return false;
+  } else {
+    const inv = 1 / dy;
+    let t1 = (minBottomY - startBottomY) * inv;
+    let t2 = (maxBottomY - startBottomY) * inv;
+    if (t1 > t2) {
+      const tmp = t1;
+      t1 = t2;
+      t2 = tmp;
+    }
+    tMin = Math.max(tMin, t1);
+    tMax = Math.min(tMax, t2);
+    if (tMin > tMax) return false;
+  }
+
+  return tMin <= tMax;
+}
+
 export interface EngineCallbacks {
   onHudUpdate: (hud: HudSnapshot) => void;
   onHapticEvent?: (event: HapticEvent) => void;
@@ -182,6 +275,7 @@ export class SkyboundEngine {
   private lensDistortionStrength = 0;
   private lensZoomStrength = 0;
   private screenDistortionStrength = 0;
+  private heatShimmerStrength = 0;
   private smoothedTierSpeed = 1.0;
 
   private readonly character: LowPolyCharacter;
@@ -242,6 +336,7 @@ export class SkyboundEngine {
   private speed = DIFFICULTY_CONFIGS.normal.baseSpeed;
   private speedMultiplier = 1.0;
   private peakSpeedMultiplier = 1.0;
+  private flowSurgeBonus = 0;
   private nextSpeedTier = 1.2;
   private elapsedRunTime = 0;
   private cameraRoll = 0;
@@ -293,6 +388,7 @@ export class SkyboundEngine {
   private hitstopTimer = 0;
   private shakeIntensity = 0;
   private hitFlash = 0;
+  private rainWetness = 0;
 
   private readonly clock = new THREE.Clock();
   private frameId = 0;
@@ -522,6 +618,7 @@ export class SkyboundEngine {
         uSonicPhase: { value: 0 },
         uBarrelStrength: { value: 0 },
         uVelocityWarp: { value: 0 },
+        uHeatShimmer: { value: 0 },
         uAccentColor: { value: new THREE.Color(0xfbbf24) },
       },
       vertexShader: `
@@ -541,6 +638,7 @@ export class SkyboundEngine {
         uniform float uSonicPhase;
         uniform float uBarrelStrength;
         uniform float uVelocityWarp;
+        uniform float uHeatShimmer;
         uniform vec3 uAccentColor;
         varying vec2 vUv;
 
@@ -568,6 +666,11 @@ export class SkyboundEngine {
           float fluidWaveB = cos(barrelUv.x * 26.0 + uTime * 11.0 - sin(barrelUv.y * 18.0 - uTime * 8.5));
           float speedStreams = 0.5 + 0.5 * cos(angle * 18.0 + uTime * 9.0);
 
+          // Biome- & speed-scaled rising desert/sandstone mirage refraction along lower horizon & outer flanks
+          float mirageBand = smoothstep(0.75, 0.08, barrelUv.y) * smoothstep(0.18, 0.75, dist);
+          float mirageWave = sin(barrelUv.y * 46.0 - uTime * 14.0 + cos(barrelUv.x * 24.0 + uTime * 6.0));
+          vec2 heatRefract = vec2(mirageWave * 0.0022, cos(barrelUv.x * 30.0 - uTime * 9.5) * 0.0012) * (uHeatShimmer * mirageBand);
+
           // Subtle across the whole frame while slightly calmer right on central lane obstacles
           float shimmerMask = mix(0.32, 1.0, edgeMask);
           float outerVelocityMask = smoothstep(0.34, 1.0, dist);
@@ -575,7 +678,8 @@ export class SkyboundEngine {
             dirNorm * (radialRipple * 0.0032 + waveFront * 0.0068) * uIntensity * shimmerMask +
             tangent * ((fluidWaveA + fluidWaveB * 0.65) * 0.0018) * uIntensity * shimmerMask +
             dirNorm * (sonicRing * 0.014) +
-            (dirNorm * (radialRipple * 0.0016) + tangent * (fluidWaveA * 0.0011)) * (uVelocityWarp * outerVelocityMask);
+            (dirNorm * (radialRipple * 0.0016) + tangent * (fluidWaveA * 0.0011)) * (uVelocityWarp * outerVelocityMask) +
+            heatRefract;
 
           // Gentle forward optical zoom toward horizon vanishing point with shimmer warp
           float totalZoom = min(0.16, uZoomAmount * 0.085 + uSonicIntensity * 0.055);
@@ -1000,6 +1104,10 @@ export class SkyboundEngine {
     }
   }
 
+  public resyncClock(): void {
+    this.clock.getDelta();
+  }
+
   public enterPhotoMode(): void {
     if (!this.savedPhotoCam) {
       this.savedPhotoCam = {
@@ -1074,7 +1182,7 @@ export class SkyboundEngine {
       this.speedBoostTimer = boost.durationSeconds;
       this.speedBoostFactor = boost.multiplier;
       this.powerupSurge = 1.0;
-      this.audio.playSpeedUp();
+      this.audio.playSpeedUp(boost.multiplier);
       this.particles.spawnBurst(0, 1.0, 0, 0xfbbf24, 18, 6.2, 1.1);
       this.eventBanner = `LUCKY BOOST · ${boost.durationSeconds}S`;
       this.eventBannerTimer = 2.4;
@@ -1114,6 +1222,7 @@ export class SkyboundEngine {
     this.speed = diffCfg.baseSpeed;
     this.speedMultiplier = 1.0;
     this.peakSpeedMultiplier = 1.0;
+    this.flowSurgeBonus = 0;
     this.nextSpeedTier = 1.2;
     this.elapsedRunTime = 0;
     this.cameraRoll = 0;
@@ -1147,7 +1256,7 @@ export class SkyboundEngine {
     this.currentBiome = 'canyon';
     this.currentLandmarkKind = 'gate';
     const initialWeather = pickWeatherForLandmark('gate', this.weatherSystem.getWeather(), true);
-    this.weatherSystem.setWeather(initialWeather, true);
+    this.weatherSystem.setWeather(initialWeather, true, 'canyon');
     this.ambientWeatherOverlay.setForecast(getLandmarkForecast('gate'), 'gate', true);
     this.audio.setAmbientBiome('canyon');
     this.audio.setAmbientLandmark('gate');
@@ -1181,6 +1290,7 @@ export class SkyboundEngine {
     this.lensDistortionStrength = 0;
     this.lensZoomStrength = 0;
     this.screenDistortionStrength = 0;
+    this.heatShimmerStrength = 0;
     this.smoothedTierSpeed = 1.0;
     this.speedLines.reset();
     this.photoFrozen = false;
@@ -1198,6 +1308,12 @@ export class SkyboundEngine {
     }
 
     this.character.root.position.set(0, 0, 0);
+    this.camera.position.set(0, 3.85, 6.9);
+    _lookAtTarget.set(0, 1.35, -9.5);
+    this.camera.lookAt(_lookAtTarget);
+    this.camera.rotation.z = 0;
+    this.rainWetness = 0;
+    this.worldBuilder.setRainWetness(0);
     this.updateEnvironmentLighting(0, true);
     this.syncFollowLights();
   }
@@ -1355,6 +1471,8 @@ export class SkyboundEngine {
         this.playerZ,
         this.currentNightFactor,
         this.clock.elapsedTime,
+        this.currentBiome,
+        1.0,
       );
       this.ambientWeatherOverlay.update(
         dt * 0.35,
@@ -1365,6 +1483,8 @@ export class SkyboundEngine {
         this.clock.elapsedTime,
         0,
         this.renderer.getPixelRatio(),
+        this.currentBiome,
+        1.0,
       );
       this.updateEnvironmentLighting(dt);
     }
@@ -1377,6 +1497,14 @@ export class SkyboundEngine {
     );
     this.audio.setTimeDilation(this.phase === 'playing' ? this.chronosStrength : 0);
     this.audio.updateAmbient(dt, this.phase, speedRatio);
+    this.audio.updateAdaptiveVelocity({
+      phase: this.phase,
+      speedMultiplier: this.phase === 'playing' ? this.smoothedTierSpeed : 1.0,
+      chronosStrength: this.phase === 'playing' ? this.chronosStrength : 0,
+      sonicBreakIntensity: this.phase === 'playing' ? this.sonicBreakIntensity : 0,
+      isGrounded: this.isGrounded,
+      isSliding: this.isSliding,
+    });
     this.music.update(this.audio.getContext(), dt, {
       phase: this.phase,
       landmark: this.currentLandmarkKind,
@@ -1399,6 +1527,7 @@ export class SkyboundEngine {
 
   private renderFrame(): void {
     const activePostPass =
+      !this.isSoftwareGl &&
       !this.photoFrozen &&
       this.phase === 'playing' &&
       (this.landmarkTransitionIntensity > 0.004 ||
@@ -1423,6 +1552,7 @@ export class SkyboundEngine {
     this.blurZoomMat.uniforms.uSonicPhase.value = this.sonicBreakPhase;
     this.blurZoomMat.uniforms.uBarrelStrength.value = this.lensDistortionStrength;
     this.blurZoomMat.uniforms.uVelocityWarp.value = this.screenDistortionStrength;
+    this.blurZoomMat.uniforms.uHeatShimmer.value = this.heatShimmerStrength;
     (this.blurZoomMat.uniforms.uAccentColor.value as THREE.Color).copy(
       this.landmarkTransitionAccent,
     );
@@ -1554,6 +1684,8 @@ export class SkyboundEngine {
       this.playerZ,
       this.currentNightFactor,
       this.simTime,
+      this.currentBiome,
+      1.15,
     );
     this.ambientWeatherOverlay.update(
       dt,
@@ -1564,6 +1696,8 @@ export class SkyboundEngine {
       this.simTime,
       0.24,
       this.renderer.getPixelRatio(),
+      this.currentBiome,
+      1.15,
     );
     this.syncFollowLights();
     this.updateEnvironmentLighting(dt);
@@ -1579,8 +1713,10 @@ export class SkyboundEngine {
       return;
     }
 
-    // Gradual time + distance speed multiplier ramp scaled per difficulty mode
+    // Gradual time + distance speed multiplier ramp + skill Flow Surge & Boost Pads
     this.elapsedRunTime += dt;
+    const prevX = this.playerX;
+    const prevY = this.playerY;
     const prevZ = this.playerZ;
     const meters = Math.floor(-this.playerZ);
     this.distance = Math.max(0, meters);
@@ -1594,8 +1730,25 @@ export class SkyboundEngine {
         this.speedBoostFactor = 1.0;
       }
     }
+
+    // Skill-based Flow Surge builds with comboStreak so 3.0x Overdrive is organically reachable
+    const skillFlowMax =
+      this.difficultyMode === 'turbo' ? 0.72 : this.difficultyMode === 'normal' ? 0.92 : 0.7;
+    const skillFlowTarget =
+      this.comboStreak >= 2 ? Math.min(skillFlowMax, (this.comboStreak - 1) * 0.14) : 0;
+    if (skillFlowTarget > this.flowSurgeBonus) {
+      this.flowSurgeBonus = THREE.MathUtils.damp(this.flowSurgeBonus, skillFlowTarget, 3.8, dt);
+    } else if (this.speedBoostTimer <= 0) {
+      const decayLambda = this.comboStreak >= 2 ? 0.45 : 1.75;
+      this.flowSurgeBonus = THREE.MathUtils.damp(this.flowSurgeBonus, skillFlowTarget, decayLambda, dt);
+      if (this.flowSurgeBonus < 0.002 && skillFlowTarget === 0) {
+        this.flowSurgeBonus = 0;
+      }
+    }
+
     const activeBoost = this.speedBoostTimer > 0 ? this.speedBoostFactor : 1.0;
-    const targetMultiplier = 1.0 + (diffCfg.maxMultiplier - 1.0) * combinedProgress;
+    const targetMultiplier =
+      1.0 + (diffCfg.maxMultiplier - 1.0) * combinedProgress + this.flowSurgeBonus;
     const targetSpeed = diffCfg.baseSpeed * targetMultiplier * activeBoost;
     this.speed = THREE.MathUtils.damp(this.speed, targetSpeed, 2.4, dt);
     this.speedMultiplier = this.speed / diffCfg.baseSpeed;
@@ -1608,7 +1761,7 @@ export class SkyboundEngine {
       this.sonicBreakPhase = 0;
       this.shakeIntensity = Math.max(this.shakeIntensity, 0.28);
       this.powerupSurge = Math.max(this.powerupSurge, 1.0);
-      this.audio.playSpeedUp();
+      this.audio.playSonicBarrierBreak();
       this.emitHaptic('jump_land');
       this.particles.spawnSpeedBurstTrail(
         this.playerX,
@@ -1623,13 +1776,17 @@ export class SkyboundEngine {
       this.showBanner('MACH 3.0 · SOUND BARRIER');
     }
 
-    // Trigger speed milestone banner & sound at every +0.2x tier up to mode ceiling
-    if (this.speedMultiplier >= this.nextSpeedTier && this.nextSpeedTier <= diffCfg.maxMultiplier - 0.05) {
-      const tierLabel = this.nextSpeedTier.toFixed(1);
-      this.nextSpeedTier = Number((this.nextSpeedTier + 0.2).toFixed(1));
-      this.audio.playSpeedUp();
+    // Trigger speed milestone banner & sound at every +0.2x tier up to mode/overdrive ceiling
+    const maxAnnouncedTier = Math.max(diffCfg.maxMultiplier, 3.05) - 0.05;
+    if (this.speedMultiplier >= this.nextSpeedTier && this.nextSpeedTier <= maxAnnouncedTier) {
+      let announcedTier = this.nextSpeedTier;
+      while (this.speedMultiplier >= this.nextSpeedTier && this.nextSpeedTier <= maxAnnouncedTier) {
+        announcedTier = this.nextSpeedTier;
+        this.nextSpeedTier = Number((this.nextSpeedTier + 0.2).toFixed(1));
+      }
+      this.audio.playSpeedUp(this.speedMultiplier);
       this.particles.spawnBurst(this.playerX, this.playerY + 0.8, this.playerZ, 0x38bdf8, 12, 5.4, 0.95);
-      this.showBanner(`PACE UP · ×${tierLabel}`);
+      this.showBanner(`PACE UP · ×${announcedTier.toFixed(1)}`);
     }
 
     // Lahore Journey landmark tracking & biome ambient sync
@@ -1775,6 +1932,14 @@ export class SkyboundEngine {
     }
     const targetScreenDistortion = rawScreenDistortion * chronosDamp;
 
+    const activeWeather = this.weatherSystem.getWeather();
+    const weatherHeatBase =
+      activeWeather === 'sunny_haze' ? 1.0 : activeWeather === 'clear' ? 0.38 : 0.1;
+    const biomeHeatMul = BIOME_WEATHER_PROFILES[this.currentBiome].hazeShimmerMul;
+    const speedHeatScale = THREE.MathUtils.clamp((tierSpeed - 1.0) / 1.8, 0, 1.3);
+    const targetHeatShimmer =
+      weatherHeatBase * biomeHeatMul * (0.25 + speedHeatScale * 0.85) * chronosDamp;
+
     const lensLerpAlpha = Math.min(1, dt * 5.2);
     this.lensDistortionStrength = THREE.MathUtils.lerp(
       this.lensDistortionStrength,
@@ -1791,6 +1956,11 @@ export class SkyboundEngine {
       targetScreenDistortion,
       lensLerpAlpha,
     );
+    this.heatShimmerStrength = THREE.MathUtils.lerp(
+      this.heatShimmerStrength,
+      targetHeatShimmer,
+      Math.min(1, dt * 3.4),
+    );
 
     if (targetBarrel === 0 && this.lensDistortionStrength < 0.001) {
       this.lensDistortionStrength = 0;
@@ -1800,6 +1970,9 @@ export class SkyboundEngine {
     }
     if (targetScreenDistortion === 0 && this.screenDistortionStrength < 0.001) {
       this.screenDistortionStrength = 0;
+    }
+    if (targetHeatShimmer === 0 && this.heatShimmerStrength < 0.001) {
+      this.heatShimmerStrength = 0;
     }
 
     this.speedLines.update(
@@ -1854,10 +2027,10 @@ export class SkyboundEngine {
 
     // Lateral lane damping scales with speed so high-pace dodges stay snappy
     const targetX = LANE_X[this.laneIndex];
-    const prevX = this.playerX;
+    const laneStepPrevX = this.playerX;
     const laneResponsiveness = 17.5 * Math.min(1.4, 0.9 + this.speedMultiplier * 0.18);
     this.playerX = THREE.MathUtils.damp(this.playerX, targetX, laneResponsiveness, dt);
-    this.laneVelX = (this.playerX - prevX) / Math.max(0.0001, dt);
+    this.laneVelX = (this.playerX - laneStepPrevX) / Math.max(0.0001, dt);
 
     // Input buffers
     if (this.jumpBufferTimer > 0) this.jumpBufferTimer -= dt;
@@ -1902,16 +2075,35 @@ export class SkyboundEngine {
       }
     }
 
-    // Vertical physics & surface landing
-    const groundY = this.groundHeightAt(this.playerX, this.playerZ);
+    // Vertical physics & swept anti-tunneling surface landing
+    let groundY = this.groundHeightAt(this.playerX, this.playerZ);
     if (!this.isGrounded || this.playerY > groundY + 0.05) {
       this.vy -= GRAVITY * dt;
       const nextY = this.playerY + this.vy * dt;
+      let landedGroundY = groundY;
+      let didSweepLand =
+        this.vy <= 0 && nextY <= groundY && this.playerY >= groundY - 0.65 && groundY > -10;
 
-      if (this.vy <= 0 && nextY <= groundY && this.playerY >= groundY - 0.65 && groundY > -10) {
+      if (!didSweepLand && this.vy <= 0 && stepDist > 0.85) {
+        const subSteps = Math.min(4, Math.ceil(stepDist / 0.85));
+        for (let s = 1; s < subSteps; s++) {
+          const frac = s / subSteps;
+          const sx = THREE.MathUtils.lerp(prevX, this.playerX, frac);
+          const sz = THREE.MathUtils.lerp(prevZ, this.playerZ, frac);
+          const sy = THREE.MathUtils.lerp(prevY, nextY, frac);
+          const sg = this.groundHeightAt(sx, sz);
+          if (sg > -10 && sy <= sg && prevY >= sg - 0.65) {
+            didSweepLand = true;
+            landedGroundY = groundY > -10 ? Math.max(groundY, sg) : sg;
+            break;
+          }
+        }
+      }
+
+      if (didSweepLand) {
         // Landed cleanly
         const wasJump = this.jumpedInAir;
-        this.playerY = groundY;
+        this.playerY = landedGroundY;
         this.vy = 0;
         this.isGrounded = true;
         this.jumpedInAir = false;
@@ -1929,6 +2121,7 @@ export class SkyboundEngine {
         this.playerY = nextY;
         this.isGrounded = false;
       }
+      groundY = landedGroundY;
     } else {
       // Running along surface
       if (groundY < -10) {
@@ -1948,9 +2141,14 @@ export class SkyboundEngine {
       return;
     }
 
-    // Squash recovery & run cycle
+    // Squash recovery, run cycle & rhythmic biome-aware footstep micro-taps
     this.squashY = THREE.MathUtils.damp(this.squashY, 1, 14, dt);
+    const prevStepPhase = Math.floor(this.runCycle / Math.PI);
     this.runCycle += dt * (effectiveForwardSpeed * 0.85);
+    const nextStepPhase = Math.floor(this.runCycle / Math.PI);
+    if (this.isGrounded && !this.isSliding && nextStepPhase > prevStepPhase) {
+      this.audio.playFootstep(this.currentBiome, this.rainWetness > 0.3);
+    }
 
     // Slide / Run / Power-up / Carnival Runner dust particles & high-speed air wisps
     this.trailAccum += dt;
@@ -2069,9 +2267,9 @@ export class SkyboundEngine {
       this.worldBuilder.disposeChunk(old);
     }
 
-    // Animate collectibles & check collisions
+    // Animate collectibles & check swept anti-tunneling collisions
     this.animateCollectibles(dt * worldAnimScale, this.simTime);
-    const crashed = this.checkCollisions(dt);
+    const crashed = this.checkCollisions(dt, prevX, prevY, prevZ);
     if (crashed) return;
 
     // Update character rig & power-up shockwave VFX
@@ -2090,6 +2288,7 @@ export class SkyboundEngine {
         chronosTimer: this.chronosTimer,
         powerupSurge: this.powerupSurge,
         hitFlash: this.hitFlash,
+        invulnTimer: this.invulnTimer,
         showcaseMode: false,
       },
       dt,
@@ -2105,10 +2304,12 @@ export class SkyboundEngine {
       this.playerZ,
       this.currentNightFactor,
       this.simTime,
+      this.currentBiome,
+      this.smoothedTierSpeed,
     );
     const maxMultForOverlay = DIFFICULTY_CONFIGS[this.difficultyMode].maxMultiplier;
     const overlaySpeedRatio = THREE.MathUtils.clamp(
-      (this.speedMultiplier - 1) / Math.max(0.1, maxMultForOverlay - 1),
+      (this.smoothedTierSpeed - 1) / Math.max(0.1, maxMultForOverlay - 1),
       0,
       1,
     );
@@ -2121,6 +2322,8 @@ export class SkyboundEngine {
       this.simTime,
       overlaySpeedRatio,
       this.renderer.getPixelRatio(),
+      this.currentBiome,
+      this.smoothedTierSpeed,
     );
     this.updateCamera(dt);
     this.syncFollowLights();
@@ -2225,7 +2428,15 @@ export class SkyboundEngine {
           if (ringB) ringB.rotation.z -= dt * 3.2;
         }
       }
+      for (const pad of chunk.boostPads) {
+        if (pad.triggered) continue;
+        for (let i = 0; i < pad.chevrons.length; i++) {
+          const pulse = 0.92 + 0.16 * Math.sin(time * 9.5 - Math.floor(i / 2) * 1.15);
+          pad.chevrons[i].scale.set(pulse, 1, pulse);
+        }
+      }
       for (const obs of chunk.obstacles) {
+        obs.prevX = obs.x;
         if (obs.kind === 'moving') {
           const phase = time * obs.moveSpeed + obs.movePhase;
           obs.x = obs.baseX + Math.sin(phase) * obs.moveAmp;
@@ -2240,23 +2451,39 @@ export class SkyboundEngine {
     }
   }
 
-  private checkCollisions(dt: number): boolean {
+  private checkCollisions(dt: number, prevX: number, prevY: number, prevZ: number): boolean {
     const playerHalfW = 0.3;
     const playerHalfD = 0.28;
-    const playerBottom = this.playerY + 0.08;
-    const playerTop = this.playerY + (this.isSliding ? 0.84 : 1.72);
+    const playerHeightSpan = this.isSliding ? 0.76 : 1.64;
+    const prevBottom = prevY + 0.08;
+    const currBottom = this.playerY + 0.08;
+    const dxStep = this.playerX - prevX;
+    const dyStep = currBottom - prevBottom;
+    const dzStep = this.playerZ - prevZ;
     const mult = (this.multiplierTimer > 0 ? 2 : 1) * this.combo;
+    const zQueryMin = Math.min(prevZ, this.playerZ) - 12;
+    const zQueryMax = Math.max(prevZ, this.playerZ) + 12;
 
     for (const chunk of this.chunks) {
-      if (chunk.zStart < this.playerZ - 12 || chunk.zEnd > this.playerZ + 12) continue;
+      if (chunk.zStart < zQueryMin || chunk.zEnd > zQueryMax) continue;
 
-      // Spring Pads
+      // Swept Spring Pads
       for (const pad of chunk.springs) {
         if (pad.triggered) continue;
         if (
-          Math.abs(this.playerX - pad.x) < 0.95 &&
-          Math.abs(this.playerZ - pad.z) < 1.0 &&
-          Math.abs(this.playerY - pad.y) < 0.75
+          sweptMinkowskiHit(
+            prevX - pad.x,
+            dxStep,
+            0.95,
+            prevY,
+            this.playerY - prevY,
+            pad.y - 0.75,
+            pad.y + 0.75,
+            prevZ,
+            dzStep,
+            pad.z - 1.0,
+            pad.z + 1.0,
+          )
         ) {
           pad.triggered = true;
           this.vy = SPRING_VELOCITY;
@@ -2274,7 +2501,51 @@ export class SkyboundEngine {
         }
       }
 
-      // Gems (with Magnet attraction!)
+      // Swept Track Boost Pads (Flow Surge + Speed Boost towards 3.0x Overdrive)
+      for (const boostPad of chunk.boostPads) {
+        if (boostPad.triggered) continue;
+        if (
+          sweptMinkowskiHit(
+            prevX - boostPad.x,
+            dxStep,
+            boostPad.halfW,
+            prevY,
+            this.playerY - prevY,
+            boostPad.y - 0.6,
+            boostPad.y + 0.9,
+            prevZ,
+            dzStep,
+            boostPad.z - boostPad.halfD,
+            boostPad.z + boostPad.halfD,
+          )
+        ) {
+          boostPad.triggered = true;
+          boostPad.mesh.scale.set(1.08, 0.55, 1.08);
+          this.speedBoostTimer = Math.min(6.0, Math.max(this.speedBoostTimer, 2.8) + 0.95);
+          this.speedBoostFactor = Math.max(this.speedBoostFactor, 1.28);
+          this.flowSurgeBonus = Math.min(1.12, this.flowSurgeBonus + 0.28);
+          this.powerupSurge = Math.max(this.powerupSurge, 0.95);
+          this.squashY = 1.18;
+          this.audio.playBoostPad();
+          this.emitHaptic('lane_switch');
+          this.particles.spawnSpeedBurstTrail(
+            boostPad.x,
+            boostPad.y + 0.35,
+            boostPad.z,
+            0xfbbf24,
+            0xa855f7,
+            18,
+            'slide',
+            1.45,
+          );
+          this.bonusScore += 60 * mult;
+          this.advanceComboSequence('TURBO PAD');
+          this.showBanner('TURBO BOOST · FLOW SURGE!');
+          this.emitHud();
+        }
+      }
+
+      // Swept Gems (with Magnet attraction!)
       for (const gem of chunk.gems) {
         if (gem.collected) continue;
         const dx = this.playerX - gem.x;
@@ -2282,8 +2553,8 @@ export class SkyboundEngine {
         const dz = this.playerZ - gem.z;
         const distSq = dx * dx + dy * dy + dz * dz;
 
-        if (this.magnetTimer > 0 && distSq < 49) {
-          const pull = Math.min(1, dt * 13);
+        if (this.magnetTimer > 0 && distSq < 64) {
+          const pull = 1 - Math.exp(-16 * dt);
           gem.x = THREE.MathUtils.lerp(gem.x, this.playerX, pull);
           gem.y = THREE.MathUtils.lerp(gem.y, this.playerY + 0.85, pull);
           gem.z = THREE.MathUtils.lerp(gem.z, this.playerZ, pull);
@@ -2293,7 +2564,18 @@ export class SkyboundEngine {
           }
         }
 
-        if (distSq < 1.35) {
+        const sweptDistSq = segmentPointDistSq(
+          prevX,
+          prevY + 0.85,
+          prevZ,
+          this.playerX,
+          this.playerY + 0.85,
+          this.playerZ,
+          gem.x,
+          gem.y,
+          gem.z,
+        );
+        if (sweptDistSq < 1.35) {
           gem.collected = true;
           gem.mesh.visible = false;
           const gemGain = gem.value * (this.multiplierTimer > 0 ? 2 : 1);
@@ -2313,13 +2595,21 @@ export class SkyboundEngine {
         }
       }
 
-      // Powerups
+      // Swept Powerups
       for (const p of chunk.powerups) {
         if (p.collected) continue;
-        const dx = this.playerX - p.x;
-        const dy = this.playerY + 0.85 - p.y;
-        const dz = this.playerZ - p.z;
-        if (dx * dx + dy * dy + dz * dz < 1.65) {
+        const sweptDistSq = segmentPointDistSq(
+          prevX,
+          prevY + 0.85,
+          prevZ,
+          this.playerX,
+          this.playerY + 0.85,
+          this.playerZ,
+          p.x,
+          p.y,
+          p.z,
+        );
+        if (sweptDistSq < 1.65) {
           p.collected = true;
           p.mesh.visible = false;
           this.activatePowerup(p.type);
@@ -2335,15 +2625,23 @@ export class SkyboundEngine {
         }
       }
 
-      // Obstacles
+      // Swept Obstacles (anti-tunneling slab test against static & moving hazards)
       for (const obs of chunk.obstacles) {
-        const dz = Math.abs(this.playerZ - obs.z);
-        const dx = Math.abs(this.playerX - obs.x);
-        const overlapX = dx < playerHalfW + obs.halfW;
-        const overlapZ = dz < playerHalfD + obs.halfD;
-        const overlapY = playerTop > obs.y && playerBottom < obs.y + obs.height;
+        const hit = sweptMinkowskiHit(
+          prevX - obs.prevX,
+          dxStep - (obs.x - obs.prevX),
+          playerHalfW + obs.halfW,
+          prevBottom,
+          dyStep,
+          obs.y - playerHeightSpan + 0.01,
+          obs.y + obs.height - 0.01,
+          prevZ,
+          dzStep,
+          obs.z - obs.halfD - playerHalfD,
+          obs.z + obs.halfD + playerHalfD,
+        );
 
-        if (overlapX && overlapZ && overlapY) {
+        if (hit) {
           if (this.invulnTimer > 0) continue;
 
           if (this.hasShield) {
@@ -2377,15 +2675,24 @@ export class SkyboundEngine {
           return true;
         }
 
-        // Style Near-Miss / Clean Slide-Under Bonus!
-        if (!obs.nearMissAwarded && this.playerZ < obs.z - obs.halfD - 0.35 && dz < 1.5) {
-          if (obs.kind === 'slide' && this.isSliding && overlapX) {
+        // Swept Style Near-Miss / Clean Slide-Under Bonus!
+        const passZ = obs.z - obs.halfD - 0.35;
+        if (!obs.nearMissAwarded && prevZ >= passZ && this.playerZ < passZ && Math.abs(this.playerZ - obs.z) < 3.2) {
+          const denom = prevZ - this.playerZ;
+          const tCross = denom > 1e-5 ? THREE.MathUtils.clamp((prevZ - passZ) / denom, 0, 1) : 1;
+          const crossX = THREE.MathUtils.lerp(prevX, this.playerX, tCross);
+          const obsCrossX = THREE.MathUtils.lerp(obs.prevX, obs.x, tCross);
+          const crossBottom = THREE.MathUtils.lerp(prevBottom, currBottom, tCross);
+          const crossDx = Math.abs(crossX - obsCrossX);
+          const crossOverlapX = crossDx < playerHalfW + obs.halfW;
+
+          if (obs.kind === 'slide' && this.isSliding && crossOverlapX) {
             obs.nearMissAwarded = true;
             this.awardStyleBonus('CLEAN SLIDE! +30', 'CLEAN SLIDE');
-          } else if (obs.kind === 'jump' && !this.isGrounded && overlapX && playerBottom >= obs.y + obs.height) {
+          } else if (obs.kind === 'jump' && !this.isGrounded && crossOverlapX && crossBottom >= obs.y + obs.height) {
             obs.nearMissAwarded = true;
             this.awardStyleBonus('CLEAN HURDLE! +30', 'CLEAN HURDLE');
-          } else if (!overlapX && dx < obs.halfW + playerHalfW + 0.7) {
+          } else if (!crossOverlapX && crossDx < obs.halfW + playerHalfW + 0.72) {
             obs.nearMissAwarded = true;
             this.awardStyleBonus('CLOSE CALL! +30', 'CLOSE CALL');
           }
@@ -2482,6 +2789,8 @@ export class SkyboundEngine {
     this.lensDistortionStrength = 0;
     this.lensZoomStrength = 0;
     this.screenDistortionStrength = 0;
+    this.heatShimmerStrength = 0;
+    this.flowSurgeBonus = 0;
     this.smoothedTierSpeed = 1.0;
     this.speedLines.reset();
     this.audio.stopVoiceover();
@@ -2832,6 +3141,15 @@ export class SkyboundEngine {
 
     this.currentNightFactor = THREE.MathUtils.lerp(this.currentNightFactor, nightBlend, t);
     this.worldBuilder.setNightFactor(this.currentNightFactor, _landmarkNightGlow.getHex());
+
+    const targetWetness = this.weatherSystem.getWeather() === 'light_rain' ? 1 : 0;
+    const nextWetness = immediate
+      ? targetWetness
+      : THREE.MathUtils.lerp(this.rainWetness, targetWetness, Math.min(1, dt * 0.45));
+    if (Math.abs(nextWetness - this.rainWetness) > 0.005 || immediate) {
+      this.rainWetness = nextWetness;
+      this.worldBuilder.setRainWetness(this.rainWetness);
+    }
 
     // Celestial Sun, Moon & Twinkling Stars
     this.sunGroup.visible = dn.sunVisible;

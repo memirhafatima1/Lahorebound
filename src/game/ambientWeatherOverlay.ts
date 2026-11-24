@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { LahoreLandmarkKind, WeatherCondition } from './types';
+import type { BiomeId, LahoreLandmarkKind, WeatherCondition } from './types';
 import type { LandmarkForecast } from './weather';
 
 export interface AmbientOverlayProfile {
@@ -8,6 +8,18 @@ export interface AmbientOverlayProfile {
   mistWeight: number;
   summary: string;
 }
+
+const BIOME_OVERLAY_SCALES: Record<
+  BiomeId,
+  { leaves: number; shimmer: number; mist: number }
+> = {
+  // Androon Lahore: strong sandstone heat shimmer, lighter breeze leaves
+  canyon: { leaves: 0.86, shimmer: 1.4, mist: 0.78 },
+  // Minar Park & Shalimar Gardens: lush foliage & fountain mist
+  skybridge: { leaves: 1.36, shimmer: 0.62, mist: 1.38 },
+  // Canal Road & Liberty Chowk: vibrant canal-side leaves & evening mist
+  obsidian: { leaves: 1.18, shimmer: 0.94, mist: 1.22 },
+};
 
 const LEAF_COUNT = 52;
 const SHIMMER_COUNT = 44;
@@ -183,6 +195,11 @@ export class AmbientWeatherOverlay {
   private shimmerStrength = 0.92;
   private mistStrength = 0;
 
+  private biomeLeafMul = BIOME_OVERLAY_SCALES.canyon.leaves;
+  private biomeShimmerMul = BIOME_OVERLAY_SCALES.canyon.shimmer;
+  private biomeMistMul = BIOME_OVERLAY_SCALES.canyon.mist;
+  private speedIntensity = 0;
+
   // 1. Swirling 3D Breeze Leaves (single InstancedMesh draw call)
   private readonly leafGeo: THREE.BufferGeometry;
   private readonly leafMat: THREE.MeshStandardMaterial;
@@ -279,6 +296,7 @@ export class AmbientWeatherOverlay {
       uniforms: {
         uTime: { value: 0 },
         uStrength: { value: 0 },
+        uSpeed: { value: 0 },
         uNight: { value: 0 },
         uPixelRatio: { value: 1 },
       },
@@ -286,6 +304,7 @@ export class AmbientWeatherOverlay {
         attribute float aSeed;
         attribute float aScale;
         uniform float uTime;
+        uniform float uSpeed;
         uniform float uPixelRatio;
         varying float vSeed;
         varying float vDistFade;
@@ -293,29 +312,31 @@ export class AmbientWeatherOverlay {
         void main() {
           vSeed = aSeed;
           vec3 shifted = position;
-          shifted.x += sin(uTime * 1.8 + aSeed) * 0.28;
+          shifted.x += sin(uTime * (1.8 + uSpeed * 1.1) + aSeed) * (0.28 + uSpeed * 0.14);
           vec4 mvPos = modelViewMatrix * vec4(shifted, 1.0);
           float depth = max(1.0, -mvPos.z);
           vDistFade = smoothstep(56.0, 12.0, depth) * smoothstep(1.5, 6.0, depth);
-          gl_PointSize = clamp(aScale * uPixelRatio * (210.0 / depth), 10.0, 74.0);
+          gl_PointSize = clamp(aScale * (1.0 + uSpeed * 0.16) * uPixelRatio * (210.0 / depth), 10.0, 82.0);
           gl_Position = projectionMatrix * mvPos;
         }
       `,
       fragmentShader: `
         uniform float uTime;
         uniform float uStrength;
+        uniform float uSpeed;
         uniform float uNight;
         varying float vSeed;
         varying float vDistFade;
 
         void main() {
           vec2 uv = gl_PointCoord * 2.0 - 1.0;
-          // Horizontal undulating mirage wave ripples rising upwards
-          float waveShift = sin(uv.y * 8.0 - uTime * 5.2 + vSeed) * 0.16;
+          // Horizontal undulating mirage wave ripples rising upwards (faster & wider at high velocity)
+          float waveRate = 5.2 + uSpeed * 3.8;
+          float waveShift = sin(uv.y * 8.0 - uTime * waveRate + vSeed) * (0.16 + uSpeed * 0.08);
           vec2 warped = vec2(uv.x + waveShift, uv.y * 1.45);
           float radial = exp(-dot(warped, warped) * 2.85);
-          float bands = 0.55 + 0.45 * sin(uv.y * 16.0 - uTime * 7.4 + vSeed * 2.0);
-          float alpha = radial * bands * uStrength * vDistFade * mix(0.24, 0.11, uNight);
+          float bands = 0.55 + 0.45 * sin(uv.y * 16.0 - uTime * (7.4 + uSpeed * 4.5) + vSeed * 2.0);
+          float alpha = clamp(radial * bands * uStrength * vDistFade * mix(0.24, 0.12, uNight), 0.0, 0.42);
           if (alpha < 0.004) discard;
           vec3 dayHeat = vec3(1.0, 0.87, 0.58);
           vec3 nightHeat = vec3(0.96, 0.56, 0.30);
@@ -366,6 +387,7 @@ export class AmbientWeatherOverlay {
         uTime: { value: 0 },
         uShimmer: { value: 0 },
         uMist: { value: 0 },
+        uSpeed: { value: 0 },
         uNight: { value: 0 },
       },
       vertexShader: `
@@ -379,6 +401,7 @@ export class AmbientWeatherOverlay {
         uniform float uTime;
         uniform float uShimmer;
         uniform float uMist;
+        uniform float uSpeed;
         uniform float uNight;
         varying vec2 vUv;
 
@@ -388,19 +411,19 @@ export class AmbientWeatherOverlay {
           // Strictly zero out the center corridor for pristine obstacle clarity
           float outerMask = smoothstep(0.56, 1.28, radialDist);
 
-          // Rising heat shimmer breath along lower/horizon edges
-          float shimmerWave = 0.5 + 0.5 * sin(vUv.y * 28.0 - uTime * 4.8 + sin(vUv.x * 12.0 + uTime));
+          // Rising heat shimmer breath along lower/horizon edges (intensifies with biome heat & speed)
+          float shimmerWave = 0.5 + 0.5 * sin(vUv.y * (28.0 + uSpeed * 8.0) - uTime * (4.8 + uSpeed * 4.2) + sin(vUv.x * 12.0 + uTime * (1.0 + uSpeed * 0.7)));
           float lowerHorizonMask = smoothstep(0.65, 0.0, vUv.y) * outerMask;
-          float shimmerAlpha = lowerHorizonMask * shimmerWave * uShimmer * mix(0.085, 0.04, uNight);
+          float shimmerAlpha = lowerHorizonMask * shimmerWave * uShimmer * mix(0.088, 0.045, uNight);
 
           // Soft curling perimeter mist along outer corners
-          float mistDrift = 0.5 + 0.5 * sin(vUv.x * 5.0 + uTime * 0.45 + cos(vUv.y * 4.0 - uTime * 0.35));
-          float mistAlpha = outerMask * (0.55 + 0.45 * mistDrift) * uMist * mix(0.11, 0.075, uNight);
+          float mistDrift = 0.5 + 0.5 * sin(vUv.x * 5.0 + uTime * (0.45 + uSpeed * 0.4) + cos(vUv.y * 4.0 - uTime * 0.35));
+          float mistAlpha = outerMask * (0.55 + 0.45 * mistDrift) * uMist * mix(0.115, 0.078, uNight);
 
           vec3 shimmerCol = mix(vec3(1.0, 0.84, 0.5), vec3(0.95, 0.55, 0.28), uNight);
           vec3 mistCol = mix(vec3(0.86, 0.93, 0.99), vec3(0.42, 0.54, 0.72), uNight);
 
-          float totalAlpha = clamp(shimmerAlpha + mistAlpha, 0.0, 0.16);
+          float totalAlpha = clamp(shimmerAlpha + mistAlpha, 0.0, 0.22);
           if (totalAlpha < 0.002) discard;
           vec3 blended = (shimmerCol * shimmerAlpha + mistCol * mistAlpha) / max(0.0001, shimmerAlpha + mistAlpha);
           gl_FragColor = vec4(blended, totalAlpha);
@@ -474,6 +497,8 @@ export class AmbientWeatherOverlay {
     simTime: number,
     speedRatio = 0,
     pixelRatio = 1,
+    biome: BiomeId = 'canyon',
+    speedMultiplier = 1.0,
   ): void {
     const goalLeaves = this.enabled ? this.targetLeaves : 0;
     const goalShimmer = this.enabled ? this.targetShimmer : 0;
@@ -483,23 +508,50 @@ export class AmbientWeatherOverlay {
     this.shimmerStrength = THREE.MathUtils.damp(this.shimmerStrength, goalShimmer, 2.0, dt);
     this.mistStrength = THREE.MathUtils.damp(this.mistStrength, goalMist, 2.0, dt);
 
+    const biomeScales = BIOME_OVERLAY_SCALES[biome];
+    this.biomeLeafMul = THREE.MathUtils.damp(this.biomeLeafMul, biomeScales.leaves, 2.0, dt);
+    this.biomeShimmerMul = THREE.MathUtils.damp(
+      this.biomeShimmerMul,
+      biomeScales.shimmer,
+      2.0,
+      dt,
+    );
+    this.biomeMistMul = THREE.MathUtils.damp(this.biomeMistMul, biomeScales.mist, 2.0, dt);
+
+    const targetSpeed = Math.max(
+      speedRatio,
+      THREE.MathUtils.clamp((speedMultiplier - 1.0) / 2.0, 0, 1.35),
+    );
+    this.speedIntensity = THREE.MathUtils.damp(this.speedIntensity, targetSpeed, 4.2, dt);
+    const s = this.speedIntensity;
+
+    const effectiveLeaves = Math.min(1.4, this.leavesStrength * this.biomeLeafMul);
+    const effectiveShimmer = Math.min(
+      1.85,
+      this.shimmerStrength * this.biomeShimmerMul * (0.9 + s * 0.58),
+    );
+    const effectiveMist = Math.min(
+      1.6,
+      this.mistStrength * this.biomeMistMul * (0.95 + s * 0.34),
+    );
+
     const anyActive =
-      this.leavesStrength > 0.015 ||
-      this.shimmerStrength > 0.015 ||
-      this.mistStrength > 0.015;
+      effectiveLeaves > 0.015 ||
+      effectiveShimmer > 0.015 ||
+      effectiveMist > 0.015;
     this.group.visible = this.enabled || anyActive;
     if (!this.group.visible) return;
 
     // 1. Update Swirling 3D Breeze Leaves
-    if (this.leavesStrength > 0.015) {
+    if (effectiveLeaves > 0.015) {
       this.leafMesh.visible = true;
-      this.leafMat.opacity = this.leavesStrength * 0.88;
+      this.leafMat.opacity = Math.min(0.95, effectiveLeaves * 0.85);
 
       const xMin = playerX - 14;
       const xMax = playerX + 14;
       const zMin = playerZ - 46;
       const zMax = playerZ + 8;
-      const breezeScale = 1.0 + speedRatio * 0.65;
+      const breezeScale = (1.0 + s * 0.78) * (0.85 + 0.25 * this.biomeLeafMul);
 
       for (let i = 0; i < LEAF_COUNT; i++) {
         const seed = this.leafSeed[i];
@@ -517,7 +569,7 @@ export class AmbientWeatherOverlay {
           (Math.sin(simTime * 2.1 + seed) * 0.58 - 0.34) * dt;
         let z =
           this.leafZ[i] +
-          (Math.cos(simTime * 1.3 * swirl + seed) * 1.1 + 0.8 * speedRatio) * dt;
+          (Math.cos(simTime * 1.3 * swirl + seed) * 1.1 + 1.1 * s * this.biomeLeafMul) * dt;
 
         if (x < xMin) x += 28;
         if (x > xMax) x -= 28;
@@ -545,8 +597,8 @@ export class AmbientWeatherOverlay {
         _tmpPos.set(x, y, z);
         _tmpEuler.set(this.leafRotX[i], this.leafRotY[i], this.leafRotZ[i]);
         _tmpQuat.setFromEuler(_tmpEuler);
-        const s = this.leafScale[i];
-        _tmpScale.set(s, s, s);
+        const sc = this.leafScale[i];
+        _tmpScale.set(sc, sc, sc);
         _tmpMat.compose(_tmpPos, _tmpQuat, _tmpScale);
         this.leafMesh.setMatrixAt(i, _tmpMat);
       }
@@ -555,11 +607,12 @@ export class AmbientWeatherOverlay {
       this.leafMesh.visible = false;
     }
 
-    // 2. Update Heat Shimmer Mirage Wisps
-    if (this.shimmerStrength > 0.015) {
+    // 2. Update Heat Shimmer Mirage Wisps (scaled by biome & velocity)
+    if (effectiveShimmer > 0.015) {
       this.shimmerPoints.visible = true;
       this.shimmerMat.uniforms.uTime.value = simTime;
-      this.shimmerMat.uniforms.uStrength.value = this.shimmerStrength;
+      this.shimmerMat.uniforms.uStrength.value = effectiveShimmer;
+      this.shimmerMat.uniforms.uSpeed.value = s;
       this.shimmerMat.uniforms.uNight.value = nightFactor;
       this.shimmerMat.uniforms.uPixelRatio.value = pixelRatio;
 
@@ -569,12 +622,15 @@ export class AmbientWeatherOverlay {
       const zMax = playerZ + 7;
       const posAttr = this.shimmerGeo.attributes.position as THREE.BufferAttribute;
       const arr = this.shimmerPositions;
+      const shimmerLiftMul = (1 + s * 0.62) * (0.85 + 0.25 * this.biomeShimmerMul);
 
       for (let i = 0; i < SHIMMER_COUNT; i++) {
         const seed = this.shimmerSeeds[i];
-        let x = arr[i * 3] + Math.sin(simTime * 1.15 + seed) * dt * 0.45;
-        let y = arr[i * 3 + 1] + dt * (0.72 + 0.24 * Math.sin(seed));
-        let z = arr[i * 3 + 2];
+        let x =
+          arr[i * 3] +
+          Math.sin(simTime * (1.15 + s * 0.85) + seed) * dt * 0.45 * shimmerLiftMul;
+        let y = arr[i * 3 + 1] + dt * (0.72 + 0.24 * Math.sin(seed)) * shimmerLiftMul;
+        let z = arr[i * 3 + 2] + dt * s * 2.4 * this.biomeShimmerMul;
 
         if (x < xMin) x += 26;
         if (x > xMax) x -= 26;
@@ -601,9 +657,13 @@ export class AmbientWeatherOverlay {
     }
 
     // 3. Update Light Mist Breeze Ribbons
-    if (this.mistStrength > 0.015) {
+    if (effectiveMist > 0.015) {
       this.mistPoints.visible = true;
-      this.mistMat.opacity = this.mistStrength * (nightFactor > 0.5 ? 0.16 : 0.21);
+      this.mistMat.size = 5.4 * (0.9 + 0.14 * this.biomeMistMul + s * 0.14);
+      this.mistMat.opacity = Math.min(
+        0.34,
+        effectiveMist * (nightFactor > 0.5 ? 0.16 : 0.21),
+      );
       this.mistMat.color.setHex(nightFactor > 0.5 ? 0x94a3b8 : 0xe0f2fe);
 
       const xMin = playerX - 16;
@@ -612,17 +672,20 @@ export class AmbientWeatherOverlay {
       const zMax = playerZ + 10;
       const mAttr = this.mistGeo.attributes.position as THREE.BufferAttribute;
       const mArr = this.mistPositions;
+      const mistRush = 1 + s * 0.5 * this.biomeMistMul;
 
       for (let i = 0; i < MIST_RIBBON_COUNT; i++) {
         const seed = this.mistSeeds[i * 2];
         const rate = this.mistSeeds[i * 2 + 1];
-        let x = mArr[i * 3] + Math.sin(simTime * 0.52 + seed) * dt * 1.05 * rate;
+        let x = mArr[i * 3] + Math.sin(simTime * 0.52 + seed) * dt * 1.05 * rate * mistRush;
         const y = THREE.MathUtils.clamp(
           mArr[i * 3 + 1] + Math.cos(simTime * 0.65 + seed) * dt * 0.2,
           playerY + 0.35,
           playerY + 3.2,
         );
-        let z = mArr[i * 3 + 2] + Math.sin(simTime * 0.35 + seed) * dt * 0.35;
+        let z =
+          mArr[i * 3 + 2] +
+          (Math.sin(simTime * 0.35 + seed) * 0.35 + s * 3.2 * this.biomeMistMul) * dt;
 
         if (x < xMin) x += 32;
         if (x > xMax) x -= 32;
@@ -643,12 +706,13 @@ export class AmbientWeatherOverlay {
     }
 
     // 4. Update Screen-Edge Perimeter Atmospheric Veil
-    const showVeil = this.shimmerStrength > 0.02 || this.mistStrength > 0.02;
+    const showVeil = effectiveShimmer > 0.02 || effectiveMist > 0.02;
     this.veilMesh.visible = showVeil;
     if (showVeil) {
       this.veilMat.uniforms.uTime.value = simTime;
-      this.veilMat.uniforms.uShimmer.value = this.shimmerStrength;
-      this.veilMat.uniforms.uMist.value = this.mistStrength;
+      this.veilMat.uniforms.uShimmer.value = effectiveShimmer;
+      this.veilMat.uniforms.uMist.value = effectiveMist;
+      this.veilMat.uniforms.uSpeed.value = s;
       this.veilMat.uniforms.uNight.value = nightFactor;
     }
   }

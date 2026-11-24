@@ -12,7 +12,7 @@ interface SpeedVisualizationProps {
 
 const SEGMENT_COUNT = 8;
 
-export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
+export const SpeedVisualization: React.FC<SpeedVisualizationProps> = React.memo(({
   speedMultiplier,
   difficulty,
   chronosTimer,
@@ -24,7 +24,7 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
   const isOverdrive = !isChronosSlow && speedMultiplier > 2.0;
   const isSupersonic = !isChronosSlow && speedMultiplier >= 3.0;
 
-  // Normalize fill across 1.0x -> max ceiling (expand ceiling if lucky-wheel boost pushes past normal max)
+  // Normalize fill across 1.0x -> max ceiling (expand ceiling if boost/combo pushes past normal max)
   const scaleCeiling = Math.max(diffCfg.maxMultiplier, speedMultiplier, 2.25);
   const speedRatio = Math.min(
     1,
@@ -68,9 +68,6 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
   // Overdrive intensity scales continuously from 2.0x upward (0.28 right past 2.0x -> 1.0 at 2.6x+)
   const overdriveIntensity = isOverdrive
     ? Math.min(1, 0.28 + ((speedMultiplier - 2.0) / 0.55) * 0.72)
-    : 0;
-  const supersonicIntensity = isSupersonic
-    ? Math.min(1, 0.65 + ((speedMultiplier - 3.0) / 0.6) * 0.35)
     : 0;
 
   const phaseLabel = isChronosSlow
@@ -128,81 +125,54 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
   const activeSegments = Math.max(1, Math.round(speedRatio * SEGMENT_COUNT));
   const thresholdSegIndex = Math.floor(thresholdRatio * SEGMENT_COUNT);
 
-  const containerShadow = isSupersonic
-    ? `0 0 ${Math.round(24 + supersonicIntensity * 18)}px ${Math.round(
-        4 + supersonicIntensity * 6,
-      )}px rgba(168, 85, 247, 0.56), -6px 0 22px rgba(249, 115, 22, 0.42), inset 0 0 18px rgba(249, 115, 22, 0.30)`
-    : isOverdrive
-      ? `0 0 ${Math.round(18 + overdriveIntensity * 20)}px ${Math.round(
-          2 + overdriveIntensity * 5,
-        )}px rgba(249, 115, 22, ${(0.34 + overdriveIntensity * 0.4).toFixed(2)}), 0 0 ${Math.round(
-          10 + overdriveIntensity * 14,
-        )}px rgba(251, 191, 36, ${(0.18 + overdriveIntensity * 0.28).toFixed(2)}), inset 0 0 ${Math.round(
-          10 + overdriveIntensity * 12,
-        )}px rgba(251, 146, 60, ${(0.18 + overdriveIntensity * 0.24).toFixed(2)})`
-      : isChronosSlow
-        ? '0 0 14px rgba(168, 85, 247, 0.35)'
-        : isCoolCruise
-          ? '0 4px 16px rgba(14, 165, 233, 0.24), inset 0 0 14px rgba(56, 189, 248, 0.14)'
-          : '0 4px 16px rgba(245, 158, 11, 0.20), inset 0 0 12px rgba(249, 115, 22, 0.12)';
-
   return (
     <div
       role="status"
       aria-label={`Speed ${effectiveMultiplier.toFixed(2)}x, ${phaseLabel}`}
-      className={`relative inline-flex items-center gap-2.5 rounded-xl px-2.5 py-1.5 border transition-[border-color,background-color,box-shadow] duration-500 ease-out ${
-        isSupersonic
-          ? 'bg-[#1c0c29]/92 border-violet-400/90 animate-speed-mach-pulse'
-          : isOverdrive
-            ? 'bg-[#22100a]/92 border-orange-400/80'
-            : isChronosSlow
-              ? 'bg-[#170e2e]/90 border-purple-400/55'
-              : isCoolCruise
-                ? 'bg-[#081529]/90 border-sky-400/45'
-                : 'bg-[#1a130b]/90 border-amber-400/55'
+      className={`relative inline-flex items-center gap-2.5 rounded-xl px-2.5 py-1.5 bg-[#0b1426]/92 border border-white/15 ${
+        isSupersonic ? 'animate-speed-mach-pulse' : ''
       }`}
-      style={{ boxShadow: containerShadow }}
     >
-      {/* Smooth multi-tier HUD container background gradient layers (cool blue -> warm orange -> orange-to-violet) */}
+      {/* Smooth multi-tier HUD container background gradient + border layers (compositor opacity only) */}
       <span
         aria-hidden="true"
         className="pointer-events-none absolute inset-0 overflow-hidden rounded-[11px]"
       >
         <span
-          className="absolute inset-0 transition-opacity duration-500 ease-out"
+          className="absolute inset-0 border border-sky-400/50 rounded-[11px] transition-opacity duration-500 ease-out"
           style={{
             opacity: coolBlueWeight,
             backgroundImage:
-              'linear-gradient(135deg, rgba(14, 165, 233, 0.28) 0%, rgba(30, 58, 138, 0.32) 55%, rgba(6, 182, 212, 0.24) 100%)',
+              'linear-gradient(135deg, rgba(14, 165, 233, 0.30) 0%, rgba(30, 58, 138, 0.34) 55%, rgba(6, 182, 212, 0.24) 100%)',
           }}
         />
         <span
-          className="absolute inset-0 transition-opacity duration-500 ease-out"
+          className="absolute inset-0 border border-orange-400/75 rounded-[11px] transition-opacity duration-500 ease-out"
           style={{
             opacity: warmAmberWeight,
             backgroundImage:
-              'linear-gradient(135deg, rgba(249, 115, 22, 0.30) 0%, rgba(194, 65, 12, 0.24) 52%, rgba(245, 158, 11, 0.32) 100%)',
+              'linear-gradient(135deg, rgba(249, 115, 22, 0.32) 0%, rgba(194, 65, 12, 0.26) 52%, rgba(245, 158, 11, 0.34) 100%)',
           }}
         />
         <span
-          className="absolute inset-0 transition-opacity duration-500 ease-out"
+          className="absolute inset-0 border border-violet-400/85 rounded-[11px] transition-opacity duration-500 ease-out"
           style={{
             opacity: orangeVioletWeight,
             backgroundImage:
-              'linear-gradient(125deg, rgba(249, 115, 22, 0.54) 0%, rgba(236, 72, 153, 0.42) 48%, rgba(139, 92, 246, 0.58) 100%)',
+              'linear-gradient(125deg, rgba(249, 115, 22, 0.56) 0%, rgba(236, 72, 153, 0.46) 48%, rgba(139, 92, 246, 0.62) 100%)',
           }}
         />
         <span
-          className="absolute inset-0 transition-opacity duration-500 ease-out"
+          className="absolute inset-0 border border-purple-400/60 rounded-[11px] transition-opacity duration-500 ease-out"
           style={{
             opacity: isChronosSlow ? 1 : 0,
             backgroundImage:
-              'linear-gradient(135deg, rgba(139, 92, 246, 0.32) 0%, rgba(34, 211, 238, 0.24) 100%)',
+              'linear-gradient(135deg, rgba(139, 92, 246, 0.34) 0%, rgba(34, 211, 238, 0.24) 100%)',
           }}
         />
       </span>
 
-      {/* Compositor-only radiant overdrive / supersonic amber-to-violet aura layers */}
+      {/* Compositor-only radiant overdrive / supersonic amber-to-violet aura layers (static glow, animated opacity only) */}
       {isSupersonic ? (
         <>
           <span
@@ -210,7 +180,7 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
             className="pointer-events-none absolute -inset-[3px] rounded-[14px] border-2 border-orange-300/95 animate-speed-mach-amber"
             style={{
               boxShadow:
-                '0 0 24px 4px rgba(249, 115, 22, 0.78), inset 0 0 14px rgba(251, 191, 36, 0.42)',
+                '0 0 22px 4px rgba(249, 115, 22, 0.72), inset 0 0 12px rgba(251, 191, 36, 0.38)',
             }}
           />
           <span
@@ -218,7 +188,7 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
             className="pointer-events-none absolute -inset-[3px] rounded-[14px] border-2 border-violet-400/95 animate-speed-mach-violet"
             style={{
               boxShadow:
-                '0 0 28px 6px rgba(168, 85, 247, 0.85), inset 0 0 16px rgba(192, 132, 252, 0.46)',
+                '0 0 24px 5px rgba(168, 85, 247, 0.78), inset 0 0 14px rgba(192, 132, 252, 0.42)',
             }}
           />
         </>
@@ -236,12 +206,8 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
         )
       )}
 
-      {/* Telemetry content (hue-shifts swiftly from amber -> violet when breaking 3.0x) */}
-      <div
-        className={`relative z-10 inline-flex items-center gap-2.5 ${
-          isSupersonic ? 'animate-speed-mach-shift' : ''
-        }`}
-      >
+      {/* Telemetry content */}
+      <div className="relative z-10 inline-flex items-center gap-2.5">
         {/* Precision SVG Arc Speedometer */}
         <div className="relative w-10 h-6 shrink-0 flex items-end justify-center">
           <svg
@@ -279,9 +245,6 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
               strokeWidth="3.2"
               strokeLinecap="round"
               strokeDasharray={`${activeLength} ${arcLength}`}
-              style={{
-                transition: 'stroke-dasharray 120ms ease-out, stroke 200ms ease',
-              }}
             />
 
             {/* 2.0x overdrive threshold notch */}
@@ -335,7 +298,7 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
         {/* Numeric Multiplier & Explicit Phase Label */}
         <div className="flex flex-col leading-none">
           <span
-            className="text-xs sm:text-sm font-black tabular-nums tracking-tight whitespace-nowrap"
+            className="text-xs sm:text-sm font-black font-mono-num tracking-tight whitespace-nowrap"
             style={{
               color: isSupersonic
                 ? '#fef08a'
@@ -344,19 +307,12 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
                   : isCoolCruise
                     ? '#e0f2fe'
                     : primaryHex,
-              textShadow: isSupersonic
-                ? '0 0 14px rgba(249, 115, 22, 0.95)'
-                : isOverdrive
-                  ? `0 0 ${Math.round(8 + overdriveIntensity * 10)}px rgba(249, 115, 22, 0.9)`
-                  : isCoolCruise
-                    ? '0 0 10px rgba(56, 189, 248, 0.45)'
-                    : undefined,
             }}
           >
             {effectiveMultiplier.toFixed(2)}×
           </span>
           <span
-            className="mt-0.5 text-[9px] font-black uppercase tracking-wider whitespace-nowrap"
+            className="mt-0.5 text-[9px] font-display font-bold uppercase tracking-wider whitespace-nowrap"
             style={{
               color: isSupersonic
                 ? '#f5d0fe'
@@ -401,14 +357,10 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
             return (
               <span
                 key={i}
-                className="w-[3px] rounded-full transition-colors duration-150"
+                className="w-[3px] rounded-full"
                 style={{
                   height: `${barHeightPx}px`,
                   backgroundColor: barColor,
-                  boxShadow:
-                    lit && isOverdrive
-                      ? `0 0 ${isSupersonic ? 11 : pastThreshold ? 8 : 5}px ${barColor}`
-                      : undefined,
                 }}
               />
             );
@@ -417,4 +369,4 @@ export const SpeedVisualization: React.FC<SpeedVisualizationProps> = ({
       </div>
     </div>
   );
-};
+});

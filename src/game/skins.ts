@@ -163,31 +163,59 @@ function normalizeLeaderboard(raw: unknown): LeaderboardEntry[] {
       typeof (item as LeaderboardEntry).distance === 'number'
     ) {
       const entry = item as LeaderboardEntry;
+      const diff =
+        entry.difficulty === 'zen' || entry.difficulty === 'normal' || entry.difficulty === 'turbo'
+          ? entry.difficulty
+          : 'normal';
       valid.push({
         id: entry.id,
+        difficulty: diff,
         score: Math.max(0, Math.floor(entry.score)),
         distance: Math.max(0, Math.floor(entry.distance)),
         skinId: typeof entry.skinId === 'string' ? entry.skinId : 'trailblazer',
+        peakSpeedMultiplier:
+          typeof entry.peakSpeedMultiplier === 'number' ? entry.peakSpeedMultiplier : undefined,
+        landmarkReachedName:
+          typeof entry.landmarkReachedName === 'string' ? entry.landmarkReachedName : undefined,
         recordedAt: typeof entry.recordedAt === 'string' ? entry.recordedAt : new Date().toISOString(),
       });
     }
   }
-  return valid
-    .sort((a, b) => b.score - a.score || b.distance - a.distance)
-    .slice(0, 5);
+  const byDifficulty: Record<'zen' | 'normal' | 'turbo', LeaderboardEntry[]> = {
+    zen: [],
+    normal: [],
+    turbo: [],
+  };
+  for (const e of valid) {
+    byDifficulty[e.difficulty ?? 'normal'].push(e);
+  }
+  return (['zen', 'normal', 'turbo'] as const)
+    .flatMap((d) =>
+      byDifficulty[d]
+        .sort((a, b) => b.score - a.score || b.distance - a.distance)
+        .slice(0, 5),
+    )
+    .sort((a, b) => b.score - a.score || b.distance - a.distance);
 }
 
 export function recordLeaderboardRun(
   existing: LeaderboardEntry[],
   candidate: LeaderboardEntry,
 ): { leaderboard: LeaderboardEntry[]; rank: number | null } {
+  const targetDiff = candidate.difficulty ?? 'normal';
+  const sameDiffExisting = existing.filter((e) => (e.difficulty ?? 'normal') === targetDiff);
+  const otherDiffExisting = existing.filter((e) => (e.difficulty ?? 'normal') !== targetDiff);
+
   if (candidate.score <= 0 && candidate.distance <= 0) {
-    return { leaderboard: existing.slice(0, 5), rank: null };
+    return { leaderboard: existing, rank: null };
   }
-  const combined = [...existing, candidate]
+  const updatedSameDiff = [...sameDiffExisting, { ...candidate, difficulty: targetDiff }]
     .sort((a, b) => b.score - a.score || b.distance - a.distance)
     .slice(0, 5);
-  const idx = combined.findIndex((e) => e.id === candidate.id);
+  const idx = updatedSameDiff.findIndex((e) => e.id === candidate.id);
+  const combined = [...updatedSameDiff, ...otherDiffExisting].sort(
+    (a, b) => b.score - a.score || b.distance - a.distance,
+  );
   return {
     leaderboard: combined,
     rank: idx >= 0 ? idx + 1 : null,
@@ -224,6 +252,7 @@ function createDefaultSave(): SaveData {
     luckyWheel: normalizeLuckyWheel(undefined),
     pendingSpeedBoost: null,
     leaderboard: [],
+    runnerHandle: null,
   };
 }
 
@@ -352,17 +381,58 @@ export function loadSaveData(): SaveData {
       luckyWheel: normalizeLuckyWheel(parsed.luckyWheel),
       pendingSpeedBoost: normalizePendingSpeedBoost(parsed.pendingSpeedBoost),
       leaderboard: normalizeLeaderboard(parsed.leaderboard),
+      runnerHandle:
+        typeof parsed.runnerHandle === 'string' && parsed.runnerHandle.length >= 3
+          ? parsed.runnerHandle.slice(0, 18)
+          : null,
     };
   } catch {
     return createDefaultSave();
   }
 }
 
-export function persistSaveData(data: SaveData): void {
+let pendingSaveTimer: number | null = null;
+let pendingSaveData: SaveData | null = null;
+
+function writeSaveToStorage(data: SaveData): void {
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
   } catch {
     // Ignore storage quota / privacy mode errors
+  }
+}
+
+export function persistSaveData(data: SaveData): void {
+  if (pendingSaveTimer !== null) {
+    window.clearTimeout(pendingSaveTimer);
+    pendingSaveTimer = null;
+  }
+  pendingSaveData = null;
+  writeSaveToStorage(data);
+}
+
+export function schedulePersistSaveData(data: SaveData, delayMs = 2000): void {
+  pendingSaveData = data;
+  if (pendingSaveTimer !== null) return;
+  pendingSaveTimer = window.setTimeout(() => {
+    pendingSaveTimer = null;
+    const latest = pendingSaveData;
+    pendingSaveData = null;
+    if (latest) {
+      writeSaveToStorage(latest);
+    }
+  }, delayMs);
+}
+
+export function flushPendingSaveData(): void {
+  if (pendingSaveTimer !== null) {
+    window.clearTimeout(pendingSaveTimer);
+    pendingSaveTimer = null;
+  }
+  if (pendingSaveData) {
+    const latest = pendingSaveData;
+    pendingSaveData = null;
+    writeSaveToStorage(latest);
   }
 }
 

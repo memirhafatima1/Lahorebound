@@ -31,6 +31,7 @@ export interface ObstacleItem {
   mesh: THREE.Group;
   baseX: number;
   x: number;
+  prevX: number;
   y: number; // bottom Y of hazard hitbox
   z: number;
   halfW: number;
@@ -70,6 +71,17 @@ export interface SpringPadItem {
   triggered: boolean;
 }
 
+export interface BoostPadItem {
+  mesh: THREE.Group;
+  x: number;
+  y: number;
+  z: number;
+  halfW: number;
+  halfD: number;
+  triggered: boolean;
+  chevrons: THREE.Mesh[];
+}
+
 export interface LandmarkMarker {
   kind: LahoreLandmarkKind;
   name: string;
@@ -90,6 +102,7 @@ export interface TrackChunk {
   gems: GemItem[];
   powerups: PowerupItem[];
   springs: SpringPadItem[];
+  boostPads: BoostPadItem[];
   landmarkMarker?: LandmarkMarker;
 }
 
@@ -194,6 +207,9 @@ export class WorldBuilder {
 
   private readonly springBaseGeo = new THREE.CylinderGeometry(0.72, 0.85, 0.18, 6);
   private readonly springCoreGeo = new THREE.CylinderGeometry(0.46, 0.56, 0.14, 6);
+  private readonly boostBaseGeo = new THREE.BoxGeometry(1.56, 0.08, 2.9);
+  private readonly boostRailGeo = new THREE.BoxGeometry(0.11, 0.14, 2.94);
+  private readonly boostChevronGeo = new THREE.BoxGeometry(0.56, 0.06, 0.22);
 
   // Lahore Street Architecture & Roadside Scenery
   private readonly dashGeo = new THREE.BoxGeometry(0.16, 0.03, 2.2);
@@ -233,11 +249,177 @@ export class WorldBuilder {
   private readonly buntingWireGeo = new THREE.BoxGeometry(9.4, 0.05, 0.05);
   private readonly buntingFlagGeo = new THREE.ConeGeometry(0.22, 0.42, 3);
 
+  private readonly fullDeck36Geo = new THREE.BoxGeometry(LANE_WIDTH * 3 + 0.6, 1.2, CHUNK_LENGTH);
+
+  // Shared Power-up Geometries & Materials
+  private readonly powerupIcoGeo = new THREE.IcosahedronGeometry(0.42, 0);
+  private readonly powerupHaloGeo = new THREE.TorusGeometry(0.58, 0.06, 6, 12);
+  private readonly chronosCrystalGeo = new THREE.OctahedronGeometry(0.42, 0);
+  private readonly chronosHeartGeo = new THREE.OctahedronGeometry(0.22, 0);
+  private readonly chronosRingAGeo = new THREE.TorusGeometry(0.62, 0.042, 6, 18);
+  private readonly chronosRingBGeo = new THREE.TorusGeometry(0.74, 0.032, 6, 18);
+  private readonly chronosShardGeo = new THREE.OctahedronGeometry(0.11, 0);
+
+  private readonly powerupMats: Record<Exclude<PowerupType, 'chronos'>, THREE.MeshStandardMaterial> = {
+    shield: new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      emissive: 0x38bdf8,
+      emissiveIntensity: 0.75,
+      roughness: 0.18,
+      metalness: 0.75,
+      flatShading: true,
+    }),
+    magnet: new THREE.MeshStandardMaterial({
+      color: 0x10b981,
+      emissive: 0x10b981,
+      emissiveIntensity: 0.75,
+      roughness: 0.18,
+      metalness: 0.75,
+      flatShading: true,
+    }),
+    multiplier: new THREE.MeshStandardMaterial({
+      color: 0xf43f5e,
+      emissive: 0xf43f5e,
+      emissiveIntensity: 0.75,
+      roughness: 0.18,
+      metalness: 0.75,
+      flatShading: true,
+    }),
+  };
+
+  private readonly chronosCrystalMat = new THREE.MeshPhysicalMaterial({
+    color: 0xa855f7,
+    emissive: 0x7e22ce,
+    emissiveIntensity: 0.85,
+    roughness: 0.12,
+    metalness: 0.72,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.08,
+    flatShading: true,
+  });
+
+  private readonly chronosHeartMat = new THREE.MeshStandardMaterial({
+    color: 0x67e8f9,
+    emissive: 0x22d3ee,
+    emissiveIntensity: 1.2,
+    roughness: 0.15,
+    metalness: 0.5,
+    flatShading: true,
+  });
+
+  private readonly chronosRingCyanMat = new THREE.MeshStandardMaterial({
+    color: 0x38bdf8,
+    emissive: 0x0ea5e9,
+    emissiveIntensity: 0.9,
+    roughness: 0.22,
+    metalness: 0.85,
+  });
+
+  private readonly chronosRingGoldMat = new THREE.MeshStandardMaterial({
+    color: 0xfde047,
+    emissive: 0xf59e0b,
+    emissiveIntensity: 0.75,
+    roughness: 0.2,
+    metalness: 0.9,
+  });
+
   // Shared materials
   private readonly lahoreTextures: LahoreTexturePack;
+  private readonly biomeMaterials: Record<
+    BiomeId,
+    {
+      deckMat: THREE.MeshStandardMaterial;
+      trimMat: THREE.MeshStandardMaterial;
+      hazardMat: THREE.MeshStandardMaterial;
+      hazardAccentMat: THREE.MeshStandardMaterial;
+      beamMat: THREE.MeshStandardMaterial;
+      cliffMat: THREE.MeshStandardMaterial;
+      foliageMat: THREE.MeshStandardMaterial;
+    }
+  >;
 
   constructor(maxAnisotropy = 4) {
     this.lahoreTextures = createLahoreTexturePack(maxAnisotropy);
+
+    const buildBiomeSet = (biome: BiomeId) => {
+      const palette = BIOME_PALETTES[biome];
+      const roadMap =
+        biome === 'canyon'
+          ? this.lahoreTextures.walledRoadTex
+          : biome === 'skybridge'
+            ? this.lahoreTextures.gardenMarbleTex
+            : this.lahoreTextures.asphaltRoadTex;
+      return {
+        deckMat: new THREE.MeshStandardMaterial({
+          color: biome === 'obsidian' ? 0xcbd5e1 : 0xffffff,
+          map: roadMap,
+          roughness: biome === 'skybridge' ? 0.62 : 0.84,
+          metalness: biome === 'skybridge' ? 0.12 : 0.05,
+          flatShading: true,
+        }),
+        trimMat: new THREE.MeshStandardMaterial({
+          color: palette.deckTrim,
+          roughness: 0.52,
+          metalness: 0.22,
+          flatShading: true,
+        }),
+        hazardMat: new THREE.MeshStandardMaterial({
+          color: palette.hazard,
+          roughness: 0.45,
+          metalness: 0.25,
+          flatShading: true,
+        }),
+        hazardAccentMat: new THREE.MeshStandardMaterial({
+          color: palette.hazardAccent,
+          emissive: palette.hazardAccent,
+          emissiveIntensity: 0.45,
+          roughness: 0.25,
+          metalness: 0.55,
+          flatShading: true,
+        }),
+        beamMat: new THREE.MeshStandardMaterial({
+          color: palette.beam,
+          emissive: palette.beam,
+          emissiveIntensity: 0.48,
+          roughness: 0.28,
+          metalness: 0.4,
+          flatShading: true,
+        }),
+        cliffMat: new THREE.MeshStandardMaterial({
+          color: palette.cliff,
+          roughness: 0.86,
+          metalness: 0.05,
+          flatShading: true,
+        }),
+        foliageMat: new THREE.MeshStandardMaterial({
+          color: palette.foliage,
+          roughness: 0.76,
+          metalness: 0.05,
+          flatShading: true,
+        }),
+      };
+    };
+
+    this.biomeMaterials = {
+      canyon: buildBiomeSet('canyon'),
+      skybridge: buildBiomeSet('skybridge'),
+      obsidian: buildBiomeSet('obsidian'),
+    };
+  }
+
+  public setRainWetness(wetness: number): void {
+    const w = THREE.MathUtils.clamp(wetness, 0, 1);
+    const canyonDeck = this.biomeMaterials.canyon.deckMat;
+    canyonDeck.roughness = THREE.MathUtils.lerp(0.84, 0.28, w);
+    canyonDeck.metalness = THREE.MathUtils.lerp(0.05, 0.34, w);
+
+    const obsidianDeck = this.biomeMaterials.obsidian.deckMat;
+    obsidianDeck.roughness = THREE.MathUtils.lerp(0.84, 0.26, w);
+    obsidianDeck.metalness = THREE.MathUtils.lerp(0.05, 0.38, w);
+
+    const skyDeck = this.biomeMaterials.skybridge.deckMat;
+    skyDeck.roughness = THREE.MathUtils.lerp(0.62, 0.2, w);
+    skyDeck.metalness = THREE.MathUtils.lerp(0.12, 0.4, w);
   }
 
   public setNightFactor(nightFactor: number, landmarkGlowHex?: number): void {
@@ -286,6 +468,24 @@ export class WorldBuilder {
     emissiveIntensity: 0.9,
     roughness: 0.2,
     metalness: 0.6,
+    flatShading: true,
+  });
+
+  private readonly boostAmberMat = new THREE.MeshStandardMaterial({
+    color: 0xfbbf24,
+    emissive: 0xf97316,
+    emissiveIntensity: 1.15,
+    roughness: 0.2,
+    metalness: 0.65,
+    flatShading: true,
+  });
+
+  private readonly boostVioletMat = new THREE.MeshStandardMaterial({
+    color: 0xc084fc,
+    emissive: 0x9333ea,
+    emissiveIntensity: 1.15,
+    roughness: 0.2,
+    metalness: 0.65,
     flatShading: true,
   });
 
@@ -433,62 +633,16 @@ export class WorldBuilder {
     difficultyMode: DifficultyMode = 'normal',
   ): TrackChunk {
     const group = new THREE.Group();
-    const palette = BIOME_PALETTES[biome];
     const density = DIFFICULTY_CONFIGS[difficultyMode].obstacleDensity;
-
-    const roadMap =
-      biome === 'canyon'
-        ? this.lahoreTextures.walledRoadTex
-        : biome === 'skybridge'
-          ? this.lahoreTextures.gardenMarbleTex
-          : this.lahoreTextures.asphaltRoadTex;
-    const deckMat = new THREE.MeshStandardMaterial({
-      color: biome === 'obsidian' ? 0xcbd5e1 : 0xffffff,
-      map: roadMap,
-      roughness: biome === 'skybridge' ? 0.62 : 0.84,
-      metalness: biome === 'skybridge' ? 0.12 : 0.05,
-      flatShading: true,
-    });
-    const trimMat = new THREE.MeshStandardMaterial({
-      color: palette.deckTrim,
-      roughness: 0.52,
-      metalness: 0.22,
-      flatShading: true,
-    });
-    const hazardMat = new THREE.MeshStandardMaterial({
-      color: palette.hazard,
-      roughness: 0.45,
-      metalness: 0.25,
-      flatShading: true,
-    });
-    const hazardAccentMat = new THREE.MeshStandardMaterial({
-      color: palette.hazardAccent,
-      emissive: palette.hazardAccent,
-      emissiveIntensity: 0.45,
-      roughness: 0.25,
-      metalness: 0.55,
-      flatShading: true,
-    });
-    const beamMat = new THREE.MeshStandardMaterial({
-      color: palette.beam,
-      emissive: palette.beam,
-      emissiveIntensity: 0.48,
-      roughness: 0.28,
-      metalness: 0.4,
-      flatShading: true,
-    });
-    const cliffMat = new THREE.MeshStandardMaterial({
-      color: palette.cliff,
-      roughness: 0.86,
-      metalness: 0.05,
-      flatShading: true,
-    });
-    const foliageMat = new THREE.MeshStandardMaterial({
-      color: palette.foliage,
-      roughness: 0.76,
-      metalness: 0.05,
-      flatShading: true,
-    });
+    const {
+      deckMat,
+      trimMat,
+      hazardMat,
+      hazardAccentMat,
+      beamMat,
+      cliffMat,
+      foliageMat,
+    } = this.biomeMaterials[biome];
 
     const chunk: TrackChunk = {
       group,
@@ -500,6 +654,7 @@ export class WorldBuilder {
       gems: [],
       powerups: [],
       springs: [],
+      boostPads: [],
     };
 
     // Starter chunk (chunkIndex <= 1) is an easy clean Lahore avenue with warm-up gems
@@ -518,14 +673,34 @@ export class WorldBuilder {
     const roll = Math.random();
     if (roll < 0.22) {
       this.buildChasmJumpPattern(chunk, zStart, difficulty, density, deckMat, trimMat, hazardMat, hazardAccentMat, beamMat);
+      if (chunkIndex % 2 === 0 || Math.random() < 0.45) {
+        const boostLane = Math.floor(Math.random() * 3);
+        this.addBoostPad(chunk, LANE_X[boostLane], 0, zStart - 5.2);
+      }
     } else if (roll < 0.44) {
       this.buildElevatedDeckPattern(chunk, zStart, difficulty, density, deckMat, trimMat, hazardMat, hazardAccentMat, beamMat);
+      if (chunkIndex % 2 === 0 || Math.random() < 0.5) {
+        const boostLane = Math.floor(Math.random() * 3);
+        this.addBoostPad(chunk, LANE_X[boostLane], 0, zStart - 33.2);
+      }
     } else if (roll < 0.64) {
       this.buildSpringSkyRailPattern(chunk, zStart, density, deckMat, trimMat, hazardMat, hazardAccentMat, beamMat);
+      if (chunkIndex % 2 === 0 || Math.random() < 0.48) {
+        const boostLane = Math.floor(Math.random() * 3);
+        this.addBoostPad(chunk, LANE_X[boostLane], 0, zStart - 32.5);
+      }
     } else if (roll < 0.84) {
       this.buildRhythmJumpSlidePattern(chunk, zStart, difficulty, density, deckMat, trimMat, hazardMat, hazardAccentMat, beamMat);
+      if (chunkIndex % 2 === 0 || Math.random() < 0.45) {
+        const boostLane = Math.floor(Math.random() * 3);
+        this.addBoostPad(chunk, LANE_X[boostLane], 0, zStart - 4.0);
+      }
     } else {
       this.buildMovingSentinelPattern(chunk, zStart, difficulty, density, deckMat, trimMat, hazardMat, hazardAccentMat, beamMat);
+      if (chunkIndex % 2 === 0 || Math.random() < 0.45) {
+        const boostLane = Math.floor(Math.random() * 3);
+        this.addBoostPad(chunk, LANE_X[boostLane], 0, zStart - 5.5);
+      }
     }
 
     // Occasional powerup spawn in the chunk
@@ -550,7 +725,10 @@ export class WorldBuilder {
   ): void {
     const width = LANE_WIDTH * 3 + 0.6;
     const thickness = 1.2;
-    const geo = new THREE.BoxGeometry(width, thickness, length);
+    const geo =
+      Math.abs(length - CHUNK_LENGTH) < 0.01
+        ? this.fullDeck36Geo
+        : new THREE.BoxGeometry(width, thickness, length);
     const mesh = new THREE.Mesh(geo, deckMat);
     mesh.position.set(0, topY - thickness / 2, zTop - length / 2);
     mesh.receiveShadow = true;
@@ -939,6 +1117,7 @@ export class WorldBuilder {
       mesh: g,
       baseX: x,
       x,
+      prevX: x,
       y: baseY,
       z,
       halfW: 0.95,
@@ -1003,6 +1182,7 @@ export class WorldBuilder {
       mesh: g,
       baseX: x,
       x,
+      prevX: x,
       y: baseY + 1.12,
       z,
       halfW: 1.02,
@@ -1053,6 +1233,7 @@ export class WorldBuilder {
       mesh: g,
       baseX: x,
       x,
+      prevX: x,
       y: baseY,
       z,
       halfW: 0.88,
@@ -1140,6 +1321,7 @@ export class WorldBuilder {
       mesh: g,
       baseX,
       x: baseX,
+      prevX: baseX,
       y: 0.08,
       z,
       halfW: 0.72,
@@ -1171,6 +1353,54 @@ export class WorldBuilder {
       y: baseY,
       z,
       triggered: false,
+    });
+  }
+
+  // Track Speed Boost Strip (composite 7-part amber/violet kinetic chevron pad)
+  private addBoostPad(chunk: TrackChunk, x: number, baseY: number, z: number): void {
+    const g = new THREE.Group();
+    g.position.set(x, baseY, z);
+
+    const base = new THREE.Mesh(this.boostBaseGeo, this.darkMetalMat);
+    base.position.y = 0.04;
+    g.add(base);
+
+    for (const side of [-1, 1]) {
+      const rail = new THREE.Mesh(
+        this.boostRailGeo,
+        side < 0 ? this.boostAmberMat : this.boostVioletMat,
+      );
+      rail.position.set(side * 0.76, 0.08, 0);
+      g.add(rail);
+    }
+
+    const chevrons: THREE.Mesh[] = [];
+    const zOffsets = [0.85, 0, -0.85];
+    zOffsets.forEach((cz, idx) => {
+      const chevronMat = idx % 2 === 0 ? this.boostAmberMat : this.boostVioletMat;
+      const leftArm = new THREE.Mesh(this.boostChevronGeo, chevronMat);
+      leftArm.position.set(-0.24, 0.1, cz);
+      leftArm.rotation.y = 0.56;
+      g.add(leftArm);
+
+      const rightArm = new THREE.Mesh(this.boostChevronGeo, chevronMat);
+      rightArm.position.set(0.24, 0.1, cz);
+      rightArm.rotation.y = -0.56;
+      g.add(rightArm);
+
+      chevrons.push(leftArm, rightArm);
+    });
+
+    chunk.group.add(g);
+    chunk.boostPads.push({
+      mesh: g,
+      x,
+      y: baseY,
+      z,
+      halfW: 0.92,
+      halfD: 1.55,
+      triggered: false,
+      chevrons,
     });
   }
 
@@ -1235,85 +1465,37 @@ export class WorldBuilder {
 
     if (type === 'chronos') {
       // Composite 6-part Chronos-Crystal: faceted amethyst crystal, cyan core & dual astrolabe rings
-      const crystalMat = new THREE.MeshPhysicalMaterial({
-        color: 0xa855f7,
-        emissive: 0x7e22ce,
-        emissiveIntensity: 0.85,
-        roughness: 0.12,
-        metalness: 0.72,
-        clearcoat: 1.0,
-        clearcoatRoughness: 0.08,
-        flatShading: true,
-      });
-      const heartMat = new THREE.MeshStandardMaterial({
-        color: 0x67e8f9,
-        emissive: 0x22d3ee,
-        emissiveIntensity: 1.2,
-        roughness: 0.15,
-        metalness: 0.5,
-        flatShading: true,
-      });
-      const ringCyanMat = new THREE.MeshStandardMaterial({
-        color: 0x38bdf8,
-        emissive: 0x0ea5e9,
-        emissiveIntensity: 0.9,
-        roughness: 0.22,
-        metalness: 0.85,
-      });
-      const ringGoldMat = new THREE.MeshStandardMaterial({
-        color: 0xfde047,
-        emissive: 0xf59e0b,
-        emissiveIntensity: 0.75,
-        roughness: 0.2,
-        metalness: 0.9,
-      });
-
-      const crystal = new THREE.Mesh(new THREE.OctahedronGeometry(0.42, 0), crystalMat);
+      const crystal = new THREE.Mesh(this.chronosCrystalGeo, this.chronosCrystalMat);
       crystal.scale.set(0.76, 1.38, 0.76);
       g.add(crystal);
 
-      const heart = new THREE.Mesh(new THREE.OctahedronGeometry(0.22, 0), heartMat);
+      const heart = new THREE.Mesh(this.chronosHeartGeo, this.chronosHeartMat);
       heart.scale.set(0.65, 1.15, 0.65);
       g.add(heart);
 
-      const ringA = new THREE.Mesh(new THREE.TorusGeometry(0.62, 0.042, 6, 18), ringCyanMat);
+      const ringA = new THREE.Mesh(this.chronosRingAGeo, this.chronosRingCyanMat);
       ringA.name = 'chronosRingA';
       ringA.rotation.set(Math.PI / 3, 0.3, 0);
       g.add(ringA);
 
-      const ringB = new THREE.Mesh(new THREE.TorusGeometry(0.74, 0.032, 6, 18), ringGoldMat);
+      const ringB = new THREE.Mesh(this.chronosRingBGeo, this.chronosRingGoldMat);
       ringB.name = 'chronosRingB';
       ringB.rotation.set(-Math.PI / 3, -0.35, Math.PI / 4);
       g.add(ringB);
 
-      const shardGeo = new THREE.OctahedronGeometry(0.11, 0);
-      const topShard = new THREE.Mesh(shardGeo, heartMat);
+      const topShard = new THREE.Mesh(this.chronosShardGeo, this.chronosHeartMat);
       topShard.position.set(0, 0.74, 0);
       g.add(topShard);
 
-      const bottomShard = new THREE.Mesh(shardGeo.clone(), heartMat);
+      const bottomShard = new THREE.Mesh(this.chronosShardGeo, this.chronosHeartMat);
       bottomShard.position.set(0, -0.74, 0);
       g.add(bottomShard);
     } else {
-      const colorMap: Record<Exclude<PowerupType, 'chronos'>, number> = {
-        shield: 0x38bdf8,
-        magnet: 0x10b981,
-        multiplier: 0xf43f5e,
-      };
-
-      const mat = new THREE.MeshStandardMaterial({
-        color: colorMap[type],
-        emissive: colorMap[type],
-        emissiveIntensity: 0.75,
-        roughness: 0.18,
-        metalness: 0.75,
-        flatShading: true,
-      });
-
-      const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.42, 0), mat);
+      const mat = this.powerupMats[type];
+      const core = new THREE.Mesh(this.powerupIcoGeo, mat);
       g.add(core);
 
-      const halo = new THREE.Mesh(new THREE.TorusGeometry(0.58, 0.06, 6, 12), mat);
+      const halo = new THREE.Mesh(this.powerupHaloGeo, mat);
       g.add(halo);
     }
 
@@ -1916,6 +2098,9 @@ export class WorldBuilder {
       this.rickshawLightGeo,
       this.springBaseGeo,
       this.springCoreGeo,
+      this.boostBaseGeo,
+      this.boostRailGeo,
+      this.boostChevronGeo,
       this.dashGeo,
       this.catEyeGeo,
       this.roadEdgeLineGeo,
@@ -1950,11 +2135,21 @@ export class WorldBuilder {
       this.umbrellaGeo,
       this.buntingWireGeo,
       this.buntingFlagGeo,
+      this.fullDeck36Geo,
+      this.powerupIcoGeo,
+      this.powerupHaloGeo,
+      this.chronosCrystalGeo,
+      this.chronosHeartGeo,
+      this.chronosRingAGeo,
+      this.chronosRingBGeo,
+      this.chronosShardGeo,
     ]);
     const sharedMats = new Set<THREE.Material>([
       this.gemMat,
       this.bonusGemMat,
       this.springPadMat,
+      this.boostAmberMat,
+      this.boostVioletMat,
       this.darkMetalMat,
       this.roadStripeMat,
       this.roadYellowMat,
@@ -1975,6 +2170,22 @@ export class WorldBuilder {
       this.trunkMat,
       this.lahoreTextures.truckArtRailMat,
       ...this.lahoreTextures.comicMaterials,
+      this.powerupMats.shield,
+      this.powerupMats.magnet,
+      this.powerupMats.multiplier,
+      this.chronosCrystalMat,
+      this.chronosHeartMat,
+      this.chronosRingCyanMat,
+      this.chronosRingGoldMat,
+      ...Object.values(this.biomeMaterials).flatMap((set) => [
+        set.deckMat,
+        set.trimMat,
+        set.hazardMat,
+        set.hazardAccentMat,
+        set.beamMat,
+        set.cliffMat,
+        set.foliageMat,
+      ]),
     ]);
 
     const matsToDispose = new Set<THREE.Material>();
@@ -2018,6 +2229,9 @@ export class WorldBuilder {
     this.rickshawLightGeo.dispose();
     this.springBaseGeo.dispose();
     this.springCoreGeo.dispose();
+    this.boostBaseGeo.dispose();
+    this.boostRailGeo.dispose();
+    this.boostChevronGeo.dispose();
     this.dashGeo.dispose();
     this.catEyeGeo.dispose();
     this.roadEdgeLineGeo.dispose();
@@ -2052,10 +2266,20 @@ export class WorldBuilder {
     this.umbrellaGeo.dispose();
     this.buntingWireGeo.dispose();
     this.buntingFlagGeo.dispose();
+    this.fullDeck36Geo.dispose();
+    this.powerupIcoGeo.dispose();
+    this.powerupHaloGeo.dispose();
+    this.chronosCrystalGeo.dispose();
+    this.chronosHeartGeo.dispose();
+    this.chronosRingAGeo.dispose();
+    this.chronosRingBGeo.dispose();
+    this.chronosShardGeo.dispose();
 
     this.gemMat.dispose();
     this.bonusGemMat.dispose();
     this.springPadMat.dispose();
+    this.boostAmberMat.dispose();
+    this.boostVioletMat.dispose();
     this.darkMetalMat.dispose();
     this.roadStripeMat.dispose();
     this.roadYellowMat.dispose();
@@ -2074,6 +2298,22 @@ export class WorldBuilder {
     this.hazardYellowMat.dispose();
     this.cloudMat.dispose();
     this.trunkMat.dispose();
+    this.powerupMats.shield.dispose();
+    this.powerupMats.magnet.dispose();
+    this.powerupMats.multiplier.dispose();
+    this.chronosCrystalMat.dispose();
+    this.chronosHeartMat.dispose();
+    this.chronosRingCyanMat.dispose();
+    this.chronosRingGoldMat.dispose();
+    for (const set of Object.values(this.biomeMaterials)) {
+      set.deckMat.dispose();
+      set.trimMat.dispose();
+      set.hazardMat.dispose();
+      set.hazardAccentMat.dispose();
+      set.beamMat.dispose();
+      set.cliffMat.dispose();
+      set.foliageMat.dispose();
+    }
     this.lahoreTextures.dispose();
   }
 }

@@ -1,23 +1,27 @@
 import React from 'react';
 import { Trophy, X } from 'lucide-react';
 import { LeaderboardPanel, type LeaderboardTab } from './LeaderboardPanel';
-import type { LeaderboardEntry } from '../game/types';
+import type { DifficultyMode, LeaderboardEntry, ProfileBadgeId } from '../game/types';
 
 interface LeaderboardModalProps {
   localEntries: LeaderboardEntry[];
+  difficulty: DifficultyMode;
   playerBestScore: number;
   playerBestDistance: number;
   playerSkinId: string;
+  playerBadgeId?: ProfileBadgeId | null;
   defaultTab?: LeaderboardTab;
   onClose: () => void;
 }
 
 export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
   localEntries,
+  difficulty,
   playerBestScore,
   playerBestDistance,
   playerSkinId,
-  defaultTab = 'local',
+  playerBadgeId = null,
+  defaultTab = 'global',
   onClose,
 }) => {
   return (
@@ -46,7 +50,7 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
               Leaderboard
             </h2>
             <p className="text-xs text-slate-400 mt-0.5 tabular-nums">
-              Compare your personal top 5 runs against global Lahore sprinters
+              Difficulty-scoped Zen, Normal &amp; Turbo global Lahore rankings
             </p>
           </div>
 
@@ -63,9 +67,11 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
         <LeaderboardPanel
           className="mt-4"
           localEntries={localEntries}
+          difficulty={difficulty}
           playerBestScore={playerBestScore}
           playerBestDistance={playerBestDistance}
           playerSkinId={playerSkinId}
+          playerBadgeId={playerBadgeId}
           defaultTab={defaultTab}
         />
 

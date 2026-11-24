@@ -25,6 +25,7 @@ export class ParticlePool {
   public readonly mesh: THREE.InstancedMesh;
   private readonly slots: ParticleSlot[] = [];
   private cursor = 0;
+  private colorDirty = false;
 
   constructor() {
     const geo = new THREE.OctahedronGeometry(0.13, 0);
@@ -83,7 +84,8 @@ export class ParticlePool {
     maxLife = 0.48,
   ): void {
     for (let i = 0; i < count; i++) {
-      const slot = this.slots[this.cursor];
+      const idx = this.cursor;
+      const slot = this.slots[idx];
       this.cursor = (this.cursor + 1) % MAX_PARTICLES;
 
       const angle = Math.random() * Math.PI * 2;
@@ -104,6 +106,8 @@ export class ParticlePool {
       slot.size = size * (0.7 + Math.random() * 0.6);
       slot.gravity = gravity;
       slot.color.setHex(hexColor);
+      this.mesh.setColorAt(idx, slot.color);
+      this.colorDirty = true;
     }
   }
 
@@ -114,7 +118,8 @@ export class ParticlePool {
     hexColor: number,
     size = 0.75,
   ): void {
-    const slot = this.slots[this.cursor];
+    const idx = this.cursor;
+    const slot = this.slots[idx];
     this.cursor = (this.cursor + 1) % MAX_PARTICLES;
 
     slot.active = true;
@@ -131,6 +136,8 @@ export class ParticlePool {
     slot.size = size;
     slot.gravity = 2.0;
     slot.color.setHex(hexColor);
+    this.mesh.setColorAt(idx, slot.color);
+    this.colorDirty = true;
   }
 
   public spawnSpeedBurstTrail(
@@ -145,7 +152,8 @@ export class ParticlePool {
   ): void {
     const clampedIntensity = Math.min(1.8, Math.max(0.6, intensity));
     for (let i = 0; i < count; i++) {
-      const slot = this.slots[this.cursor];
+      const idx = this.cursor;
+      const slot = this.slots[idx];
       this.cursor = (this.cursor + 1) % MAX_PARTICLES;
 
       const spreadSide = (Math.random() - 0.5) * 2; // -1..1
@@ -170,6 +178,8 @@ export class ParticlePool {
       slot.size = (0.72 + Math.random() * 0.55) * (0.85 + clampedIntensity * 0.25);
       slot.gravity = isJump ? 4.2 : 1.6;
       slot.color.setHex(i % 2 === 0 ? primaryHex : secondaryHex);
+      this.mesh.setColorAt(idx, slot.color);
+      this.colorDirty = true;
     }
   }
 
@@ -203,12 +213,14 @@ export class ParticlePool {
       _dummy.scale.setScalar(Math.max(0.01, slot.size * t));
       _dummy.updateMatrix();
       this.mesh.setMatrixAt(i, _dummy.matrix);
-      this.mesh.setColorAt(i, slot.color);
     }
 
     if (anyChanged) {
       this.mesh.instanceMatrix.needsUpdate = true;
-      if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+    }
+    if (this.colorDirty && this.mesh.instanceColor) {
+      this.mesh.instanceColor.needsUpdate = true;
+      this.colorDirty = false;
     }
   }
 

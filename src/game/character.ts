@@ -14,6 +14,7 @@ export interface RunnerPoseState {
   chronosTimer: number;
   powerupSurge: number;
   hitFlash: number;
+  invulnTimer?: number;
   showcaseMode: boolean;
 }
 
@@ -818,10 +819,21 @@ export class LowPolyCharacter {
 
     this.vfxTime += dt;
 
-    // Hit flash, pickup surge, or Chronos temporal rim tint
+    // Hit flash, post-shield invulnerability flicker, pickup surge, or Chronos temporal rim tint
+    const invulnRemaining = pose.invulnTimer ?? 0;
+    if (invulnRemaining > 0) {
+      const flickerOn = Math.sin(this.vfxTime * 34) > -0.15;
+      this.bodyRig.visible = flickerOn;
+    } else {
+      this.bodyRig.visible = true;
+    }
+
     if (pose.hitFlash > 0) {
       this.primaryMat.emissive.setHex(0xffffff);
       this.primaryMat.emissiveIntensity = pose.hitFlash * 1.4;
+    } else if (invulnRemaining > 0) {
+      this.primaryMat.emissive.setHex(0x38bdf8);
+      this.primaryMat.emissiveIntensity = 0.52;
     } else if (pose.powerupSurge > 0) {
       this.primaryMat.emissive.setHex(0xbae6fd);
       this.primaryMat.emissiveIntensity = pose.powerupSurge * 0.65;

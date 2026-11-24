@@ -1,0 +1,192 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isVerified() && request.auth.uid == uid;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidHandle(handle) {
+      return handle is string && handle.size() >= 3 && handle.size() <= 18 && handle.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidSkinId(skinId) {
+      return skinId is string && skinId.size() >= 1 && skinId.size() <= 32 && skinId.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidBadgeId(badgeId) {
+      return badgeId is string && badgeId.size() <= 40 && badgeId.matches('^[a-zA-Z0-9_\\-]*$');
+    }
+
+    function isValidRunnerProfile(data) {
+      return data.keys().hasAll(['uid', 'handle', 'skinId', 'badgeId', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'handle', 'skinId', 'badgeId', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && isValidHandle(data.handle)
+        && isValidSkinId(data.skinId)
+        && isValidBadgeId(data.badgeId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLeaderboardEntry(data) {
+      return data.keys().hasAll([
+          'uid',
+          'handle',
+          'difficulty',
+          'score',
+          'distance',
+          'skinId',
+          'badgeId',
+          'peakSpeedMultiplier',
+          'landmarkReachedName',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'handle',
+          'difficulty',
+          'score',
+          'distance',
+          'skinId',
+          'badgeId',
+          'peakSpeedMultiplier',
+          'landmarkReachedName',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && isValidHandle(data.handle)
+        && data.difficulty is string
+        && data.difficulty in ['zen', 'normal', 'turbo']
+        && data.score is int
+        && data.score >= 0
+        && data.score <= 10000000
+        && data.distance is int
+        && data.distance >= 0
+        && data.distance <= 500000
+        && isValidSkinId(data.skinId)
+        && isValidBadgeId(data.badgeId)
+        && data.peakSpeedMultiplier is number
+        && data.peakSpeedMultiplier >= 1.0
+        && data.peakSpeedMultiplier <= 10.0
+        && data.landmarkReachedName is string
+        && data.landmarkReachedName.size() >= 1
+        && data.landmarkReachedName.size() <= 64
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isBetterScoreAction() {
+      return incoming().score > existing().score
+        || (incoming().score == existing().score && incoming().distance > existing().distance);
+    }
+
+    function isProfileSyncAction() {
+      return incoming().score == existing().score
+        && incoming().distance == existing().distance
+        && incoming().peakSpeedMultiplier == existing().peakSpeedMultiplier
+        && incoming().landmarkReachedName == existing().landmarkReachedName;
+    }
+
+    match /runnerProfiles/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidRunnerProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isOwner(userId)
+        && isValidRunnerProfile(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'handle',
+          'skinId',
+          'badgeId',
+          'updatedAt'
+        ]);
+      allow delete: if isValidId(userId) && isOwner(userId);
+    }
+
+    match /leaderboardEntries/{entryId} {
+      allow get: if isValidId(entryId)
+        && existing().difficulty in ['zen', 'normal', 'turbo']
+        && existing().score is int
+        && existing().score >= 0;
+      allow list: if resource.data.difficulty in ['zen', 'normal', 'turbo']
+        && resource.data.score is int
+        && resource.data.score >= 0;
+      allow create: if isVerified()
+        && isValidId(entryId)
+        && isValidLeaderboardEntry(incoming())
+        && entryId == (request.auth.uid + '_' + incoming().difficulty)
+        && exists(/databases/$(database)/documents/runnerProfiles/$(request.auth.uid))
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerified()
+        && isValidId(entryId)
+        && isValidLeaderboardEntry(incoming())
+        && existing().uid == request.auth.uid
+        && entryId == (request.auth.uid + '_' + existing().difficulty)
+        && incoming().uid == existing().uid
+        && incoming().difficulty == existing().difficulty
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (isBetterScoreAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'handle',
+              'score',
+              'distance',
+              'skinId',
+              'badgeId',
+              'peakSpeedMultiplier',
+              'landmarkReachedName',
+              'updatedAt'
+            ]))
+          || (isProfileSyncAction()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'handle',
+              'skinId',
+              'badgeId',
+              'updatedAt'
+            ]))
+        );
+      allow delete: if isValidId(entryId)
+        && isVerified()
+        && existing().uid == request.auth.uid;
+    }
+  }
+}

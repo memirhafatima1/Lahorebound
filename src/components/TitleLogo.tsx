@@ -36,9 +36,9 @@ export const TitleLogo: React.FC = () => {
           stroke="#0f172a"
           strokeWidth="4"
           paintOrder="stroke"
-          fontFamily="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-          fontWeight="900"
-          fontSize="50"
+          fontFamily="'Chakra Petch', 'Plus Jakarta Sans', sans-serif"
+          fontWeight="700"
+          fontSize="54"
           letterSpacing="5"
         >
           LAHORE
@@ -52,8 +52,8 @@ export const TitleLogo: React.FC = () => {
           y="110"
           textAnchor="middle"
           fill="url(#strideAccentGrad)"
-          fontFamily="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-          fontWeight="900"
+          fontFamily="'Chakra Petch', 'Plus Jakarta Sans', sans-serif"
+          fontWeight="700"
           fontSize="19"
           letterSpacing="9"
         >

@@ -1,0 +1,143 @@
+{
+  "entities": {
+    "RunnerProfile": {
+      "title": "RunnerProfile",
+      "description": "Public runner identity profile with customizable handle and equipped cosmetics (no PII).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the runner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "handle": {
+          "type": "string",
+          "description": "Public runner handle shown on difficulty leaderboards.",
+          "minLength": 3,
+          "maxLength": 18,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "skinId": {
+          "type": "string",
+          "description": "Equipped runner skin identifier.",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "badgeId": {
+          "type": "string",
+          "description": "Equipped profile badge identifier or empty string.",
+          "maxLength": 40,
+          "pattern": "^[a-zA-Z0-9_\\-]*$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was first created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was last updated."
+        }
+      },
+      "required": ["uid", "handle", "skinId", "badgeId", "createdAt", "updatedAt"]
+    },
+    "GlobalLeaderboardEntry": {
+      "title": "GlobalLeaderboardEntry",
+      "description": "Best verified run per player per difficulty tier (zen, normal, turbo).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the runner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "handle": {
+          "type": "string",
+          "description": "Public runner handle at time of run or latest profile sync.",
+          "minLength": 3,
+          "maxLength": 18,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "difficulty": {
+          "type": "string",
+          "enum": ["zen", "normal", "turbo"],
+          "description": "Difficulty bracket for the leaderboard ranking."
+        },
+        "score": {
+          "type": "integer",
+          "description": "Highest run score achieved in this difficulty tier."
+        },
+        "distance": {
+          "type": "integer",
+          "description": "Distance in meters achieved during this best run."
+        },
+        "skinId": {
+          "type": "string",
+          "description": "Skin ID used for the run.",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "badgeId": {
+          "type": "string",
+          "description": "Equipped badge ID or empty string.",
+          "maxLength": 40,
+          "pattern": "^[a-zA-Z0-9_\\-]*$"
+        },
+        "peakSpeedMultiplier": {
+          "type": "number",
+          "description": "Peak speed multiplier reached during the run."
+        },
+        "landmarkReachedName": {
+          "type": "string",
+          "description": "Furthest Lahore landmark reached during the run.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when entry was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when entry was last updated."
+        }
+      },
+      "required": [
+        "uid",
+        "handle",
+        "difficulty",
+        "score",
+        "distance",
+        "skinId",
+        "badgeId",
+        "peakSpeedMultiplier",
+        "landmarkReachedName",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/runnerProfiles/{userId}": {
+      "schema": {
+        "$ref": "#/entities/RunnerProfile"
+      },
+      "description": "Stores each authenticated runner's public handle and cosmetic showcase."
+    },
+    "/leaderboardEntries/{entryId}": {
+      "schema": {
+        "$ref": "#/entities/GlobalLeaderboardEntry"
+      },
+      "description": "Difficulty-scoped global leaderboard entries keyed by {uid}_{difficulty}."
+    }
+  }
+}

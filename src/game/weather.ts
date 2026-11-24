@@ -1,5 +1,45 @@
 import * as THREE from 'three';
-import type { LahoreLandmarkKind, WeatherCondition } from './types';
+import type { BiomeId, LahoreLandmarkKind, WeatherCondition } from './types';
+
+export interface BiomeWeatherProfile {
+  fogCompression: number;
+  fogTintBoost: number;
+  rainSpeedMul: number;
+  rainDensityMul: number;
+  mistScaleMul: number;
+  hazeShimmerMul: number;
+}
+
+// Distinct atmospheric signatures for each region of Lahore
+export const BIOME_WEATHER_PROFILES: Record<BiomeId, BiomeWeatherProfile> = {
+  // Androon Lahore (Walled City): warm sandstone heat shimmer, golden dust haze, tighter canyon air
+  canyon: {
+    fogCompression: 1.14,
+    fogTintBoost: 1.18,
+    rainSpeedMul: 0.92,
+    rainDensityMul: 0.88,
+    mistScaleMul: 0.84,
+    hazeShimmerMul: 1.44,
+  },
+  // Iqbal Park & Shalimar Gardens: lush humidity, cascading fountain mist, brisk monsoon showers
+  skybridge: {
+    fogCompression: 1.22,
+    fogTintBoost: 1.12,
+    rainSpeedMul: 1.24,
+    rainDensityMul: 1.28,
+    mistScaleMul: 1.38,
+    hazeShimmerMul: 0.68,
+  },
+  // Canal Road & Liberty Chowk: high-speed urban flyover, sharp slicing rain & cool canal mist
+  obsidian: {
+    fogCompression: 1.05,
+    fogTintBoost: 1.22,
+    rainSpeedMul: 1.38,
+    rainDensityMul: 1.22,
+    mistScaleMul: 1.16,
+    hazeShimmerMul: 0.96,
+  },
+};
 
 export interface WeatherMetadata {
   id: WeatherCondition;
@@ -250,6 +290,15 @@ export class WeatherSystem {
   private mistStrength = 0;
   private hazeStrength = 0;
 
+  // Smoothed biome & velocity scaling state
+  private biomeFogCompression = BIOME_WEATHER_PROFILES.canyon.fogCompression;
+  private biomeFogTintBoost = BIOME_WEATHER_PROFILES.canyon.fogTintBoost;
+  private biomeRainSpeedMul = BIOME_WEATHER_PROFILES.canyon.rainSpeedMul;
+  private biomeRainDensityMul = BIOME_WEATHER_PROFILES.canyon.rainDensityMul;
+  private biomeMistScaleMul = BIOME_WEATHER_PROFILES.canyon.mistScaleMul;
+  private biomeHazeShimmerMul = BIOME_WEATHER_PROFILES.canyon.hazeShimmerMul;
+  private speedIntensity = 0;
+
   // 1. Light Rain streaks + ground splashes
   private readonly rainPositions: Float32Array;
   private readonly rainSpeeds: Float32Array;
@@ -445,12 +494,21 @@ export class WeatherSystem {
     this.group.add(this.hazeGlowMesh);
   }
 
-  public setWeather(condition: WeatherCondition, immediate = false): void {
+  public setWeather(condition: WeatherCondition, immediate = false, biome?: BiomeId): void {
     this.activeCondition = condition;
     if (immediate) {
       this.rainStrength = condition === 'light_rain' ? 1 : 0;
       this.mistStrength = condition === 'mist' ? 1 : 0;
       this.hazeStrength = condition === 'sunny_haze' ? 1 : 0;
+      if (biome) {
+        const bp = BIOME_WEATHER_PROFILES[biome];
+        this.biomeFogCompression = bp.fogCompression;
+        this.biomeFogTintBoost = bp.fogTintBoost;
+        this.biomeRainSpeedMul = bp.rainSpeedMul;
+        this.biomeRainDensityMul = bp.rainDensityMul;
+        this.biomeMistScaleMul = bp.mistScaleMul;
+        this.biomeHazeShimmerMul = bp.hazeShimmerMul;
+      }
     }
   }
 
@@ -462,6 +520,21 @@ export class WeatherSystem {
     return WEATHER_META[this.activeCondition];
   }
 
+  public getSpeedIntensity(): number {
+    return this.speedIntensity;
+  }
+
+  public getBiomeProfileSnapshot(): BiomeWeatherProfile {
+    return {
+      fogCompression: this.biomeFogCompression,
+      fogTintBoost: this.biomeFogTintBoost,
+      rainSpeedMul: this.biomeRainSpeedMul,
+      rainDensityMul: this.biomeRainDensityMul,
+      mistScaleMul: this.biomeMistScaleMul,
+      hazeShimmerMul: this.biomeHazeShimmerMul,
+    };
+  }
+
   public update(
     dt: number,
     playerX: number,
@@ -469,6 +542,8 @@ export class WeatherSystem {
     playerZ: number,
     nightFactor: number,
     simTime: number,
+    biome: BiomeId = 'canyon',
+    speedMultiplier = 1.0,
   ): void {
     const targetRain = this.activeCondition === 'light_rain' ? 1 : 0;
     const targetMist = this.activeCondition === 'mist' ? 1 : 0;
@@ -478,12 +553,37 @@ export class WeatherSystem {
     this.mistStrength = THREE.MathUtils.damp(this.mistStrength, targetMist, 1.7, dt);
     this.hazeStrength = THREE.MathUtils.damp(this.hazeStrength, targetHaze, 1.7, dt);
 
-    // 1. Update Light Rain Streaks & Ground Splashes
+    const bp = BIOME_WEATHER_PROFILES[biome];
+    this.biomeFogCompression = THREE.MathUtils.damp(this.biomeFogCompression, bp.fogCompression, 1.8, dt);
+    this.biomeFogTintBoost = THREE.MathUtils.damp(this.biomeFogTintBoost, bp.fogTintBoost, 1.8, dt);
+    this.biomeRainSpeedMul = THREE.MathUtils.damp(this.biomeRainSpeedMul, bp.rainSpeedMul, 1.8, dt);
+    this.biomeRainDensityMul = THREE.MathUtils.damp(this.biomeRainDensityMul, bp.rainDensityMul, 1.8, dt);
+    this.biomeMistScaleMul = THREE.MathUtils.damp(this.biomeMistScaleMul, bp.mistScaleMul, 1.8, dt);
+    this.biomeHazeShimmerMul = THREE.MathUtils.damp(this.biomeHazeShimmerMul, bp.hazeShimmerMul, 1.8, dt);
+
+    const targetSpeedIntensity = THREE.MathUtils.clamp((speedMultiplier - 1.0) / 2.0, 0, 1.35);
+    this.speedIntensity = THREE.MathUtils.damp(this.speedIntensity, targetSpeedIntensity, 4.2, dt);
+    const s = this.speedIntensity;
+
+    // 1. Update Light Rain Streaks & Ground Splashes (scaled by biome & velocity)
     if (this.rainStrength > 0.015) {
       this.rainLines.visible = true;
       this.splashPoints.visible = true;
-      this.rainMat.opacity = this.rainStrength * (0.48 - nightFactor * 0.08);
-      this.splashMat.opacity = this.rainStrength * 0.44;
+      const rainSpeedFactor = this.biomeRainSpeedMul * (1 + s * 0.48);
+      const rainDensityFactor = this.biomeRainDensityMul;
+      const windTiltX = 0.09 + s * 0.09 * rainDensityFactor;
+      const windTiltZ = 0.04 + s * (0.28 + 0.16 * this.biomeRainSpeedMul);
+      const streakStretch = 1 + s * 0.56 * this.biomeRainSpeedMul;
+
+      this.rainMat.opacity = Math.min(
+        0.74,
+        this.rainStrength * rainDensityFactor * (0.44 + s * 0.18 - nightFactor * 0.06),
+      );
+      this.splashMat.opacity = Math.min(
+        0.65,
+        this.rainStrength * rainDensityFactor * (0.4 + s * 0.16),
+      );
+      this.splashMat.size = 0.55 + s * 0.12 * rainDensityFactor;
 
       const xMin = playerX - 15;
       const xMax = playerX + 15;
@@ -497,12 +597,12 @@ export class WeatherSystem {
 
       for (let i = 0; i < RAIN_COUNT; i++) {
         const idx = i * 6;
-        const speed = this.rainSpeeds[i];
-        const len = this.rainLengths[i];
+        const speed = this.rainSpeeds[i] * rainSpeedFactor;
+        const len = this.rainLengths[i] * streakStretch;
 
-        let x = arr[idx] - dt * 1.9;
+        let x = arr[idx] - dt * (1.9 + s * 1.4) * rainDensityFactor;
         let y = arr[idx + 1] - speed * dt;
-        let z = arr[idx + 2];
+        let z = arr[idx + 2] + dt * s * 6.5 * this.biomeRainSpeedMul;
 
         if (y < yMin) {
           y = yMax - Math.random() * 2.5;
@@ -517,17 +617,18 @@ export class WeatherSystem {
         arr[idx] = x;
         arr[idx + 1] = y;
         arr[idx + 2] = z;
-        arr[idx + 3] = x + 0.09;
+        arr[idx + 3] = x + windTiltX;
         arr[idx + 4] = y + len;
-        arr[idx + 5] = z + 0.04;
+        arr[idx + 5] = z + windTiltZ;
       }
       posAttr.needsUpdate = true;
 
       // Update ground rain splashes
       const splashAttr = this.splashGeo.attributes.position as THREE.BufferAttribute;
       const sArr = this.splashPositions;
+      const splashRate = 3.4 * (1 + s * 0.42 * this.biomeRainSpeedMul);
       for (let i = 0; i < SPLASH_COUNT; i++) {
-        this.splashPhases[i] += dt * 3.4;
+        this.splashPhases[i] += dt * splashRate;
         if (this.splashPhases[i] >= 1) {
           this.splashPhases[i] -= 1;
           sArr[i * 3] = playerX + (Math.random() - 0.5) * 18;
@@ -543,10 +644,15 @@ export class WeatherSystem {
       this.splashPoints.visible = false;
     }
 
-    // 2. Update Drifting Mist Wisps
+    // 2. Update Drifting Mist Wisps (scaled by biome humidity & forward velocity rush)
     if (this.mistStrength > 0.015) {
       this.mistPoints.visible = true;
-      this.mistMat.opacity = this.mistStrength * (nightFactor > 0.5 ? 0.2 : 0.28);
+      const mistMul = this.biomeMistScaleMul;
+      this.mistMat.size = 7.4 * (0.88 + 0.14 * mistMul + s * 0.16);
+      this.mistMat.opacity = Math.min(
+        0.4,
+        this.mistStrength * mistMul * (nightFactor > 0.5 ? 0.19 : 0.27) * (1 + s * 0.24),
+      );
       this.mistMat.color.setHex(nightFactor > 0.5 ? 0x64748b : 0xe2e8f0);
 
       const mAttr = this.mistGeo.attributes.position as THREE.BufferAttribute;
@@ -555,13 +661,16 @@ export class WeatherSystem {
       const xMax = playerX + 17;
       const zMin = playerZ - 68;
       const zMax = playerZ + 12;
+      const mistDriftSpeed = 1 + s * 0.45 * mistMul;
 
       for (let i = 0; i < MIST_COUNT; i++) {
         const seed = this.mistDriftSeeds[i * 2];
         const driftRate = this.mistDriftSeeds[i * 2 + 1];
-        let x = mArr[i * 3] + Math.sin(simTime * 0.45 + seed) * dt * 1.15 * driftRate;
+        let x =
+          mArr[i * 3] +
+          Math.sin(simTime * 0.45 + seed) * dt * 1.15 * driftRate * mistDriftSpeed;
         const y = mArr[i * 3 + 1] + Math.cos(simTime * 0.6 + seed) * dt * 0.18;
-        let z = mArr[i * 3 + 2];
+        let z = mArr[i * 3 + 2] + dt * s * 3.8 * mistMul;
 
         if (x < xMin) x += 34;
         if (x > xMax) x -= 34;
@@ -581,13 +690,26 @@ export class WeatherSystem {
       this.mistPoints.visible = false;
     }
 
-    // 3. Update Sunny Haze Golden Motes & Warm Horizon Glow
+    // 3. Update Sunny Haze Golden Motes & Warm Horizon Glow (intensified in Androon canyon & at speed)
     if (this.hazeStrength > 0.015) {
       this.hazePoints.visible = true;
       this.hazeGlowMesh.visible = true;
+      const hazeMul = this.biomeHazeShimmerMul;
       const sunWarmth = THREE.MathUtils.lerp(1.0, 0.42, nightFactor);
-      this.hazeMat.opacity = this.hazeStrength * 0.72 * sunWarmth;
-      this.hazeGlowMat.opacity = this.hazeStrength * 0.48 * sunWarmth;
+      this.hazeMat.size = 0.62 * (0.9 + 0.18 * hazeMul + s * 0.16);
+      this.hazeMat.opacity = Math.min(
+        0.95,
+        this.hazeStrength * hazeMul * (0.64 + s * 0.24) * sunWarmth,
+      );
+      this.hazeGlowMat.opacity = Math.min(
+        0.7,
+        this.hazeStrength * hazeMul * (0.42 + s * 0.2) * sunWarmth,
+      );
+      this.hazeGlowMesh.scale.set(
+        1 + s * 0.14 * hazeMul,
+        1 + s * 0.1 * hazeMul,
+        1,
+      );
       this.hazeGlowMesh.position.set(playerX * 0.4, 15, playerZ - 94);
 
       const hAttr = this.hazeGeo.attributes.position as THREE.BufferAttribute;
@@ -596,13 +718,18 @@ export class WeatherSystem {
       const xMax = playerX + 13;
       const zMin = playerZ - 54;
       const zMax = playerZ + 10;
+      const moteMotionScale = 1 + s * 0.52 * hazeMul;
 
       for (let i = 0; i < HAZE_MOTE_COUNT; i++) {
         const seed = this.hazeSeeds[i * 2];
         const speedMul = this.hazeSeeds[i * 2 + 1];
-        let x = hArr[i * 3] + Math.sin(simTime * 0.8 + seed) * dt * 0.65 * speedMul;
-        let y = hArr[i * 3 + 1] + (0.25 + Math.cos(simTime * 0.7 + seed) * 0.2) * dt;
-        let z = hArr[i * 3 + 2];
+        let x =
+          hArr[i * 3] +
+          Math.sin(simTime * 0.8 + seed) * dt * 0.65 * speedMul * moteMotionScale;
+        let y =
+          hArr[i * 3 + 1] +
+          (0.25 + Math.cos(simTime * 0.7 + seed) * 0.2) * dt * moteMotionScale;
+        let z = hArr[i * 3 + 2] + dt * s * 2.2 * hazeMul;
 
         if (x < xMin) x += 26;
         if (x > xMax) x -= 26;
@@ -628,17 +755,24 @@ export class WeatherSystem {
       1 - this.rainStrength - this.mistStrength - this.hazeStrength,
     );
 
-    // Fog distances per weather blend
-    out.fogNear =
+    const baseFogNear =
       clearWeight * 42 +
       this.rainStrength * 27 +
       this.mistStrength * 18 +
       this.hazeStrength * 32;
-    out.fogFar =
+    const baseFogFar =
       clearWeight * 138 +
       this.rainStrength * 98 +
       this.mistStrength * 82 +
       this.hazeStrength * 116;
+
+    // Biome + speed dynamically compress fog slightly for richer regional atmosphere while preserving obstacle readability
+    const biomeCompress = 1 + (this.biomeFogCompression - 1) * 0.65;
+    const speedCompress = 1 + this.speedIntensity * (0.14 * this.biomeFogCompression);
+    const totalFogScale = 1 / Math.max(0.85, biomeCompress * speedCompress);
+
+    out.fogNear = Math.max(13.5, baseFogNear * totalFogScale);
+    out.fogFar = Math.max(out.fogNear + 44, baseFogFar * totalFogScale);
 
     // Combined sky/fog atmospheric tint
     out.skyTint.setRGB(0, 0, 0);
@@ -686,14 +820,15 @@ export class WeatherSystem {
       out.skyTint.multiplyScalar(1 / totalTint);
       out.fogTint.multiplyScalar(1 / totalTint);
     }
-    out.skyTintWeight = Math.min(0.65, totalTint);
-    out.fogTintWeight = Math.min(0.74, totalTint * 1.15);
+    const tintScale = this.biomeFogTintBoost * (1 + this.speedIntensity * 0.14);
+    out.skyTintWeight = Math.min(0.72, totalTint * tintScale);
+    out.fogTintWeight = Math.min(0.82, totalTint * 1.15 * tintScale);
 
     out.sunIntensityMul =
       clearWeight * 1.0 +
       this.rainStrength * 0.78 +
       this.mistStrength * 0.84 +
-      this.hazeStrength * 1.12;
+      this.hazeStrength * (1.12 + 0.06 * (this.biomeHazeShimmerMul - 1));
     out.hemiIntensityMul =
       clearWeight * 1.0 +
       this.rainStrength * 0.94 +
@@ -702,7 +837,7 @@ export class WeatherSystem {
     out.exposureOffset =
       this.rainStrength * -0.05 +
       this.mistStrength * -0.02 +
-      this.hazeStrength * 0.07;
+      this.hazeStrength * (0.07 * Math.min(1.35, this.biomeHazeShimmerMul));
   }
 
   public dispose(): void {
